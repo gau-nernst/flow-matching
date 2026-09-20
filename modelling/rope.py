@@ -31,7 +31,8 @@ def _rope_kernel(
     stride_ob,
     stride_ol,
     D: tl.constexpr,
-    eps=1e-6,
+    GEMMA_NORM: tl.constexpr = False,
+    eps: float = 1e-6,
 ):
     pid_l = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -46,8 +47,11 @@ def _rope_kernel(
     if norm_ptr is not None:
         norm = tl.load(norm_ptr + offs, mask)
         rrms = tl.rsqrt(tl.sum(x * x) * (1.0 / D) + eps)
-        x *= rrms * norm.to(tl.float32)
-        x = x.to(tl.bfloat16).to(tl.float32)
+        if GEMMA_NORM:
+            scale = rrms + rrms * norm.to(tl.float32)
+        else:
+            scale = rrms * norm.to(tl.float32)
+        x = (x * scale).to(tl.bfloat16).to(tl.float32)
 
     x_lo, x_hi = x.reshape(BLOCK_DIM // 2, 2).split()
 
@@ -66,6 +70,7 @@ def apply_rope(
     x: Tensor,
     rope: Tensor,
     norm: Tensor | None = None,
+    gemma_norm: bool = False,
     eps: float = 1e-6,
     *,
     out: Tensor | None = None,
@@ -75,7 +80,10 @@ def apply_rope(
     # rope: [L, D/2] in complex
     if torch.is_grad_enabled():
         if norm is not None:
-            x = F.rms_norm(x, x.shape[-1:], norm, eps)
+            if gemma_norm:
+                x = F.rms_norm(x.float(), x.shape[-1:], norm.float() + 1.0, eps).to(x.dtype)
+            else:
+                x = F.rms_norm(x, x.shape[-1:], norm, eps)
         dtype = rope.dtype.to_real()
         x_ = torch.view_as_complex(x.to(dtype).unflatten(-1, (-1, 2)))  # [B, L, nH, D/2]
         x_ = torch.view_as_real(x_ * rope.unsqueeze(-2)).flatten(-2)  # [B, L, nH, D]
@@ -94,7 +102,7 @@ def apply_rope(
     else:
         out = torch.empty_like(x, dtype=out_dtype)
     B, L, H, D = x.shape
-    _rope_kernel[(L, H, B)](x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], D, eps)
+    _rope_kernel[(L, H, B)](x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], D, gemma_norm, eps)
     return out
 
 

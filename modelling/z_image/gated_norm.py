@@ -15,6 +15,7 @@ def _gated_norm_kernel(
     L: tl.constexpr,
     D: tl.constexpr,
     gate_type: tl.constexpr,
+    GEMMA_NORM: tl.constexpr,
     eps: float = 1e-5,
 ):
     pid_l = tl.program_id(0)
@@ -31,7 +32,11 @@ def _gated_norm_kernel(
     x = x.to(tl.float32)
     var = tl.sum(x * x) * (1.0 / D)
     rrms = tl.rsqrt(var + eps)
-    x *= rrms * w.to(tl.float32)
+    if GEMMA_NORM:
+        scale = rrms + rrms * w.to(tl.float32)
+    else:
+        scale = rrms * w.to(tl.float32)
+    x *= scale
 
     if gate_ptr is not None:
         if gate_type == "plus_one":
@@ -54,11 +59,15 @@ def gated_norm(
     gate: Tensor | None = None,
     add: Tensor | None = None,
     gate_type: str = "plus_one",
+    gemma_norm: bool = False,
     eps: float = 1e-6,
 ) -> Tensor:
     if torch.is_grad_enabled():
         # if True:
-        x = F.rms_norm(x, x.shape[-1:], w, eps=eps)
+        if gemma_norm:
+            x = F.rms_norm(x.float(), x.shape[:-1:], w.float() + 1.0, eps).to(x.dtype)
+        else:
+            x = F.rms_norm(x, x.shape[:-1:], w, eps)
         if gate is not None:
             if gate_type == "plus_one":
                 x = x * (1.0 + gate)
