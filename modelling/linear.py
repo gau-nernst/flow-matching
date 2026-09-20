@@ -29,6 +29,11 @@ class Linear(nn.Module):
                 self.register_buffer("weight_scale", torch.empty(out_dim, in_dim // 16, dtype=torch.float8_e4m3fn))
                 self.register_buffer("weight_scale_2", torch.empty((), dtype=torch.float32))
 
+            elif f"{prefix}weight_scale" in state_dict:
+                # fp8 tensor
+                self.register_buffer("input_scale", torch.empty((), dtype=torch.float32))
+                self.register_buffer("weight_scale", torch.empty((), dtype=torch.float32))
+
             elif f"{prefix}weight_scale_inv" in state_dict:
                 # fp8 1d2d
                 N, K = state_dict[f"{prefix}weight"].shape
@@ -48,8 +53,22 @@ class Linear(nn.Module):
             if add is not None:
                 out = out + add
 
+        elif self.is_fp8_tensor():
+            xq = fp8_tensor_quantize(x, self.input_scale)
+            out = F.scaled_mm(
+                xq,
+                self.weight.T,
+                self.input_scale,
+                F.ScalingType.TensorWise,
+                self.weight_scale,
+                F.ScalingType.TensorWise,
+                bias=self.bias,
+            )
+            if add is not None:
+                out = out + add
+
         elif self.is_fp8_1d2d():
-            x, xs = fp8_quantize(x)
+            x, xs = fp8_1d_quantize(x)
             out = sm120_mm_fp8_1d2d.mm(x, xs, self.weight, self.weight_scale_inv, self.bias, add)
 
         else:
@@ -65,6 +84,10 @@ class Linear(nn.Module):
 
     def is_nvfp4(self):
         return hasattr(self, "weight_scale_2")
+
+    def is_fp8_tensor(self):
+        ws = getattr(self, "weight_scale", None)
+        return ws is not None and ws.shape == ()
 
     def is_fp8_1d2d(self):
         return hasattr(self, "weight_scale_inv")
@@ -189,7 +212,7 @@ def fp8_1d2d_mm(x: Tensor, xs: Tensor, w: Tensor, ws: Tensor, b: Tensor | None =
 
 
 @triton.jit(do_not_specialize=["M"])
-def _fp8_quantize_kernel(
+def _fp8_1d_quantize_kernel(
     x_ptr,
     o_ptr,
     os_ptr,
@@ -219,7 +242,7 @@ def _fp8_quantize_kernel(
     tl.store(os_ptr + offs_m * stride_osm + pid_n * stride_osn, inv_scale, mask=offs_m < M)
 
 
-def fp8_quantize(x: Tensor):
+def fp8_1d_quantize(x: Tensor):
     M, N = x.shape
     BLOCK_M = 1 if M < 8 else 4
     BLOCK_N = 128
@@ -230,5 +253,41 @@ def fp8_quantize(x: Tensor):
     scale = x.new_empty(N // BLOCK_N, pad_M, dtype=torch.float32).T[:M]
 
     grid = (N // BLOCK_N, triton.cdiv(M, BLOCK_M), 1)
-    _fp8_quantize_kernel[grid](x, out, scale, M, x.stride(0), *scale.stride(), out.stride(0), BLOCK_M, BLOCK_N)
+    _fp8_1d_quantize_kernel[grid](x, out, scale, M, x.stride(0), *scale.stride(), out.stride(0), BLOCK_M, BLOCK_N)
     return out, scale
+
+
+@triton.jit(do_not_specialize=["M"])
+def _fp8_tensor_quantize_kernel(
+    x_ptr,
+    o_ptr,
+    s_ptr,
+    M,
+    N,
+    stride_xm,
+    stride_om,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # x and o: [M, N]
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    scale = tl.load(s_ptr)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (offs_m < M) & (offs_n < N)
+    x = tl.load(x_ptr + offs_m * stride_xm + offs_n, mask)  # [BLOCK_M, BLOCK_N]
+    x /= scale
+    tl.store(o_ptr + offs_m * stride_om + offs_n, x, mask)
+
+
+def fp8_tensor_quantize(x: Tensor, scale: Tensor):
+    M, N = x.shape
+    BLOCK_M = 128
+    BLOCK_N = 128
+    out = x.new_empty(M, N, dtype=torch.float8_e4m3fn)
+    grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(M, BLOCK_M), 1)
+    _fp8_tensor_quantize_kernel[grid](x, out, scale, M, N, x.stride(0), out.stride(0), BLOCK_M, BLOCK_N)
+    return out
