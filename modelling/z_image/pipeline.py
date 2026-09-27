@@ -7,8 +7,8 @@ from torch import Tensor, nn
 from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer, Qwen3Model
 
-from ..autoencoder import load_autoencoder
 from ..solvers import get_solver
+from ..vae import load_vae
 from .model import ZImage, load_zimage
 
 
@@ -18,7 +18,7 @@ class ZImagePipeline:
 
     def __init__(self, zimage: ZImage | None = None) -> None:
         self.zimage = zimage or load_zimage().bfloat16()
-        self.ae = load_autoencoder("flux1").bfloat16()
+        self.ae = load_vae("flux1").bfloat16()
 
         # text stuff
         self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B")

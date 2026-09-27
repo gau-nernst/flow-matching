@@ -4,10 +4,10 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from ..autoencoder import AutoEncoder, load_autoencoder
 from ..offload import PerLayerOffloadCUDAStream
 from ..solvers import get_solver
 from ..text_embedder import load_clip_l, load_t5
+from ..vae import AutoEncoder, load_vae
 from .model import Flux1, load_flux1
 
 
@@ -65,7 +65,7 @@ def prepare_inputs(
 class Flux1Pipeline:
     def __init__(self, flux: Flux1 | None = None, offload_flux: bool = False, offload_t5: bool = False) -> None:
         self.flux = flux or load_flux1()  # 23.8 GB in BF16
-        self.ae = load_autoencoder("flux1").bfloat16()  # 168 MB in BF16
+        self.ae = load_vae("flux1").bfloat16()  # 168 MB in BF16
         self.text_embedder = Flux1TextEmbedder(offload_t5)
 
         # autoencoder and clip are small, don't need to offload

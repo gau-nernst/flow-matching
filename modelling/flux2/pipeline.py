@@ -10,10 +10,10 @@ from torch import Tensor, nn
 from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from ..autoencoder import load_autoencoder
 from ..offload import PerLayerOffloadCUDAStream
 from ..qwen3 import Qwen3ForCausalLM
 from ..solvers import get_solver
+from ..vae import load_vae
 from .model import Flux2, load_flux2
 
 
@@ -66,7 +66,7 @@ class Flux2Pipeline:
         offload_flux: bool = False,
     ) -> None:
         self.flux = flux or load_flux2()
-        self.ae = load_autoencoder("flux2").bfloat16()
+        self.ae = load_vae("flux2").bfloat16()
         self.text_encoder = Flux2Qwen3TextEncoder(text_encoder_id)
 
         self.flux_offloader = PerLayerOffloadCUDAStream(self.flux, enable=offload_flux)

@@ -298,7 +298,7 @@ class AutoEncoder(nn.Module):
         return self.decode(self.encode(x, sample), x.dtype == torch.uint8)
 
 
-def _load_autoencoder(repo_id: str, filename: str, scale_shift: tuple[float, float] = (1.0, 0.0)):
+def _load_vae(repo_id: str, filename: str, scale_shift: tuple[float, float] = (1.0, 0.0)):
     state_dict = load_hf_state_dict(repo_id, filename)
 
     cfg = AEConfig(
@@ -315,11 +315,10 @@ def _load_autoencoder(repo_id: str, filename: str, scale_shift: tuple[float, flo
     return ae
 
 
-def load_autoencoder(name: str):
+def load_vae(name: str):
     repo_id, filename, scale_shift = dict(
         # original weight is FP32
         flux1=("black-forest-labs/FLUX.1-dev", "ae.safetensors", (0.3611, 0.1159)),
         flux2=("black-forest-labs/FLUX.2-dev", "ae.safetensors", (1.0, 0.0)),
     )[name]
-
-    return _load_autoencoder(repo_id, filename, scale_shift)
+    return _load_vae(repo_id, filename, scale_shift)

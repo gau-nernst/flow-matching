@@ -8,7 +8,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 from torchvision.transforms import v2
 
-from modelling import Flux1, Flux1TextEmbedder, LoRALinear, load_autoencoder, load_flux1
+from modelling import Flux1, Flux1TextEmbedder, LoRALinear, load_flux1, load_vae
 from modelling.offload import PerLayerOffloadWithBackward
 from time_sampler import TimeSampler
 
@@ -18,7 +18,7 @@ def setup_model(model_name: str, offload: bool, lora: int, use_compile: bool, in
         model = load_flux1(model_name)
         layers = list(model.double_blocks) + list(model.single_blocks)
 
-        ae = load_autoencoder("flux1")
+        ae = load_vae("flux1")
         text_embedder = Flux1TextEmbedder(offload_t5=True)
 
     else:
