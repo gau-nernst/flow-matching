@@ -11,6 +11,15 @@ from ..rope import RopeND, apply_rope
 from ..utils import load_hf_state_dict, make_merge_hook
 
 
+def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
+    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
+    omega = 1.0 / ((theta * ntk) ** scale)
+    out = torch.einsum("...n,d->...nd", pos, omega)
+    out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
+    out = out.unflatten(-1, (2, 2))
+    return out.float()
+
+
 class SimpleModulation(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -219,3 +228,15 @@ class Krea2(nn.Module):
         final = self.last(combined, t)
         output = final[:, txtlen : txtlen + imglen, :]
         return output
+
+
+def load_krea2(name: str = "turbo"):
+    repo_id = f"krea/Krea-2-{name.capitalize()}"
+    filename = f"{name}.safetensors"
+    state_dict = load_hf_state_dict(repo_id, filename)
+
+    with torch.device("meta"):
+        model = Krea2()
+
+    model.load_state_dict(state_dict, assign=True)
+    return model
