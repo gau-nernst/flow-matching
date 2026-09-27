@@ -43,7 +43,7 @@ class Linear(nn.Module):
 
     def forward(self, x: Tensor, add: Tensor | None = None) -> Tensor:
         *dims, in_dim = x.shape
-        x = x.view(-1, in_dim)
+        x = x.reshape(-1, in_dim)
         if add is not None:
             add = add.view(-1, add.shape[-1])
 
