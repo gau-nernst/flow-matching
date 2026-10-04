@@ -164,7 +164,6 @@ if __name__ == "__main__":
     parser.add_argument("--lora", type=int, default=8)
     parser.add_argument("--time_sampler", default="LogitNormal()")
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--int8_training", action="store_true")
     parser.add_argument("--ema", action="store_true")
 
     parser.add_argument("--num_workers", type=int, default=4)
@@ -209,9 +208,7 @@ if __name__ == "__main__":
         train_dloader = create_dloader(args.train_ds, batch_size)
         distill_dloader = None
 
-    model, offloader, ae, text_embedder = setup_model(
-        args.model, args.offload, args.lora, args.compile, args.int8_training
-    )
+    model, offloader, ae, text_embedder = setup_model(args.model, args.offload, args.lora, args.compile)
     ema = EMA(model) if args.ema else None
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
     logger.info(model)

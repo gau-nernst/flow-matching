@@ -11,7 +11,6 @@ Supported features:
 - Training: LoRA fine-tuning with CPU offload, logit-normal sampler, and multi-resolution/multi-aspect-ratio training.
   - TODO: Multi-resolution via varlen attention?
 - [RF-inversion](https://arxiv.org/abs/2410.10792) (FLUX-Redux is simpler and superior).
-- INT8 matmul (2x inference speedup for consumer cards).
 - Single-GPU model offloading for inference and training.
 - Solvers: Euler, [DPM-Solver++(2M)](https://arxiv.org/abs/2211.01095), [UniPC](https://arxiv.org/abs/2302.04867)
 - Web UI: `uvicorn webui.server:app --host 0.0.0.0 --port 8000`

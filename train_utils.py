@@ -13,7 +13,7 @@ from modelling.offload import PerLayerOffloadWithBackward
 from time_sampler import TimeSampler
 
 
-def setup_model(model_name: str, offload: bool, lora: int, use_compile: bool, int8_training: bool):
+def setup_model(model_name: str, offload: bool, lora: int, use_compile: bool):
     if model_name.startswith(("flux", "flex")):
         model = load_flux1(model_name)
         layers = list(model.double_blocks) + list(model.single_blocks)
@@ -30,9 +30,8 @@ def setup_model(model_name: str, offload: bool, lora: int, use_compile: bool, in
     text_embedder.cuda()
 
     for layer in layers:
-        if lora > 0 or int8_training:
-            quantization = "int8_training" if int8_training else ""
-            LoRALinear.add_lora(layer, rank=lora, quantization=quantization, device="cuda")
+        if lora > 0:
+            LoRALinear.add_lora(layer, rank=lora, device="cuda")
         # TODO: use selective activation checkpointing
         # https://pytorch.org/blog/activation-checkpointing-techniques/
         layer.forward = partial(checkpoint, layer.forward, use_reentrant=False)
