@@ -57,10 +57,10 @@ def setup_model(model_name: str, lora: int, use_compile: bool):
 
         # TODO: use selective activation checkpointing
         # https://pytorch.org/blog/activation-checkpointing-techniques/
-        layer.forward = partial(checkpoint, layer.forward, use_reentrant=False)
-
-    if use_compile:
-        model.compile()
+        fwd = partial(checkpoint, layer.forward, use_reentrant=False)
+        if use_compile:
+            fwd = torch.compile(fwd)
+        layer.forward = fwd
 
     return model, ae, text_embedder
 

@@ -102,6 +102,7 @@ class ImageDataset(IterableDataset):
 
 
 @torch.no_grad()
+@torch.compiler.set_stance("force_eager")
 def save_images(
     model: Flux2,
     ae: AutoEncoder,
@@ -149,6 +150,7 @@ if __name__ == "__main__":
     parser.add_argument("--time_sampler", default="LogitNormal()")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--ema", action="store_true")
+    parser.add_argument("--profile", action="store_true")
 
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--train_ds", type=json.loads, required=True)
@@ -175,7 +177,7 @@ if __name__ == "__main__":
     torch._dynamo.config.cache_size_limit = 1000
     torch._dynamo.config.accumulated_cache_size_limit = 1000
 
-    wandb.init(project="T2I finetune", name=args.run_name, dir="/tmp")
+    wandb.init(project="T2I finetune", name=args.run_name, dir="/tmp", mode="disabled" if args.profile else None)
 
     def create_dloader(ds_config: dict, batch_size: int):
         ds = ImageDataset(
@@ -221,7 +223,7 @@ if __name__ == "__main__":
             logger.info("Load model: ", model.load_state_dict(ckpt, strict=False))
 
     # inference before any training
-    if step == 0:
+    if step == 0 and not args.profile:
         save_images(model, ae, text_embedder, args.test_prompt_path, img_dir / f"step{step:06d}", args.test_img_size)
 
     pbar = tqdm(initial=step, total=args.num_steps, dynamic_ncols=True)
@@ -229,6 +231,15 @@ if __name__ == "__main__":
     model.train()
     time0 = time.perf_counter()
     while step < args.num_steps:
+        if args.profile:
+            if step == 5:
+                prof = torch.profiler.profile(with_stack=True)
+                prof.__enter__()
+            elif step == 10:
+                prof.__exit__(None, None, None)
+                prof.export_chrome_trace("trace.json.gz")
+                break
+
         for _ in range(args.gradient_accumulation):
             imgs, prompts = next(train_dloader)
 

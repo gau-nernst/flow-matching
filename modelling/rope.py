@@ -76,9 +76,9 @@ def apply_rope(
     if torch.is_grad_enabled():
         if norm is not None:
             x = F.rms_norm(x, x.shape[-1:], norm, eps)
-        dtype = rope.dtype.to_real()
-        x_ = torch.view_as_complex(x.to(dtype).unflatten(-1, (-1, 2)))  # [B, L, nH, D/2]
-        x_ = torch.view_as_real(x_ * rope.unsqueeze(-2)).flatten(-2)  # [B, L, nH, D]
+        cos, sin = torch.view_as_real(rope).unsqueeze(-3).unbind(-1)  # [L, 1, D/2] each
+        x0, x1 = x.float().unflatten(-1, (-1, 2)).unbind(-1)  # [B, L, nH, D/2] each
+        x_ = torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1).flatten(-2)
         if out is not None:
             out.copy_(x_)
         else:
