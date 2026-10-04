@@ -16,3 +16,4 @@ torchinductor/
 *.log
 uv.lock
 cutedsl_dump/
+data/

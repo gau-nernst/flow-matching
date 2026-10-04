@@ -41,9 +41,18 @@ class Linear(nn.Module):
 
         self.register_load_state_dict_pre_hook(hook)
 
+    def init_lora(self, rank: int, scale: float = 1.0):
+        self.lora_scale = scale
+
+        out_dim, in_dim = self.weight.shape
+        self.lora_a = nn.Parameter(torch.empty(rank, in_dim))
+        self.lora_b = nn.Parameter(torch.empty(out_dim, rank))
+        nn.init.kaiming_normal_(self.lora_a, a=5**0.5)
+        nn.init.zeros_(self.lora_b)
+
     def forward(self, x: Tensor, add: Tensor | None = None) -> Tensor:
         *dims, in_dim = x.shape
-        x = x.view(-1, in_dim)
+        x = x.reshape(-1, in_dim)
         if add is not None:
             add = add.view(-1, add.shape[-1])
 
@@ -68,8 +77,8 @@ class Linear(nn.Module):
                 out = out + add
 
         elif self.is_fp8_1d2d():
-            x, xs = fp8_1d_quantize(x)
-            out = sm120_mm_fp8_1d2d.mm(x, xs, self.weight, self.weight_scale_inv, self.bias, add)
+            xq, xs = fp8_1d_quantize(x)
+            out = sm120_mm_fp8_1d2d.mm(xq, xs, self.weight, self.weight_scale_inv, self.bias, add)
 
         else:
             # bf16
@@ -79,6 +88,10 @@ class Linear(nn.Module):
                 out = F.linear(x, self.weight, self.bias)
                 if add is not None:
                     out = out + add
+
+        if hasattr(self, "lora_a"):
+            alpha = self.lora_scale / self.lora_a.shape[0]
+            out = torch.add(out, x @ self.lora_a.to(x.dtype).T @ self.lora_b.to(x.dtype).T, alpha=alpha)
 
         return out.view(*dims, -1)
 

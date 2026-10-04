@@ -24,7 +24,12 @@ class MLP(nn.ModuleList):
         self.append(Linear(mlp_dim, dim, bias=False))
 
     def forward(self, x: Tensor) -> Tensor:
-        if self[0].is_nvfp4() and self[2].is_nvfp4():
+        if (
+            self[0].is_nvfp4()
+            and self[2].is_nvfp4()
+            and not hasattr(self[0], "lora_a")
+            and not hasattr(self[2], "lora_b")
+        ):
             w1, w3 = self[0].weight.view(torch.float4_e2m1fn_x2).chunk(2, dim=0)
             w1_sf, w3_sf = self[0].weight_scale.chunk(2, dim=0)
             xs_2 = self[0].input_scale
@@ -85,15 +90,14 @@ class DoubleStreamBlock(nn.Module):
         mod_img: tuple[Tensor, ...],
         mod_txt: tuple[Tensor, ...],
     ) -> tuple[Tensor, Tensor]:
-        """NOTE: img and txt are modified in-place"""
         B, Limg, _ = img.shape
         _, Ltxt, _ = txt.shape
 
         img_shift1, img_scale1, img_gate1, img_shift2, img_scale2, img_gate2 = mod_img
         txt_shift1, txt_scale1, txt_gate1, txt_shift2, txt_scale2, txt_gate2 = mod_txt
 
-        img_res = modulate(img, img_shift1, img_scale1, img_res, img_gate2)
-        txt_res = modulate(txt, txt_shift1, txt_scale1, txt_res, txt_gate2)
+        img_res, img = modulate(img, img_shift1, img_scale1, img_res, img_gate2)
+        txt_res, txt = modulate(txt, txt_shift1, txt_scale1, txt_res, txt_gate2)
         img_q, img_k, img_v = self.img_attn.qkv(img_res).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
         txt_q, txt_k, txt_v = self.txt_attn.qkv(txt_res).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
 
@@ -112,11 +116,11 @@ class DoubleStreamBlock(nn.Module):
         attn = dispatch_attn(q, k, v, impl=self.attn_impl).flatten(2)
         txt_attn, img_attn = attn.split([txt.shape[1], img.shape[1]], dim=1)
 
-        img_res = self.img_attn.proj(img_attn)
-        txt_res = self.txt_attn.proj(txt_attn)
-        img_res = self.img_mlp(modulate(img, img_shift2, img_scale2, img_res, img_gate1))
-        txt_res = self.txt_mlp(modulate(txt, txt_shift2, txt_scale2, txt_res, txt_gate1))
-        return img_res, txt_res
+        img_res, img = modulate(img, img_shift2, img_scale2, self.img_attn.proj(img_attn), img_gate1)
+        txt_res, txt = modulate(txt, txt_shift2, txt_scale2, self.txt_attn.proj(txt_attn), txt_gate1)
+        img_res = self.img_mlp(img_res)
+        txt_res = self.txt_mlp(txt_res)
+        return img_res, img, txt_res, txt
 
 
 class SingleStreamBlock(nn.Module):
@@ -141,10 +145,9 @@ class SingleStreamBlock(nn.Module):
         self.register_load_state_dict_pre_hook(create_name_map_hook(remap_pairs))
 
     def forward(self, x: Tensor, res: Tensor | None, pe: Tensor, mod: tuple[Tensor, ...]) -> Tensor:
-        """NOTE: x is modified in-place"""
         # TODO: fuse quantize with modulate
         shift, scale, gate = mod
-        x_mod = modulate(x, shift, scale, res, gate)
+        x_mod, x = modulate(x, shift, scale, res, gate)
 
         if self.linear1.is_nvfp4():
             xs_2 = self.linear1.input_scale
@@ -171,7 +174,7 @@ class SingleStreamBlock(nn.Module):
         attn = dispatch_attn(q, k, v, impl=self.attn_impl).flatten(2)
 
         # TODO: pre-allocate attn+mlp buffer
-        return self.linear2(torch.cat([attn, mlp], 2))
+        return self.linear2(torch.cat([attn, mlp], 2)), x
 
 
 # default is klein-4B
@@ -249,16 +252,16 @@ class Flux2(nn.Module):
         mod_txt = self.double_stream_modulation_txt(vec)
         img_res = txt_res = None
         for block in self.double_blocks:
-            img_res, txt_res = block(img, img_res, txt, txt_res, rope, mod_img, mod_txt)
+            img_res, img, txt_res, txt = block(img, img_res, txt, txt_res, rope, mod_img, mod_txt)
 
-        joint = img.new_empty(B, Ltxt + Limg, self.cfg.dim)
-        torch.addcmul(img, mod_img[-1], img_res, out=joint[:, Ltxt:])
-        torch.addcmul(txt, mod_txt[-1], txt_res, out=joint[:, :Ltxt])
+        img = torch.addcmul(img, mod_img[-1], img_res)
+        txt = torch.addcmul(txt, mod_txt[-1], txt_res)
+        joint = torch.cat([txt, img], dim=1)
 
         mod = self.single_stream_modulation(vec)
         res = None
         for block in self.single_blocks:
-            res = block(joint, res, rope, mod)
+            res, joint = block(joint, res, rope, mod)
         img = torch.addcmul(joint[:, Ltxt:], mod[-1], res[:, Ltxt:])
 
         return self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)

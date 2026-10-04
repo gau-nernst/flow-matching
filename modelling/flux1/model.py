@@ -92,8 +92,8 @@ class DoubleStreamBlock(nn.Module):
         img_shift1, img_scale1, img_gate1, img_shift2, img_scale2, img_gate2 = self.img_mod(vec)
         txt_shift1, txt_scale1, txt_gate1, txt_shift2, txt_scale2, txt_gate2 = self.txt_mod(vec)
 
-        img_q, img_k, img_v = self.img_attn.forward_qkv(modulate(img, img_shift1, img_scale1, eps=self.eps))
-        txt_q, txt_k, txt_v = self.txt_attn.forward_qkv(modulate(txt, txt_shift1, txt_scale1, eps=self.eps))
+        img_q, img_k, img_v = self.img_attn.forward_qkv(modulate(img, img_shift1, img_scale1, eps=self.eps)[0])
+        txt_q, txt_k, txt_v = self.txt_attn.forward_qkv(modulate(txt, txt_shift1, txt_scale1, eps=self.eps)[0])
 
         q = apply_rope(torch.cat((txt_q, img_q), dim=1), pe)
         k = apply_rope(torch.cat((txt_k, img_k), dim=1), pe)
@@ -101,11 +101,11 @@ class DoubleStreamBlock(nn.Module):
         attn = dispatch_attn(q, k, v, impl=self.attn_impl).flatten(2)
         txt_attn, img_attn = attn.split([txt.shape[1], img.shape[1]], dim=1)
 
-        img = img + img_gate1 * self.img_attn.proj(img_attn)
-        img = img + img_gate2 * self.img_mlp(modulate(img, img_shift2, img_scale2))
+        img = torch.addcmul(img, img_gate1, self.img_attn.proj(img_attn))
+        img = torch.addcmul(img, img_gate2, self.img_mlp(modulate(img, img_shift2, img_scale2)[0]))
 
-        txt = txt + txt_gate1 * self.txt_attn.proj(txt_attn)
-        txt = txt + txt_gate2 * self.txt_mlp(modulate(txt, txt_shift2, txt_scale2))
+        txt = torch.addcmul(txt, txt_gate1, self.txt_attn.proj(txt_attn))
+        txt = torch.addcmul(txt, txt_gate2, self.txt_mlp(modulate(txt, txt_shift2, txt_scale2)[0]))
 
         return img, txt
 
@@ -141,7 +141,7 @@ class SingleStreamBlock(nn.Module):
 
     def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
         shift, scale, gate = self.modulation(vec)
-        x_mod = modulate(x, shift, scale, eps=self.eps)
+        x_mod, _ = modulate(x, shift, scale, eps=self.eps)
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.dim, self.mlp_dim], dim=-1)
 
         q, k, v = qkv.unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
@@ -162,7 +162,7 @@ class LastLayer(nn.Module):
 
     def forward(self, x: Tensor, vec: Tensor) -> Tensor:
         shift, scale = self.adaLN_modulation(vec)[:, None, :].chunk(2, dim=-1)
-        return self.linear(modulate(x, shift, scale))
+        return self.linear(modulate(x, shift, scale)[0])
 
 
 # default is Flux.1-dev
@@ -288,8 +288,6 @@ def load_flux1(name: str = "dev"):
         "dev": ("black-forest-labs/FLUX.1-dev", "flux1-dev.safetensors", None),
         "schnell": ("black-forest-labs/FLUX.1-schnell", "flux1-schnell.safetensors", None),
         "krea-dev": ("black-forest-labs/FLUX.1-Krea-dev", "flux1-krea-dev.safetensors", None),
-        "flex1-alpha": ("ostris/Flex.1-alpha", "Flex.1-alpha.safetensors", "model.diffusion_model."),
-        "flex2-preview": ("ostris/Flex.2-preview", "Flex.2-preview.safetensors", None),
     }[name]
 
     # BF16

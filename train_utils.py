@@ -8,53 +8,70 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 from torchvision.transforms import v2
 
-from modelling import Flux1, Flux1TextEmbedder, LoRALinear, load_flux1, load_vae
-from modelling.offload import PerLayerOffloadWithBackward
+from modelling import (
+    Flux2,
+    Flux2Qwen3TextEncoder,
+    load_flux2,
+    load_vae,
+    load_zimage,
+)
+from modelling.linear import Linear
 from time_sampler import TimeSampler
 
 
-def setup_model(model_name: str, offload: bool, lora: int, use_compile: bool):
-    if model_name.startswith(("flux", "flex")):
-        model = load_flux1(model_name)
+def setup_model(model_name: str, lora: int, use_compile: bool):
+    if model_name.startswith("flux2-"):
+        model = load_flux2(model_name.removeprefix("flux2-"))
         layers = list(model.double_blocks) + list(model.single_blocks)
 
+        ae = load_vae("flux2")
+
+        if model_name.startswith("flux2-klein-4B"):
+            text_id = "Qwen/Qwen3-4B-FP8"
+        elif model_name.startswith("flux2-klein-9B"):
+            text_id = "Qwen/Qwen3-8B-FP8"
+        else:
+            raise ValueError
+        text_embedder = Flux2Qwen3TextEncoder(text_id)
+
+    elif model_name.startswith("z-image-"):
+        model = load_zimage(model_name.removeprefix("z-image-"))
+        layers = list(model.layers)
+
         ae = load_vae("flux1")
-        text_embedder = Flux1TextEmbedder(offload_t5=True)
+        # TODO: text encoder
+        raise ValueError
 
     else:
         raise ValueError(f"Unsupported {model_name=}")
 
-    model.bfloat16().train().requires_grad_(False)
-    offloader = PerLayerOffloadWithBackward(model, enable=offload).cuda()
-    ae.eval().cuda()
+    model.cuda().train().requires_grad_(False)
+    ae.bfloat16().eval().cuda()
     text_embedder.cuda()
 
     for layer in layers:
-        if lora > 0:
-            LoRALinear.add_lora(layer, rank=lora, device="cuda")
+        with torch.device("cuda"):
+            for m in layer.modules():
+                if isinstance(m, Linear):
+                    m.init_lora(lora)
+
         # TODO: use selective activation checkpointing
         # https://pytorch.org/blog/activation-checkpointing-techniques/
         layer.forward = partial(checkpoint, layer.forward, use_reentrant=False)
-        if use_compile:  # might not be optimal to compile this way, but required for offloading
-            layer.forward = torch.compile(layer.forward)
 
-    return model, offloader, ae, text_embedder
+    if use_compile:
+        model.compile()
+
+    return model, ae, text_embedder
 
 
-def compute_loss(
-    model: Flux1,
-    latents: Tensor,
-    embeds: Tensor,
-    vecs: Tensor,
-    time_sampler: TimeSampler,
-    model_kwargs: dict,
-) -> Tensor:
+def compute_loss(model: Flux2, latents: Tensor, time_sampler: TimeSampler, model_kwargs: dict) -> Tensor:
     bsize = latents.shape[0]
-    t_vec = time_sampler(bsize, device=latents.device).bfloat16()
+    t_vec = time_sampler(bsize, device=latents.device)
     noise = torch.randn_like(latents)
-    interpolate = latents.lerp(noise, t_vec.view(-1, 1, 1, 1))
+    interpolate = latents.lerp(noise, t_vec.view([-1] + [1] * (latents.ndim - 1)))
 
-    v = model(interpolate, t_vec, embeds, vecs, **model_kwargs)
+    v = model(interpolate, t_vec, **model_kwargs)
 
     # rectified flow loss. predict velocity from latents (t=0) to noise (t=1).
     return F.mse_loss(noise.float() - latents.float(), v.float())
@@ -86,8 +103,8 @@ def random_resize(img_pil: Image.Image, min_size: int, max_size: int):
     factor = 64
     height = target_height // factor * factor
     width = target_width // factor * factor
-    img_pt = torch.from_numpy(np.array(img_pil)).permute(2, 0, 1)
-    img_pt = v2.RandomCrop((height, width))(img_pt)
+    img_pt = torch.from_numpy(np.array(img_pil)).permute(2, 0, 1)  # HWC->CHW
+    img_pt = v2.RandomCrop((height, width))(img_pt).permute(1, 2, 0)  # CHW->HWC
     return img_pt
 
 

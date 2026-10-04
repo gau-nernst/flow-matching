@@ -12,7 +12,11 @@ def _modulate_kernel(
     scale_ptr,  # [B, D]
     res_ptr,  # [B, L, D]
     gate_ptr,  # [B, D]
+    gated_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
+    shift_stride,
+    scale_stride,
+    gate_stride,
     L: tl.constexpr,
     D: tl.constexpr,
     eps: float = 1e-6,
@@ -27,12 +31,12 @@ def _modulate_kernel(
 
     if res_ptr is not None:
         res = tl.load(res_ptr + (pid_b * L * D + pid_l * D + offs), mask, other=0.0)
-        gate = tl.load(gate_ptr + (pid_b * D + offs), mask)
+        gate = tl.load(gate_ptr + (pid_b * gate_stride + offs), mask)
         x = (x.to(tl.float32) + gate.to(tl.float32) * res.to(tl.float32)).to(x.dtype)
-        tl.store(x_ptr + (pid_b * L * D + pid_l * D + offs), x, mask)
+        tl.store(gated_ptr + (pid_b * L * D + pid_l * D + offs), x, mask)
 
-    shift = tl.load(shift_ptr + (pid_b * D + offs), mask)
-    scale = tl.load(scale_ptr + (pid_b * D + offs), mask)
+    shift = tl.load(shift_ptr + (pid_b * shift_stride + offs), mask)
+    scale = tl.load(scale_ptr + (pid_b * scale_stride + offs), mask)
 
     x = x.to(tl.float32)
     x -= tl.sum(x) * (1.0 / D)
@@ -54,14 +58,33 @@ def modulate(
     if torch.is_grad_enabled():
         if res is not None:
             x = torch.addcmul(x, gate, res)
-        x = F.layer_norm(x, x.shape[-1:], eps=eps)
-        return (1.0 + scale) * x + shift
+        out = F.layer_norm(x, x.shape[-1:], eps=eps)
+        out = torch.addcmul(out, out, scale) + shift
+        return out, x
 
-    assert x.is_contiguous() and shift.is_contiguous() and scale.is_contiguous()
+    B, L, D = x.shape
+    assert x.is_contiguous() and shift[0].is_contiguous() and scale[0].is_contiguous()
+    assert shift.shape in ((B, 1, D), (1, 1, D))
+    assert scale.shape in ((B, 1, D), (1, 1, D))
     if res is not None:
         assert gate is not None
-        assert res.is_contiguous() and gate.is_contiguous()
-    B, L, D = x.shape
+        assert res.is_contiguous() and gate[0].is_contiguous()
+        assert gate.shape in ((B, 1, D), (1, 1, D))
+    gated = torch.empty_like(x) if res is not None else x
     out = torch.empty_like(x)
-    _modulate_kernel[(L, B)](x, shift, scale, res, gate, out, L, D, eps)
-    return out
+    _modulate_kernel[(L, B)](
+        x,
+        shift,
+        scale,
+        res,
+        gate,
+        gated,
+        out,
+        shift.stride(0) if shift.shape[0] > 1 else 0,
+        scale.stride(0) if scale.shape[0] > 1 else 0,
+        gate.stride(0) if gate is not None and gate.shape[0] > 1 else 0,
+        L,
+        D,
+        eps,
+    )
+    return out, gated

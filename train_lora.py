@@ -21,8 +21,8 @@ from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, IterableDataset, default_collate, get_worker_info
 from tqdm import tqdm
 
-from modelling import AutoEncoder, Flux1
-from modelling.flux1.pipeline import Flux1TextEmbedder, flux1_generate, flux1_timesteps
+from modelling import AutoEncoder, Flux2
+from modelling.flux2.pipeline import Flux2Qwen3TextEncoder, flux2_generate, flux2_time_shift
 from time_sampler import LogitNormal, Uniform
 from train_utils import EMA, compute_loss, parse_img_size, random_resize, setup_model
 
@@ -52,6 +52,7 @@ class ImageDataset(IterableDataset):
             meta = pd.read_csv(meta_path)
         self.filenames = meta["filename"].tolist()
         self.prompts = meta["prompt"].tolist()
+        logger.info("Dataset %s has %i images", meta_path, len(self.filenames))
 
         self.shuffle_rng = torch.Generator()
         self.shuffle_rng.seed()
@@ -90,7 +91,7 @@ class ImageDataset(IterableDataset):
                         tags.pop(torch.randint(len(tags), size=()).item())
                         prompt = SEPARATOR.join(tags)
 
-                img_size = tuple(img_pt.shape[-2:])
+                img_size = tuple(img_pt.shape[:2])
                 if img_size not in buckets:
                     buckets[img_size] = []
                 buckets[img_size].append((img_pt, prompt))
@@ -102,9 +103,9 @@ class ImageDataset(IterableDataset):
 
 @torch.no_grad()
 def save_images(
-    model: Flux1,
+    model: Flux2,
     ae: AutoEncoder,
-    text_embedder: Flux1TextEmbedder,
+    text_embedder: Flux2Qwen3TextEncoder,
     prompt_path: str,
     save_dir: Path,
     img_size: tuple[int, int],
@@ -115,50 +116,33 @@ def save_images(
     save_dir.mkdir(parents=True, exist_ok=True)
     rng = torch.Generator("cuda").manual_seed(2024)
 
-    neg_embeds, neg_vecs = text_embedder([""])
-
     for offset in tqdm(range(0, len(prompts), batch_size), "Generating images", dynamic_ncols=True):
-        embeds, vecs = text_embedder(prompts[offset : offset + batch_size])
+        curr_prompts = prompts[offset : offset + batch_size]
+        conds = text_embedder(curr_prompts)
 
-        shape = (embeds.shape[0], 16, img_size[0] // 8, img_size[1] // 8)
-        noise = torch.randn(shape, device="cuda", dtype=torch.bfloat16, generator=rng)
+        shape = (
+            len(curr_prompts),
+            img_size[0] // ae.downsample // 2,
+            img_size[1] // ae.downsample // 2,
+            ae.cfg.z_dim * 4,
+        )
+        noise = torch.randn(shape, device="cuda", generator=rng)
 
-        if isinstance(model, Flux1):
-            timesteps = flux1_timesteps(img_seq_len=shape[2] * shape[3] // 4)
+        num_steps = 4
+        timesteps = torch.linspace(1.0, 0.0, num_steps + 1)
+        timesteps = flux2_time_shift(timesteps, num_steps, shape[1] * shape[2])
+        timesteps = timesteps.tolist()
 
-            if len(model.double_blocks) == 19:  # flux-dev
-                guidance_list = [(3.5, 1.0), (1.0, 3.5), (2.0, 2.0)]
-            elif len(model.double_blocks) == 8:  # flex-alpha
-                guidance_list = [(3.5, 1.0), (None, 3.5), (2.0, 2.0)]
-            else:
-                raise ValueError
-
-            for guidance, cfg_scale in guidance_list:
-                latents = flux1_generate(
-                    model,
-                    noise,
-                    timesteps,
-                    embeds,
-                    vecs,
-                    neg_embeds.expand_as(embeds),
-                    neg_vecs.expand_as(vecs),
-                    guidance=guidance,
-                    cfg_scale=cfg_scale,
-                )
-                latents = latents.permute(0, 2, 3, 1)  # NCHW -> NHWC
-                imgs = ae.decode(latents, uint8=True).cpu()
-                for img_idx in range(imgs.shape[0]):
-                    save_path = save_dir / f"{offset + img_idx:04d}_{guidance}-{cfg_scale}.webp"
-                    Image.fromarray(imgs[img_idx].numpy()).save(save_path, lossless=True)
-
-        else:
-            raise ValueError
+        latents = flux2_generate(model, noise, timesteps, conds)
+        imgs = ae.decode(latents, uint8=True).cpu()
+        for img_idx in range(imgs.shape[0]):
+            save_path = save_dir / f"{offset + img_idx:04d}.webp"
+            Image.fromarray(imgs[img_idx].numpy()).save(save_path, lossless=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="flux-dev")
-    parser.add_argument("--offload", action="store_true")
+    parser.add_argument("--model", default="flux2-klein-4B")
     parser.add_argument("--min_size", type=int, default=512)
     parser.add_argument("--max_size", type=int, default=1024)
     parser.add_argument("--lora", type=int, default=8)
@@ -191,7 +175,7 @@ if __name__ == "__main__":
     torch._dynamo.config.cache_size_limit = 1000
     torch._dynamo.config.accumulated_cache_size_limit = 1000
 
-    wandb.init(project="Flux finetune", name=args.run_name, dir="/tmp")
+    wandb.init(project="T2I finetune", name=args.run_name, dir="/tmp")
 
     def create_dloader(ds_config: dict, batch_size: int):
         ds = ImageDataset(
@@ -208,7 +192,7 @@ if __name__ == "__main__":
         train_dloader = create_dloader(args.train_ds, batch_size)
         distill_dloader = None
 
-    model, offloader, ae, text_embedder = setup_model(args.model, args.offload, args.lora, args.compile)
+    model, ae, text_embedder = setup_model(args.model, args.lora, args.compile)
     ema = EMA(model) if args.ema else None
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
     logger.info(model)
@@ -254,18 +238,17 @@ if __name__ == "__main__":
                 prompts = prompts + distill_prompts
 
             with torch.no_grad():
-                # NCHW -> NHWC
-                latents = ae.encode(imgs.permute(0, 2, 3, 1).cuda(), sample=True)
+                latents = ae.encode(imgs.cuda(), sample=True)
 
-            if args.model == "flux-dev":
-                # finetune at guidance=1.0 is better than at 3.5
-                model_kwargs = dict(guidance=torch.full((imgs.shape[0],), 1.0, device="cuda", dtype=torch.bfloat16))
-            else:
-                model_kwargs = dict()
+            txt = text_embedder(prompts)
+            img_rope = model.make_img_rope(*latents.shape[1:3])
+            txt_rope = model.make_txt_rope(txt.shape[1])
+            rope = torch.cat([txt_rope, img_rope], dim=0)
+            model_kwargs = dict(txt=txt, rope=rope)
+            latents = latents.flatten(1, 2)
 
-            loss = compute_loss(model, latents, *text_embedder(prompts), time_sampler, model_kwargs)
-            with offloader.disable_forward_hook():
-                loss.backward()
+            loss = compute_loss(model, latents, time_sampler, model_kwargs)
+            loss.div(args.gradient_accumulation).backward()
 
         if step % args.log_interval == 0:
             grad_norm = sum(p.grad.square().sum() for p in model.parameters() if p.grad is not None) ** 0.5

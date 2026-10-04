@@ -156,7 +156,7 @@ class Flux2Pipeline:
             pbar=pbar,
             progress_cb=progress_cb,
         )
-        return self.ae.decode(latents, uint8=True)
+        return ae.decode(latents, uint8=True)
 
 
 # https://github.com/black-forest-labs/flux2/blob/b56ac614/src/flux2/sampling.py#L244
@@ -197,7 +197,7 @@ def flux2_generate(
     txt: Tensor,
     neg_txt: Tensor | None = None,
     ref_latents: list[Tensor] | None = None,
-    guidance: Tensor | float | None = 3.5,
+    guidance: Tensor | float | None = None,
     cfg_scale: float = 1.0,
     solver: str = "euler",
     pbar: bool = False,
