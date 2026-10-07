@@ -30,36 +30,44 @@ def _rope_kernel(
     stride_xl,
     stride_ob,
     stride_ol,
+    H,
     D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     eps=1e-6,
 ):
     pid_l = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_b = tl.program_id(2)
+    pid_b = tl.program_id(1)
 
-    BLOCK_DIM: tl.constexpr = triton.next_power_of_2(D)
-    offs = tl.arange(0, BLOCK_DIM)
-    mask = offs < D
-    x_ptrs = x_ptr + (pid_b * stride_xb + pid_l * stride_xl + pid_h * D + offs)
-    x = tl.load(x_ptrs, mask, other=0.0).to(tl.float32)
+    BLOCK_D: tl.constexpr = triton.next_power_of_2(D)
+    offs_h = tl.arange(0, BLOCK_H)[:, None]
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+
+    x_ptrs = x_ptr + (pid_b * stride_xb + pid_l * stride_xl + offs_h * D + offs_d)
+    o_ptrs = o_ptr + (pid_b * stride_ob + pid_l * stride_ol + offs_h * D + offs_d)
 
     if norm_ptr is not None:
-        norm = tl.load(norm_ptr + offs, mask)
-        rrms = tl.rsqrt(tl.sum(x * x) * (1.0 / D) + eps)
-        x *= rrms * norm.to(tl.float32)
-        x = x.to(tl.bfloat16).to(tl.float32)
+        norm = tl.load(norm_ptr + offs_d, mask_d).to(tl.float32)
+    rope = tl.load(rope_ptr + (pid_l * D + offs_d), mask_d)
+    rope0, rope1 = rope.reshape(BLOCK_D // 2, 2).split()
 
-    x_lo, x_hi = x.reshape(BLOCK_DIM // 2, 2).split()
+    for h in range(tl.cdiv(H, BLOCK_H)):
+        mask_h = offs_h < H - h * BLOCK_H
+        x = tl.load(x_ptrs, mask_h & mask_d, other=0.0).to(tl.float32)
 
-    rope = tl.load(rope_ptr + (pid_l * D + offs), mask)
-    rope_lo, rope_hi = rope.reshape(BLOCK_DIM // 2, 2).split()
+        if norm_ptr is not None:
+            mean_sq = tl.sum(x * x, axis=1, keep_dims=True) * (1.0 / D)
+            x = x * tl.rsqrt(mean_sq + eps) * norm
+            # x = x.to(tl.bfloat16).to(tl.float32)
 
-    r_lo = x_lo * rope_lo - x_hi * rope_hi
-    r_hi = x_lo * rope_hi + x_hi * rope_lo
-    r = tl.join(r_lo, r_hi).reshape(BLOCK_DIM)
+        x0, x1 = x.reshape(BLOCK_H, BLOCK_D // 2, 2).split()
+        r0 = x0 * rope0 - x1 * rope1
+        r1 = x0 * rope1 + x1 * rope0
+        r = tl.join(r0, r1).reshape(BLOCK_H, BLOCK_D)
+        tl.store(o_ptrs, r, mask_h & mask_d)
 
-    o_ptrs = o_ptr + (pid_b * stride_ob + pid_l * stride_ol + pid_h * D + offs)
-    tl.store(o_ptrs, r, mask)
+        x_ptrs += BLOCK_H * D
+        o_ptrs += BLOCK_H * D
 
 
 def apply_rope(
@@ -78,7 +86,13 @@ def apply_rope(
             x = F.rms_norm(x, x.shape[-1:], norm, eps)
         cos, sin = torch.view_as_real(rope).unsqueeze(-3).unbind(-1)  # [L, 1, D/2] each
         x0, x1 = x.float().unflatten(-1, (-1, 2)).unbind(-1)  # [B, L, nH, D/2] each
-        x_ = torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1).flatten(-2)
+        x_ = torch.stack(
+            [
+                torch.addcmul(x0 * cos, x1, sin, value=-1),
+                torch.addcmul(x0 * sin, x1, cos),
+            ],
+            dim=-1,
+        ).flatten(-2)
         if out is not None:
             out.copy_(x_)
         else:
@@ -94,7 +108,9 @@ def apply_rope(
     else:
         out = torch.empty_like(x, dtype=out_dtype)
     B, L, H, D = x.shape
-    _rope_kernel[(L, H, B)](x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], D, eps)
+    BLOCK_H = 8  # 8x128 = 1024. so 4 warps issue 16B
+    grid = (L, B)
+    _rope_kernel[grid](x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], H, D, BLOCK_H, eps)
     return out
 
 
