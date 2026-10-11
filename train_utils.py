@@ -2,6 +2,7 @@ from functools import partial
 
 import numpy as np
 import torch
+import torch._functorch.config
 import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor, nn
@@ -19,7 +20,7 @@ from modelling.linear import Linear
 from time_sampler import TimeSampler
 
 
-def setup_model(model_name: str, lora: int, use_compile: bool):
+def setup_model(model_name: str, lora: int, use_compile: bool, mem_budget: float = 0.7, ckpt_ratio: float = 0.5):
     if model_name.startswith("flux2-"):
         model = load_flux2(model_name.removeprefix("flux2-"))
         layers = list(model.double_blocks) + list(model.single_blocks)
@@ -49,7 +50,7 @@ def setup_model(model_name: str, lora: int, use_compile: bool):
     ae.bfloat16().eval().cuda()
     text_embedder.cuda()
 
-    for layer in layers:
+    for i, layer in enumerate(layers):
         with torch.device("cuda"):
             for m in layer.modules():
                 if isinstance(m, Linear):
@@ -57,10 +58,14 @@ def setup_model(model_name: str, lora: int, use_compile: bool):
 
         # TODO: use selective activation checkpointing
         # https://pytorch.org/blog/activation-checkpointing-techniques/
-        fwd = partial(checkpoint, layer.forward, use_reentrant=False)
+        fwd = layer.forward
+        if i < len(layers) * ckpt_ratio:
+            fwd = partial(checkpoint, fwd, use_reentrant=False)
         if use_compile:
             fwd = torch.compile(fwd)
         layer.forward = fwd
+
+    torch._functorch.config.activation_memory_budget = mem_budget
 
     return model, ae, text_embedder
 
