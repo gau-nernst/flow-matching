@@ -5,7 +5,7 @@ from transformers import Qwen3Config
 
 from .linear import Linear
 from .rope import apply_rope, compute_rope
-from .utils import create_name_map_hook, load_hf_state_dict, make_merge_hook
+from .utils import create_remap_hook, create_weight_merge_hook, load_hf_state_dict
 
 
 class Qwen3Attention(nn.Module):
@@ -23,7 +23,7 @@ class Qwen3Attention(nn.Module):
         self.q_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
 
-        self.register_load_state_dict_pre_hook(make_merge_hook(["q_proj", "k_proj", "v_proj"], "qkv_proj"))
+        self.register_load_state_dict_pre_hook(create_weight_merge_hook(["q_proj", "k_proj", "v_proj"], "qkv_proj"))
 
     def forward(self, x: Tensor, pos_embeds: Tensor, add: Tensor | None = None) -> Tensor:
         qkv = self.qkv_proj(x).view(*x.shape[:-1], -1, self.head_dim)
@@ -42,12 +42,12 @@ class Qwen3MLP(nn.Module):
         self.w13 = Linear(cfg.hidden_size, cfg.intermediate_size * 2, bias=False)
         self.w2 = Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
-        self.register_load_state_dict_pre_hook(make_merge_hook(["gate_proj", "up_proj"], "w13"))
+        self.register_load_state_dict_pre_hook(create_weight_merge_hook(["gate_proj", "up_proj"], "w13"))
         remap_pairs = [
             ("down_proj.weight", "w2.weight"),
             ("down_proj.weight_scale_inv", "w2.weight_scale_inv"),
         ]
-        self.register_load_state_dict_pre_hook(create_name_map_hook(remap_pairs))
+        self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     def forward(self, x: Tensor, add: Tensor | None = None) -> Tensor:
         gate, up = self.w13(x).chunk(2, dim=-1)

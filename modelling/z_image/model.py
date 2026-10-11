@@ -12,7 +12,7 @@ from ..attn import dispatch_attn
 from ..flux1.model import timestep_embedding
 from ..linear import Linear, nvfp4_mm
 from ..rope import RopeND, apply_rope
-from ..utils import load_hf_state_dict, make_merge_hook
+from ..utils import create_weight_merge_hook, load_hf_state_dict
 from .gated_norm import gated_norm
 
 
@@ -39,13 +39,13 @@ class Attention(nn.Module):
         self.eps = eps
         self.attn_impl = "pt"
 
-        self.register_load_state_dict_pre_hook(make_merge_hook(["to_q", "to_k", "to_v"], "qkv"))
+        self.register_load_state_dict_pre_hook(create_weight_merge_hook(["to_q", "to_k", "to_v"], "qkv"))
 
     def forward(self, x: Tensor, pe: Tensor):
         q, k, v = self.qkv(x).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
         qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else x.dtype
-        q = apply_rope(q, pe, self.norm_q.weight, self.eps, out_dtype=qk_dtype)
-        k = apply_rope(k, pe, self.norm_k.weight, self.eps, out_dtype=qk_dtype)
+        q = apply_rope(q, pe, self.norm_q.weight, self.eps, out=torch.empty_like(q, dtype=qk_dtype))
+        k = apply_rope(k, pe, self.norm_k.weight, self.eps, out=torch.empty_like(k, dtype=qk_dtype))
         out = dispatch_attn(q, k, v, self.attn_impl).flatten(2)
         return self.to_out(out)
 

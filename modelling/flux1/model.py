@@ -11,7 +11,7 @@ from torch import Tensor, nn
 from ..attn import dispatch_attn
 from ..linear import Linear
 from ..rope import RopeND, apply_rope
-from ..utils import create_name_map_hook, load_hf_state_dict
+from ..utils import create_remap_hook, load_hf_state_dict
 from .modulate import modulate
 
 
@@ -53,7 +53,7 @@ class SelfAttention(nn.Module):
             ("norm.query_norm.scale", "q_norm.weight"),
             ("norm.key_norm.scale", "k_norm.weight"),
         ]
-        self.register_load_state_dict_pre_hook(create_name_map_hook(remap_pairs))
+        self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     def forward_qkv(self, x: Tensor):
         q, k, v = self.qkv(x).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
@@ -137,7 +137,7 @@ class SingleStreamBlock(nn.Module):
             ("norm.query_norm.scale", "q_norm.weight"),
             ("norm.key_norm.scale", "k_norm.weight"),
         ]
-        self.register_load_state_dict_pre_hook(create_name_map_hook(remap_pairs))
+        self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
         shift, scale, gate = self.modulation(vec)

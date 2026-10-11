@@ -21,11 +21,25 @@ def compute_rope(
 
 
 @triton.jit
-def _rope_kernel(
+def _rope(x, cos, sin, bwd: tl.constexpr = False):
+    BLOCK_H: tl.constexpr = x.shape[0]
+    BLOCK_D: tl.constexpr = x.shape[1]
+    x0, x1 = x.reshape(BLOCK_H, BLOCK_D // 2, 2).split()
+    if not bwd:
+        y0 = x0 * cos - x1 * sin
+        y1 = x0 * sin + x1 * cos
+    else:
+        y0 = x0 * cos + x1 * sin
+        y1 = -x0 * sin + x1 * cos
+    return tl.join(y0, y1).reshape(BLOCK_H, BLOCK_D)
+
+
+@triton.jit
+def _norm_rope_kernel(
     x_ptr,  # [B, L, H, D]
     rope_ptr,  # [L, D]
     norm_ptr,  # [D]
-    o_ptr,
+    y_ptr,
     stride_xb,
     stride_xl,
     stride_ob,
@@ -44,30 +58,42 @@ def _rope_kernel(
     mask_d = offs_d < D
 
     x_ptrs = x_ptr + (pid_b * stride_xb + pid_l * stride_xl + offs_h * D + offs_d)
-    o_ptrs = o_ptr + (pid_b * stride_ob + pid_l * stride_ol + offs_h * D + offs_d)
+    y_ptrs = y_ptr + (pid_b * stride_ob + pid_l * stride_ol + offs_h * D + offs_d)
 
+    rope = tl.load(rope_ptr + (pid_l * D + offs_d), mask_d)
+    cos, sin = rope.reshape(BLOCK_D // 2, 2).split()
     if norm_ptr is not None:
         norm = tl.load(norm_ptr + offs_d, mask_d).to(tl.float32)
-    rope = tl.load(rope_ptr + (pid_l * D + offs_d), mask_d)
-    rope0, rope1 = rope.reshape(BLOCK_D // 2, 2).split()
 
     for h in range(tl.cdiv(H, BLOCK_H)):
         mask_h = offs_h < H - h * BLOCK_H
-        x = tl.load(x_ptrs, mask_h & mask_d, other=0.0).to(tl.float32)
+        mask = mask_h & mask_d
+
+        x = tl.load(x_ptrs, mask, other=0.0).to(tl.float32)
 
         if norm_ptr is not None:
-            mean_sq = tl.sum(x * x, axis=1, keep_dims=True) * (1.0 / D)
-            x = x * tl.rsqrt(mean_sq + eps) * norm
+            rrms = tl.rsqrt(tl.sum(x * x, axis=1, keep_dims=True) * (1.0 / D) + eps)
+            x = x * rrms * norm
             # x = x.to(tl.bfloat16).to(tl.float32)
 
-        x0, x1 = x.reshape(BLOCK_H, BLOCK_D // 2, 2).split()
-        r0 = x0 * rope0 - x1 * rope1
-        r1 = x0 * rope1 + x1 * rope0
-        r = tl.join(r0, r1).reshape(BLOCK_H, BLOCK_D)
-        tl.store(o_ptrs, r, mask_h & mask_d)
+        tl.store(y_ptrs, _rope(x, cos, sin), mask)
 
         x_ptrs += BLOCK_H * D
-        o_ptrs += BLOCK_H * D
+        y_ptrs += BLOCK_H * D
+
+
+def _norm_rope_ref(x: Tensor, rope: Tensor, norm: Tensor | None = None, eps: float = 1e-6):
+    if norm is not None:
+        x = F.rms_norm(x, x.shape[-1:], norm, eps)
+    cos, sin = torch.view_as_real(rope).unsqueeze(-3).unbind(-1)  # [L, 1, D/2] each
+    x0, x1 = x.float().unflatten(-1, (-1, 2)).unbind(-1)  # [B, L, nH, D/2] each
+    return torch.stack(
+        [
+            torch.addcmul(x0 * cos, x1, sin, value=-1),
+            torch.addcmul(x0 * sin, x1, cos),
+        ],
+        dim=-1,
+    ).flatten(-2)
 
 
 def apply_rope(
@@ -77,27 +103,12 @@ def apply_rope(
     eps: float = 1e-6,
     *,
     out: Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
 ) -> Tensor:
     # x: [B, L, nH, D] in real
     # rope: [L, D/2] in complex
-    if torch.is_grad_enabled():
-        if norm is not None:
-            x = F.rms_norm(x, x.shape[-1:], norm, eps)
-        cos, sin = torch.view_as_real(rope).unsqueeze(-3).unbind(-1)  # [L, 1, D/2] each
-        x0, x1 = x.float().unflatten(-1, (-1, 2)).unbind(-1)  # [B, L, nH, D/2] each
-        x_ = torch.stack(
-            [
-                torch.addcmul(x0 * cos, x1, sin, value=-1),
-                torch.addcmul(x0 * sin, x1, cos),
-            ],
-            dim=-1,
-        ).flatten(-2)
-        if out is not None:
-            out.copy_(x_)
-        else:
-            out = x_.type_as(x)
-        return out
+    if any([x.requires_grad, rope.requires_grad, norm.requires_grad if norm is not None else False]):
+        out_ = _norm_rope_ref(x, rope, norm, eps)
+        return out.copy_(out_) if out is not None else out_.type_as(x)
 
     assert x[0, 0].is_contiguous() and rope.is_contiguous()
     if norm is not None:
@@ -106,11 +117,11 @@ def apply_rope(
     if out is not None:
         assert out[0, 0].is_contiguous()
     else:
-        out = torch.empty_like(x, dtype=out_dtype)
+        out = torch.empty_like(x)
     B, L, H, D = x.shape
     BLOCK_H = 8  # 8x128 = 1024. so 4 warps issue 16B
     grid = (L, B)
-    _rope_kernel[grid](x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], H, D, BLOCK_H, eps)
+    _norm_rope_kernel[grid](x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], H, D, BLOCK_H, eps=eps)
     return out
 
 

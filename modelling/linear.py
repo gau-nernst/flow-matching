@@ -82,16 +82,14 @@ class Linear(nn.Module):
 
         else:
             # bf16
-            if self.bias is None and add is not None:
-                out = torch.addmm(add, x, self.weight.T)
-            else:
-                out = F.linear(x, self.weight, self.bias)
-                if add is not None:
-                    out = out + add
+            out = F.linear(x, self.weight, self.bias)
+            if add is not None:
+                out = out + add
 
         if hasattr(self, "lora_a"):
             alpha = self.lora_scale / self.lora_a.shape[0]
-            out = torch.add(out, x @ self.lora_a.to(x.dtype).T @ self.lora_b.to(x.dtype).T, alpha=alpha)
+            h = (x @ self.lora_a.to(x.dtype).T) * alpha
+            out = out + h @ self.lora_b.to(x.dtype).T
 
         return out.view(*dims, -1)
 

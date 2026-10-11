@@ -13,7 +13,7 @@ from ..flux1.model import LastLayer, MLPEmbedder, Modulation, timestep_embedding
 from ..flux1.modulate import modulate
 from ..linear import Linear, nvfp4_mm
 from ..rope import RopeND, apply_rope
-from ..utils import create_name_map_hook, load_hf_state_dict
+from ..utils import create_remap_hook, load_hf_state_dict
 
 
 class MLP(nn.ModuleList):
@@ -78,7 +78,7 @@ class DoubleStreamBlock(nn.Module):
             ("txt_attn.norm.query_norm.scale", "txt_attn.q_norm"),
             ("txt_attn.norm.key_norm.scale", "txt_attn.k_norm"),
         ]
-        self.register_load_state_dict_pre_hook(create_name_map_hook(remap_pairs))
+        self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     def forward(
         self,
@@ -142,7 +142,7 @@ class SingleStreamBlock(nn.Module):
             ("norm.query_norm.scale", "q_norm"),
             ("norm.key_norm.scale", "k_norm"),
         ]
-        self.register_load_state_dict_pre_hook(create_name_map_hook(remap_pairs))
+        self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     def forward(self, x: Tensor, res: Tensor | None, pe: Tensor, mod: tuple[Tensor, ...]) -> Tensor:
         # TODO: fuse quantize with modulate
@@ -169,8 +169,8 @@ class SingleStreamBlock(nn.Module):
 
         qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else x.dtype
         q, k, v = qkv.unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
-        q = apply_rope(q, pe, self.q_norm, self.eps, out_dtype=qk_dtype)
-        k = apply_rope(k, pe, self.k_norm, self.eps, out_dtype=qk_dtype)
+        q = apply_rope(q, pe, self.q_norm, self.eps, out=torch.empty_like(q, dtype=qk_dtype))
+        k = apply_rope(k, pe, self.k_norm, self.eps, out=torch.empty_like(k, dtype=qk_dtype))
         attn = dispatch_attn(q, k, v, impl=self.attn_impl).flatten(2)
 
         # TODO: pre-allocate attn+mlp buffer

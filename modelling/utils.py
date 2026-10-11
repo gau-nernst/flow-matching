@@ -33,7 +33,7 @@ def load_hf_state_dict(repo_id: str, filename: str, prefix: str | None = None):
     return state_dict
 
 
-def create_name_map_hook(pairs: list[tuple[str, str]]):
+def create_remap_hook(pairs: list[tuple[str, str]]):
     def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         for old, new in pairs:
             if f"{prefix}{old}" in state_dict:
@@ -42,7 +42,7 @@ def create_name_map_hook(pairs: list[tuple[str, str]]):
     return hook
 
 
-def make_merge_hook(old_keys: list[str], new_key: str):
+def create_weight_merge_hook(old_keys: list[str], new_key: str):
     def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         for suffix in ("weight", "weight_scale_inv"):
             if f"{prefix}{old_keys[0]}.{suffix}" not in state_dict:
