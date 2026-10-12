@@ -147,6 +147,7 @@ if __name__ == "__main__":
     parser.add_argument("--min_size", type=int, default=512)
     parser.add_argument("--max_size", type=int, default=1024)
     parser.add_argument("--lora", type=int, default=8)
+    parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--time_sampler", default="LogitNormal()")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--mem_budget", type=float, default=0.7)
@@ -196,7 +197,9 @@ if __name__ == "__main__":
         train_dloader = create_dloader(args.train_ds, batch_size)
         distill_dloader = None
 
-    model, ae, text_embedder = setup_model(args.model, args.lora, args.compile, args.mem_budget, args.ckpt_ratio)
+    model, ae, text_embedder = setup_model(
+        args.model, args.lora, args.fp8, args.compile, args.mem_budget, args.ckpt_ratio
+    )
     ema = EMA(model) if args.ema else None
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
     logger.info(model)

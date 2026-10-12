@@ -88,8 +88,9 @@ class Linear(nn.Module):
                 out = out + add
 
         elif self.is_fp8_1d2d():
-            xq, xs = quantize_fp8_1d(x)
-            out = sm120_mm_fp8_1d2d.mm(xq, xs, self.weight, self.weight_scale_inv, self.bias, add)
+            out = FP8_1d2dFunc.apply(x, self.weight, self.weight_scale_inv, self.bias)
+            if add is not None:
+                out = out + add
 
         else:
             # bf16
@@ -155,3 +156,53 @@ def fp8_tensor_quantize(x: Tensor, scale: Tensor):
     grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(M, BLOCK_M), 1)
     _fp8_tensor_quantize_kernel[grid](x, out, scale, M, N, x.stride(0), out.stride(0), BLOCK_M, BLOCK_N)
     return out
+
+
+class FP8_1d2dFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(x: Tensor, w: Tensor, ws: Tensor, bias: Tensor | None):
+        xq, xs = _quantize_fp8_1d(x)
+        return fp8_1d2d_mm(xq, xs, w, ws, bias)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        _, w, ws, _ = inputs
+        ctx.save_for_backward(w, ws)
+
+    @staticmethod
+    def backward(ctx, grad_y: Tensor):
+        grad_x = grad_w = grad_ws = grad_bias = None
+        w, ws = ctx.saved_tensors
+
+        if ctx.needs_input_grad[0]:
+            # TODO: support N-major weight
+            grad_yq, grad_ys = _quantize_fp8_1d(grad_y)
+            grad_x = fp8_1d2d_mm(grad_yq, grad_ys, w.T.contiguous(), ws.T)
+        if ctx.needs_input_grad[3]:
+            grad_bias = grad_y.sum(0)
+        return grad_x, grad_w, grad_ws, grad_bias
+
+
+@torch.library.custom_op("gn_flow_matching::fp8_1d2d_mm", mutates_args=(), device_types="cuda")
+def fp8_1d2d_mm(x: Tensor, xs: Tensor, w: Tensor, ws: Tensor, bias: Tensor | None = None) -> Tensor:
+    return sm120_mm_fp8_1d2d.mm(x, xs, w, ws, bias)
+
+
+@fp8_1d2d_mm.register_fake
+def _(x: Tensor, xs: Tensor, w: Tensor, ws: Tensor, bias: Tensor | None = None) -> Tensor:
+    return x.new_empty(x.shape[0], w.shape[0], dtype=torch.bfloat16)
+
+
+def _quantize_fp8_1d(x: Tensor):
+    # decompose for torch.compile
+    if torch.compiler.is_compiling():
+        M, N = x.shape
+        x = x.reshape(M, N // 128, 128)
+        inv_scale = 448.0 * x.abs().amax(dim=2, keepdim=True).float().clip(1e-12).reciprocal()
+        xq = (x * inv_scale).clip(-448.0, 448.0).to(torch.float8_e4m3fn).view(M, N)
+        pad_M = triton.cdiv(M, 4) * 4 - M  # alignment
+        scale = F.pad(inv_scale.reciprocal().squeeze(2).T, (0, pad_M)).contiguous().T[:M]  # alignment
+        return xq, scale
+
+    # hand-written Triton kernel
+    return quantize_fp8_1d(x)

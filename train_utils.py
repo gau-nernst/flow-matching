@@ -20,7 +20,9 @@ from modelling.linear import Linear
 from time_sampler import TimeSampler
 
 
-def setup_model(model_name: str, lora: int, use_compile: bool, mem_budget: float = 0.7, ckpt_ratio: float = 0.5):
+def setup_model(
+    model_name: str, lora: int, fp8: bool, use_compile: bool, mem_budget: float = 0.7, ckpt_ratio: float = 0.5
+):
     if model_name.startswith("flux2-"):
         model = load_flux2(model_name.removeprefix("flux2-"))
         layers = list(model.double_blocks) + list(model.single_blocks)
@@ -54,6 +56,8 @@ def setup_model(model_name: str, lora: int, use_compile: bool, mem_budget: float
         with torch.device("cuda"):
             for m in layer.modules():
                 if isinstance(m, Linear):
+                    if fp8:
+                        m.to_fp8_1d2d()
                     m.init_lora(lora)
 
         # TODO: use selective activation checkpointing
