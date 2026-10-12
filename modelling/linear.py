@@ -5,6 +5,7 @@ import triton.language as tl
 from gn_kernels import quantize_fp8_1d, quantize_nvfp4_triton
 from gn_kernels.cutedsl.sm120 import sm120_mm_fp8_1d2d
 from torch import Tensor, nn
+from torch.utils.flop_counter import register_flop_formula
 
 
 def nvfp4_mm(x: Tensor, xs: Tensor, xs2: Tensor, w: Tensor, ws: Tensor, ws2: Tensor, bias: Tensor | None = None):
@@ -101,7 +102,7 @@ class Linear(nn.Module):
         if hasattr(self, "lora_a"):
             alpha = self.lora_scale / self.lora_a.shape[0]
             h = (x @ self.lora_a.to(x.dtype).T) * alpha
-            out = out + h @ self.lora_b.to(x.dtype).T
+            out = LoraBFunc.apply(h, self.lora_b, out)
 
         return out.view(*dims, -1)
 
@@ -193,6 +194,14 @@ def _(x: Tensor, xs: Tensor, w: Tensor, ws: Tensor, bias: Tensor | None = None) 
     return x.new_empty(x.shape[0], w.shape[0], dtype=torch.bfloat16)
 
 
+# required for correct interaction with activation checkpointing budget
+@register_flop_formula(torch.ops.gn_flow_matching.fp8_1d2d_mm)
+def _(x_shape, xs_shape, w_shape, ws_shape, bias_shape=None, *, out_shape=None, **kwargs) -> int:
+    M, K = x_shape
+    N, _ = w_shape
+    return 2 * M * N * K // 2  # divide by 2 due to FP8
+
+
 def _quantize_fp8_1d(x: Tensor):
     # decompose for torch.compile
     if torch.compiler.is_compiling():
@@ -206,3 +215,89 @@ def _quantize_fp8_1d(x: Tensor):
 
     # hand-written Triton kernel
     return quantize_fp8_1d(x)
+
+
+class LoraBFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(x: Tensor, w: Tensor, add: Tensor) -> Tensor:
+        return small_k_mm(x, w, add)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, w, _ = inputs
+        ctx.save_for_backward(x, w)
+
+    @staticmethod
+    def backward(ctx, grad_y: Tensor):
+        grad_x = grad_w = grad_add = None
+        x, w = ctx.saved_tensors
+
+        if ctx.needs_input_grad[0]:
+            grad_x = grad_y @ w.to(grad_y.dtype)  # reduction dim = N
+        if ctx.needs_input_grad[1]:
+            grad_w = torch.mm(grad_y.T, x, out_dtype=w.dtype)  # reduction dim = M
+        if ctx.needs_input_grad[2]:
+            grad_add = grad_y
+        return grad_x, grad_w, grad_add
+
+
+@triton.jit
+def _small_k_mm_kernel(
+    x_ptr,  # [M, K]
+    w_ptr,  # [N, K]
+    add_ptr,  # [M, N]
+    y_ptr,  # [M, N]
+    stride_xm,
+    stride_wn,
+    stride_am,
+    stride_ym,
+    M,
+    N,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_n = tl.program_id(0).to(tl.int64)
+    pid_m = tl.program_id(1).to(tl.int64)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + tl.arange(0, 2)
+    w_ptrs = w_ptr + offs_n[:, None] * stride_wn + tl.arange(0, 2)
+
+    mask = mask_m[:, None] & mask_n
+    acc = tl.load(add_ptr + (offs_m[:, None] * stride_am + offs_n), mask).to(tl.float32)
+
+    for _ in range(K // 2):
+        x = tl.load(x_ptrs, mask_m[:, None])
+        w = tl.load(w_ptrs, mask_n[:, None])
+        x0, x1 = x.split()
+        w0, w1 = w.split()
+        acc += x0.to(tl.float32)[:, None] * w0.to(tl.float32)
+        acc += x1.to(tl.float32)[:, None] * w1.to(tl.float32)
+        x_ptrs += 2
+        w_ptrs += 2
+
+    tl.store(y_ptr + (offs_m[:, None] * stride_ym + offs_n), acc, mask)
+
+
+def small_k_mm(x: Tensor, w: Tensor, add: Tensor):
+    # there are 2 problems (x @ w.T + add) has with torch.compile
+    # - the op is rewritten as torch.addmm(add, x, w.T). this performs a memcpy on add before calling CuBLAS,
+    #   which is wasteful.
+    # - the GEMM kernel itself is slow for small K (due to low-rank).
+    # right now this kernel is good up to K=16
+    assert x.stride(1) == 1 and w.stride(1) == 1 and add.stride(1) == 1
+    M, K = x.shape
+    N, _ = w.shape
+
+    out = x.new_empty(M, N)
+    BLOCK_M, BLOCK_N = 128, 128
+    grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(M, BLOCK_M), 1)
+    _small_k_mm_kernel[grid](
+        x, w, add, out, x.stride(0), w.stride(0), add.stride(0), out.stride(0), M, N, K, BLOCK_M, BLOCK_N
+    )
+    return out

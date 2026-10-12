@@ -70,6 +70,7 @@ def setup_model(
         layer.forward = fwd
 
     torch._functorch.config.activation_memory_budget = mem_budget
+    torch._functorch.config.is_non_builtin_to_include = True  # without this, mem budget ignores custom ops' cost
 
     return model, ae, text_embedder
 
