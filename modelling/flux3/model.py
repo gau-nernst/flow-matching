@@ -94,9 +94,15 @@ class Flux3(nn.Module):
         if cfg.flow_map:
             self.ref_time_in = MLPEmbedder(256, cfg.dim, bias=False)
 
+        # use our Linear, since modulation weights are quantized in FP8/NVFP4 checkpoints
+        def make_mod():
+            mod = Modulation(cfg.dim, double=False, bias=False)
+            mod.lin = Linear(cfg.dim, cfg.dim * 3, bias=False)
+            return mod
+
         modes = ("image", "image_cond", "txt")
-        self.early_stream_modulations = nn.ModuleDict({k: Modulation(cfg.dim, double=False, bias=False) for k in modes})
-        self.single_stream_modulations = nn.ModuleDict({k: Modulation(cfg.dim, double=False, bias=False) for k in modes})
+        self.early_stream_modulations = nn.ModuleDict({k: make_mod() for k in modes})
+        self.single_stream_modulations = nn.ModuleDict({k: make_mod() for k in modes})
 
         # per-mode blocks: each mode only attends to itself
         self.content_mode_blocks = nn.ModuleDict({k: make_blocks(cfg.num_mode_blocks) for k in ("image", "image_cond")})
@@ -227,6 +233,8 @@ def _load_flux3(repo_id: str, filename: str):
 def load_flux3(name: str = "klein"):
     repo_id, filename = {
         "klein": ("black-forest-labs/flux-3-image-klein", "model.safetensors"),
+        "klein-fp8": ("black-forest-labs/flux-3-image-klein", "variants/fp8r/model.safetensors"),
+        "klein-nvfp4": ("black-forest-labs/flux-3-image-klein", "variants/nvfp4/model.safetensors"),
         "klein-base": ("black-forest-labs/flux-3-image-klein-base", "model.safetensors"),
     }[name]
 

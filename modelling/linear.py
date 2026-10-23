@@ -30,6 +30,10 @@ class Linear(nn.Module):
                 self.register_buffer("weight_scale", torch.empty(out_dim, in_dim // 16, dtype=torch.float8_e4m3fn))
                 self.register_buffer("weight_scale_2", torch.empty((), dtype=torch.float32))
 
+            elif f"{prefix}weight_scale" in state_dict and state_dict[f"{prefix}weight_scale"].ndim == 1:
+                # fp8 row-wise weight, dynamic row-wise activation e.g. Flux.3
+                self.register_buffer("weight_scale", torch.empty(out_dim, dtype=torch.float32))
+
             elif f"{prefix}weight_scale" in state_dict:
                 # fp8 tensor
                 self.register_buffer("input_scale", torch.empty((), dtype=torch.float32))
@@ -88,6 +92,21 @@ class Linear(nn.Module):
             if add is not None:
                 out = out + add
 
+        elif self.is_fp8_rowwise():
+            xq, xs = fp8_rowwise_quantize(x)
+            out = F.scaled_mm(
+                xq,
+                self.weight.T,
+                xs,
+                F.ScalingType.RowWise,
+                self.weight_scale[None],
+                F.ScalingType.RowWise,
+                bias=self.bias,
+                use_fast_accum=True,
+            )
+            if add is not None:
+                out = out + add
+
         elif self.is_fp8_1d2d():
             out = FP8_1d2dFunc.apply(x, self.weight, self.weight_scale_inv, self.bias)
             if add is not None:
@@ -112,6 +131,10 @@ class Linear(nn.Module):
     def is_fp8_tensor(self):
         ws = getattr(self, "weight_scale", None)
         return ws is not None and ws.shape == ()
+
+    def is_fp8_rowwise(self):
+        ws = getattr(self, "weight_scale", None)
+        return ws is not None and ws.dtype == torch.float32 and ws.ndim == 1
 
     def is_fp8_1d2d(self):
         return hasattr(self, "weight_scale_inv")
@@ -147,6 +170,13 @@ def _fp8_tensor_quantize_kernel(
     x = tl.load(x_ptr + offs_m * stride_xm + offs_n, mask)  # [BLOCK_M, BLOCK_N]
     x /= scale
     tl.store(o_ptr + offs_m * stride_om + offs_n, x, mask)
+
+
+# TODO: triton kernel
+def fp8_rowwise_quantize(x: Tensor) -> tuple[Tensor, Tensor]:
+    scale = (x.abs().amax(dim=1, keepdim=True).float() / 448.0).clip(1e-12)
+    xq = (x.float() / scale).clip(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return xq, scale
 
 
 def fp8_tensor_quantize(x: Tensor, scale: Tensor):
