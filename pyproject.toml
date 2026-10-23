@@ -16,6 +16,7 @@ dependencies = [
     "accelerate>=1.12.0",
     "fastapi[standard]>=0.115.0",
     "requests>=2.32.3",
+    "flash-linear-attention>=0.5.2",
 ]
 
 [tool.ruff]
