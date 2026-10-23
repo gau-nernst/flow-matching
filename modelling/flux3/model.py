@@ -11,10 +11,11 @@ from ..flux1.modulate import modulate
 from ..flux2.model import MLP
 from ..linear import Linear
 from ..rope import apply_rope
-from ..utils import create_remap_hook, create_weight_merge_hook, load_hf_state_dict
+from ..utils import create_remap_hook, load_hf_state_dict
 
 
 # same as Flux.2's SingleStreamBlock, but with separate q/k/v/mlp_in and attn_out/mlp_out weights.
+# we don't merge q/k/v: quantized checkpoints have separate scales for each, and merging only gives <1% speedup.
 # xs is a list of segments, each with its own modulation (e.g. image and text in single-stream blocks).
 # they are concatenated for qkv/mlp projections and attention.
 class Block(nn.Module):
@@ -24,19 +25,21 @@ class Block(nn.Module):
         self.eps = eps
         self.attn_impl = "pt"
 
-        self.qkv = Linear(dim, dim * 3, bias=False)
+        self.q_proj = Linear(dim, dim, bias=False)
+        self.k_proj = Linear(dim, dim, bias=False)
+        self.v_proj = Linear(dim, dim, bias=False)
         self.attn_out = Linear(dim, dim, bias=False)
         self.mlp = MLP(dim, int(dim * mlp_ratio))
         self.q_norm = nn.Parameter(torch.empty(self.head_dim))
         self.k_norm = nn.Parameter(torch.empty(self.head_dim))
 
-        self.register_load_state_dict_pre_hook(create_weight_merge_hook(["q_proj", "k_proj", "v_proj"], "qkv"))
         remap_pairs = [
-            ("mlp_in.weight", "mlp.0.weight"),
-            ("mlp_out.weight", "mlp.2.weight"),
             ("norm.query_norm.scale", "q_norm"),
             ("norm.key_norm.scale", "k_norm"),
         ]
+        for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale"):
+            remap_pairs.append((f"mlp_in.{suffix}", f"mlp.0.{suffix}"))
+            remap_pairs.append((f"mlp_out.{suffix}", f"mlp.2.{suffix}"))
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     def forward(
@@ -54,9 +57,9 @@ class Block(nn.Module):
             new_xs.append(x)
         x_mod = torch.cat(x_mods, dim=1) if len(x_mods) > 1 else x_mods[0]
 
-        q, k, v = self.qkv(x_mod).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
-        q = apply_rope(q, pe, self.q_norm, self.eps)
-        k = apply_rope(k, pe, self.k_norm, self.eps)
+        q = apply_rope(self.q_proj(x_mod).unflatten(2, (-1, self.head_dim)), pe, self.q_norm, self.eps)
+        k = apply_rope(self.k_proj(x_mod).unflatten(2, (-1, self.head_dim)), pe, self.k_norm, self.eps)
+        v = self.v_proj(x_mod).unflatten(2, (-1, self.head_dim))
         attn = dispatch_attn(q, k, v, impl=self.attn_impl).flatten(2)
 
         # TODO: fuse residual
