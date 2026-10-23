@@ -4,7 +4,9 @@
 import math
 from collections.abc import Callable
 
+import numpy as np
 import torch
+from PIL import Image, ImageOps
 from torch import Tensor, nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizer
@@ -100,12 +102,14 @@ class Flux3Pipeline:
             m.cuda()
         return self
 
-    # TODO: reference images, CFG for base model
+    # TODO: CFG for base model
+    # img_size: (height, width). default to 1024x1024 for T2I, and the (prepared) 1st reference image size for TI2I.
     @torch.no_grad()
     def generate(
         self,
         prompt: str | list[str],
-        img_size: int | tuple[int, int] = 1024,
+        ref_imgs: list[Image.Image] | None = None,
+        img_size: int | tuple[int, int] | None = None,
         num_steps: int = 16,
         alpha: float = 16.0,
         seed: int | None = None,
@@ -115,17 +119,39 @@ class Flux3Pipeline:
     ) -> Tensor:
         assert self.flux.cfg.flow_map, "only distilled (flow map) model is supported for now"
         txt = self.text_encoder(prompt)
-
         bsize = txt.shape[0]
-        if isinstance(img_size, int):
-            height = width = img_size
-        else:
-            height, width = img_size
-
         ae = self.ae
+        device = ae.encoder.conv_in.weight.device
+
+        # official: a single reference is reflect-padded to a multiple of 16, and the output is cropped back.
+        # multiple references are center-cropped instead.
+        ref_imgs = list(ref_imgs or [])
+        crop_box = None
+        if len(ref_imgs) == 1:
+            ref_imgs[0], crop_box = flux3_prepare_reference(ref_imgs[0])
+        else:
+            ref_imgs = [flux3_prepare_multi_reference(img) for img in ref_imgs]
+
+        if img_size is None:
+            width, height = ref_imgs[0].size if ref_imgs else (1024, 1024)
+        else:
+            crop_box = None
+            height, width = (img_size, img_size) if isinstance(img_size, int) else img_size
+
+        cond = cond_rope = None
+        if ref_imgs:
+            cond_list = []
+            cond_rope_list = []
+            for i, img in enumerate(ref_imgs):
+                img = torch.from_numpy(np.array(img)).to(device)
+                z = ae.encode(img.unsqueeze(0))  # (1, h, w, C)
+                cond_list.append(z.flatten(1, 2))
+                cond_rope_list.append(self.flux.make_img_rope(z.shape[1], z.shape[2], l=-(i + 1), device=device))
+            cond = torch.cat(cond_list, dim=1).expand(bsize, -1, -1)
+            cond_rope = torch.cat(cond_rope_list, dim=0)
+
         H = height // ae.downsample // 2
         W = width // ae.downsample // 2
-        device = ae.encoder.conv_in.weight.device
 
         # same as official: CPU RNG, round to BF16, keep latents in FP32
         rng = torch.Generator().manual_seed(seed) if seed is not None else None
@@ -137,11 +163,65 @@ class Flux3Pipeline:
             img_size=(H, W),
             timesteps=flux3_timesteps(num_steps, alpha),
             txt=txt,
+            cond=cond,
+            cond_rope=cond_rope,
             solver=solver,
             pbar=pbar,
             progress_cb=progress_cb,
         )
-        return ae.decode(latents.unflatten(1, (H, W)), uint8=True)
+        out = ae.decode(latents.unflatten(1, (H, W)), uint8=True)  # (B, H, W, 3)
+
+        if crop_box is not None:
+            left, top, right, bottom = crop_box
+            out = out[:, top:bottom, left:right]
+        return out
+
+
+# https://github.com/black-forest-labs/flux-3-image-klein/blob/bfc8889/src/flux3/pipeline.py#L131
+# fit within 4MP (sides <= 4096), then reflect-pad to a multiple of 16 (sides >= 64).
+# returns the padded image, and the (left, top, right, bottom) box of the original image inside it (None if no pad).
+def flux3_prepare_reference(img: Image.Image) -> tuple[Image.Image, tuple[int, int, int, int] | None]:
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    max_pixels = 4 * 1024 * 1024
+    ceil16 = lambda x: -(-x // 16) * 16
+
+    scale = min(1.0, math.sqrt(max_pixels / (img.width * img.height)), 4096 / max(img.size))
+    while True:
+        fit = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+        w, h = (min(4096, max(64, ceil16(x))) for x in fit)
+        if w * h <= max_pixels:
+            break
+        scale *= 0.995
+
+    if fit != img.size:
+        img = img.resize(fit, Image.Resampling.LANCZOS)
+    if (w, h) == img.size:
+        return img, None
+
+    left = (w - img.width) // 2
+    top = (h - img.height) // 2
+    padding = ((top, h - img.height - top), (left, w - img.width - left), (0, 0))
+    mode = "reflect" if min(img.size) > 16 else "symmetric"  # reflect needs pad shorter than the side
+    img_padded = Image.fromarray(np.pad(np.asarray(img), padding, mode=mode))
+    return img_padded, (left, top, left + img.width, top + img.height)
+
+
+# https://github.com/black-forest-labs/flux-3-image-klein/blob/bfc8889/src/flux3/pipeline.py#L161
+# fit within 1MP, then center-crop to a multiple of 16.
+def flux3_prepare_multi_reference(img: Image.Image) -> Image.Image:
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    max_pixels = 1024 * 1024
+    W, H = img.size
+    if W * H > max_pixels:
+        scale = math.sqrt(max_pixels / (W * H))
+        W, H = int(W * scale), int(H * scale)
+        img = img.resize((W, H), Image.Resampling.LANCZOS)
+
+    w = W // 16 * 16
+    h = H // 16 * 16
+    left = (W - w) // 2
+    top = (H - h) // 2
+    return img.crop((left, top, left + w, top + h))
 
 
 # https://github.com/black-forest-labs/flux-3-image-klein/blob/bfc8889/src/flux3/sampling.py#L9
@@ -158,6 +238,8 @@ def flux3_generate(
     img_size: tuple[int, int],
     timesteps: list[float],
     txt: Tensor,
+    cond: Tensor | None = None,
+    cond_rope: Tensor | None = None,
     solver: str = "euler",
     pbar: bool = False,
     progress_cb: Callable[[int, int], None] | None = None,
@@ -168,14 +250,14 @@ def flux3_generate(
     solver_ = get_solver(solver, timesteps)
     timesteps_tensor = torch.tensor(timesteps).to(latents.device, non_blocking=True)
 
-    img_rope = flux.make_img_rope(H, W, latents.device)
+    img_rope = flux.make_img_rope(H, W, device=latents.device)
     txt_rope = flux.make_txt_rope(txt.shape[1], latents.device)
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
         # flow map: the model also takes the timestep it jumps to
         t = timesteps_tensor[i].expand(B)
         t_next = timesteps_tensor[i + 1].expand(B)
-        v = flux(latents, t, txt, img_rope, txt_rope, ref_time=t_next).float()
+        v = flux(latents, t, txt, img_rope, txt_rope, ref_time=t_next, cond=cond, cond_rope=cond_rope).float()
 
         latents = solver_.step(latents, v, i)
         if progress_cb is not None:

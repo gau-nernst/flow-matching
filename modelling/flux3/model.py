@@ -103,8 +103,9 @@ class Flux3(nn.Module):
         self.final_layer = nn.ModuleDict({"image": LastLayer(cfg.dim, 1, cfg.img_dim, bias=False)})
 
     # 4D RoPE (t, h, w, l) with theta=10_000 and float positions
-    # - image: (0, h/2, w/2, 0)
-    # - text:  (0, 0, 0, l)
+    # - image:     (0, h/2, w/2, 0)
+    # - image_cond (reference image i, 0-indexed): (0, h/2, w/2, -(i+1))
+    # - text:      (0, 0, 0, l)
     @staticmethod
     def make_rope(ids: Tensor) -> Tensor:
         rope_list = []
@@ -116,10 +117,10 @@ class Flux3(nn.Module):
         return torch.cat(rope_list, dim=-1)
 
     @staticmethod
-    def make_img_rope(H: int, W: int, device: torch.types.Device = None) -> Tensor:
+    def make_img_rope(H: int, W: int, l: int = 0, device: torch.types.Device = None) -> Tensor:
         h, w = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij")
         zeros = torch.zeros_like(h)
-        ids = torch.stack([zeros, h * 0.5, w * 0.5, zeros], dim=-1).flatten(0, 1)
+        ids = torch.stack([zeros, h * 0.5, w * 0.5, torch.full_like(h, l)], dim=-1).flatten(0, 1)
         return Flux3.make_rope(ids)
 
     @staticmethod
@@ -134,7 +135,7 @@ class Flux3(nn.Module):
         t = (t.bfloat16() * 1000).float()
         return mlp(timestep_embedding(t, 256, time_factor=1.0).to(self.txt_in.weight.dtype))
 
-    # TODO: image_cond
+    # cond: tokens of all reference images, concatenated along the sequence dim
     def forward(
         self,
         img: Tensor,
@@ -143,38 +144,50 @@ class Flux3(nn.Module):
         img_rope: Tensor,
         txt_rope: Tensor,
         ref_time: Tensor | None = None,
+        cond: Tensor | None = None,
+        cond_rope: Tensor | None = None,
     ) -> Tensor:
         assert (ref_time is not None) == self.cfg.flow_map
+        assert (cond is None) == (cond_rope is None)
+        dtype = self.txt_in.weight.dtype
 
-        img = self.emb_in["image"](img.to(self.txt_in.weight.dtype))
-        txt = self.txt_in(txt)
+        xs = dict(image=self.emb_in["image"](img.to(dtype)), txt=self.txt_in(txt))
+        ropes = dict(image=img_rope, txt=txt_rope)
+        if cond is not None:
+            xs["image_cond"] = self.emb_in["image_cond"](cond.to(dtype))
+            ropes["image_cond"] = cond_rope
 
-        # text is always at t=0
+        # text and reference images are always at t=0
         vec_img = self.time_embed(self.time_in, time)
-        vec_txt = self.time_embed(self.time_in, torch.zeros_like(time))
+        vec_zero = self.time_embed(self.time_in, torch.zeros_like(time))
         if ref_time is not None:
             vec_ref = self.time_embed(self.ref_time_in, ref_time)
             vec_img = vec_img + vec_ref
-            vec_txt = vec_txt + vec_ref
+            vec_zero = vec_zero + vec_ref
+        vecs = {k: vec_img if k == "image" else vec_zero for k in xs}
 
-        mod_img = self.early_stream_modulations["image"](vec_img)
-        mod_txt = self.early_stream_modulations["txt"](vec_txt)
-        img_res = txt_res = None
-        for img_block, txt_block in zip(self.content_mode_blocks["image"], self.txt_mode_blocks):
-            (img_res,), (img,) = img_block([img], [img_res], img_rope, [mod_img])
-            (txt_res,), (txt,) = txt_block([txt], [txt_res], txt_rope, [mod_txt])
+        # per-mode blocks
+        blocks = dict(
+            image=self.content_mode_blocks["image"],
+            image_cond=self.content_mode_blocks["image_cond"],
+            txt=self.txt_mode_blocks,
+        )
+        mods = {k: self.early_stream_modulations[k](vecs[k]) for k in xs}
+        ress = dict.fromkeys(xs)
+        for i in range(self.cfg.num_mode_blocks):
+            for k in xs:
+                (ress[k],), (xs[k],) = blocks[k][i]([xs[k]], [ress[k]], ropes[k], [mods[k]])
+        xs = {k: torch.addcmul(xs[k], mods[k][-1], ress[k]) for k in xs}
 
-        img = torch.addcmul(img, mod_img[-1], img_res)
-        txt = torch.addcmul(txt, mod_txt[-1], txt_res)
-
-        mod_img = self.single_stream_modulations["image"](vec_img)
-        mod_txt = self.single_stream_modulations["txt"](vec_txt)
-        rope = torch.cat([img_rope, txt_rope], dim=0)
-        xs = [img, txt]
-        ress = [None, None]
+        # single-stream blocks. image must be the 1st segment.
+        keys = list(xs)
+        mods = [self.single_stream_modulations[k](vecs[k]) for k in keys]
+        rope = torch.cat([ropes[k] for k in keys], dim=0)
+        x_list = [xs[k] for k in keys]
+        res_list = [None] * len(keys)
         for block in self.single_blocks:
-            ress, xs = block(xs, ress, rope, [mod_img, mod_txt])
-        img = torch.addcmul(xs[0], mod_img[-1], ress[0])
+            res_list, x_list = block(x_list, res_list, rope, mods)
+        img = torch.addcmul(x_list[0], mods[0][-1], res_list[0])
 
         return self.final_layer["image"](img, vec_img)
 
