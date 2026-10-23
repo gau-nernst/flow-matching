@@ -85,7 +85,8 @@ class Flux3TextEncoder(nn.Module):
 
 
 class Flux3Pipeline:
-    KLEIN_DEFAULTS = dict(num_steps=16)
+    KLEIN_DEFAULTS = dict(num_steps=16, cfg_scale=1.0)
+    KLEIN_BASE_DEFAULTS = dict(num_steps=50, cfg_scale=4.0)
 
     def __init__(self, flux: Flux3 | None = None, text_encoder_id: str = "Qwen/Qwen3-VL-4B-Instruct-FP8") -> None:
         self.flux = flux or load_flux3()
@@ -102,14 +103,16 @@ class Flux3Pipeline:
             m.cuda()
         return self
 
-    # TODO: CFG for base model
     # img_size: (height, width). default to 1024x1024 for T2I, and the (prepared) 1st reference image size for TI2I.
+    # default is for klein (distilled). for klein-base, use KLEIN_BASE_DEFAULTS.
     @torch.no_grad()
     def generate(
         self,
         prompt: str | list[str],
+        neg_prompt: str = "",
         ref_imgs: list[Image.Image] | None = None,
         img_size: int | tuple[int, int] | None = None,
+        cfg_scale: float = 1.0,
         num_steps: int = 16,
         alpha: float = 16.0,
         seed: int | None = None,
@@ -117,9 +120,11 @@ class Flux3Pipeline:
         pbar: bool = False,
         progress_cb: Callable[[int, int], None] | None = None,
     ) -> Tensor:
-        assert self.flux.cfg.flow_map, "only distilled (flow map) model is supported for now"
         txt = self.text_encoder(prompt)
         bsize = txt.shape[0]
+
+        # neg_txt may have a different length from txt, so we can't batch them
+        neg_txt = self.text_encoder(neg_prompt).expand(bsize, -1, -1) if cfg_scale != 1.0 else None
         ae = self.ae
         device = ae.encoder.conv_in.weight.device
 
@@ -163,6 +168,8 @@ class Flux3Pipeline:
             img_size=(H, W),
             timesteps=flux3_timesteps(num_steps, alpha),
             txt=txt,
+            neg_txt=neg_txt,
+            cfg_scale=cfg_scale,
             cond=cond,
             cond_rope=cond_rope,
             solver=solver,
@@ -238,6 +245,8 @@ def flux3_generate(
     img_size: tuple[int, int],
     timesteps: list[float],
     txt: Tensor,
+    neg_txt: Tensor | None = None,
+    cfg_scale: float = 1.0,
     cond: Tensor | None = None,
     cond_rope: Tensor | None = None,
     solver: str = "euler",
@@ -252,12 +261,21 @@ def flux3_generate(
 
     img_rope = flux.make_img_rope(H, W, device=latents.device)
     txt_rope = flux.make_txt_rope(txt.shape[1], latents.device)
+    if cfg_scale != 1.0:
+        assert neg_txt is not None
+        neg_txt_rope = flux.make_txt_rope(neg_txt.shape[1], latents.device)
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
-        # flow map: the model also takes the timestep it jumps to
+        # flow map (distilled): the model also takes the timestep it jumps to
         t = timesteps_tensor[i].expand(B)
-        t_next = timesteps_tensor[i + 1].expand(B)
-        v = flux(latents, t, txt, img_rope, txt_rope, ref_time=t_next, cond=cond, cond_rope=cond_rope).float()
+        t_next = timesteps_tensor[i + 1].expand(B) if flux.cfg.flow_map else None
+        kwargs = dict(ref_time=t_next, cond=cond, cond_rope=cond_rope)
+        v = flux(latents, t, txt, img_rope, txt_rope, **kwargs).float()
+
+        # classifier-free guidance
+        if cfg_scale != 1.0:
+            neg_v = flux(latents, t, neg_txt, img_rope, neg_txt_rope, **kwargs).float()
+            v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
         if progress_cb is not None:
