@@ -155,20 +155,30 @@ class Fibo(nn.Module):
     # img: [B, H, W, C] (Flux.2 VAE latents, patchified + normalized)
     # time: [B] in [0, 1], 1 is noise
     # txt: [B, 6, L, txt_dim]. text encoder bundles: the Perceiver's first, then one per injection block.
-    def forward(self, img: Tensor, time: Tensor, txt: Tensor) -> Tensor:
+    # ctx: latents of the images to edit, [B, h, w, C] each, sizes can differ. clean tokens (t=0), not predicted.
+    def forward(self, img: Tensor, time: Tensor, txt: Tensor, ctx: list[Tensor] | None = None) -> Tensor:
         B, H, W, _ = img.shape
         dtype = self.x_embedder.weight.dtype
+        ctx = ctx or []
 
-        # image tokens get the real timestep, clean tokens (gist) get t=0
+        # image tokens get the real timestep, clean tokens (gist, context) get t=0
         t_mlp = self.t_embedder.mlp
         vec = t_mlp(timestep_embedding(time, 256).to(dtype))
         vec_clean = t_mlp(timestep_embedding(torch.zeros_like(time), 256).to(dtype))
+        vecs = torch.stack([vec_clean, vec], dim=1)
 
-        # RoPE axes (plane, h, w). gist token i is on plane 1+i, the image on plane max_num_gist_tokens+1.
-        img_pe = self.pos_embed.create((self.cfg.max_num_gist_tokens + 1, 0, 0), (1, H, W))
-        x = self.x_embedder(img.flatten(1, 2).to(dtype))
+        # RoPE axes (plane, h, w). gist token i is on plane 1+i, the image on plane max_num_gist_tokens+1,
+        # context image k on the k-th plane after it.
+        # official order is [gist, image, context]. we put context before the image, so that clean and noisy tokens
+        # are 2 contiguous segments. positions come from RoPE, so this only changes rounding.
+        img_plane = self.cfg.max_num_gist_tokens + 1
+        ctx_pe = [self.pos_embed.create((img_plane + 1 + k, 0, 0), (1, *c.shape[1:3])) for k, c in enumerate(ctx)]
+        img_pe = self.pos_embed.create((img_plane, 0, 0), (1, H, W))
+        pe = torch.cat([*ctx_pe, img_pe], dim=0)
+        x = self.x_embedder(torch.cat([c.flatten(1, 2) for c in [*ctx, img]], dim=1).to(dtype))
+        num_ctx = x.shape[1] - H * W
         for block in self.noise_refiner:
-            x = block(x, vec[:, None], img_pe)
+            x = block(x, vecs, pe, split=num_ctx) if num_ctx else block(x, vec[:, None], pe)
 
         # Perceiver
         txt = txt.to(dtype)
@@ -179,15 +189,14 @@ class Fibo(nn.Module):
         gist = self.perceiver.norm_out(gist)
         gist_pe = self.pos_embed.create((1, 0, 0), (num_gist, 1, 1))
 
-        # one stream: gist tokens, then image tokens. injection blocks also read their own text bundle.
+        # one stream: gist tokens, context tokens, then image tokens. injection blocks also read their own text bundle.
         x = torch.cat([gist, x], dim=1)
-        pe = torch.cat([gist_pe, img_pe], dim=0)
-        vecs = torch.stack([vec_clean, vec], dim=1)
+        pe = torch.cat([gist_pe, pe], dim=0)
         bundle_ids = {layer_id: i + 1 for i, layer_id in enumerate(self.cfg.injection_layer_ids)}
         for i, block in enumerate(self.layers):
-            x = block(x, vecs, pe, txt[:, bundle_ids[i]] if i in bundle_ids else None, num_gist)
+            x = block(x, vecs, pe, txt[:, bundle_ids[i]] if i in bundle_ids else None, num_gist + num_ctx)
 
-        x = self.final_layer(x[:, num_gist:], vec)
+        x = self.final_layer(x[:, num_gist + num_ctx :], vec)
         return x.unflatten(1, (H, W))
 
     # online block FP8 (1d2d) for the linear layers of the image-stream blocks.
