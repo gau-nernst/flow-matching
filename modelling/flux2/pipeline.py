@@ -26,7 +26,7 @@ class Flux2Qwen3TextEncoder(nn.Module):
 
         # TODO: we can truncate Qwen3 to 27 layers
         self.model.eval()
-        self.output_indices = [9, 18, 27]
+        self.output_indices = [8, 17, 26]  # hidden_states[9, 18, 27] in HF
 
     @torch.no_grad()
     def forward(self, texts: str | list[str]) -> Tensor:
@@ -50,7 +50,14 @@ class Flux2Qwen3TextEncoder(nn.Module):
             return_tensors="pt",
         )
         device = next(self.parameters()).device
-        outputs = self.model(inputs["input_ids"].to(device), output_indices=self.output_indices)
+
+        # same as HF attention_mask: pad tokens are masked out as keys, but pad queries still attend
+        # to real tokens. the DiT attends to pad tokens, so their embeddings matter.
+        pad_mask = inputs["attention_mask"].to(device).bool()  # [B, L]
+        L = pad_mask.shape[1]
+        attn_mask = torch.ones(L, L, dtype=torch.bool, device=device).tril() & pad_mask[:, None, None, :]
+
+        outputs = self.model(inputs["input_ids"].to(device), output_indices=self.output_indices, attn_mask=attn_mask)
         return torch.cat(outputs, dim=-1)
 
 

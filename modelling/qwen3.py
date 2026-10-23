@@ -23,15 +23,39 @@ class Qwen3Attention(nn.Module):
         self.q_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
 
+        # HF Qwen3 rotates pairs (i, i + D/2), while our apply_rope() rotates pairs (2i, 2i + 1).
+        # permute q/k rows within each head so that they are equivalent. this must run before weight merge.
+        # for FP8 weights, each head is exactly 1 block of 128 rows, so weight_scale_inv stays unchanged.
+        def rope_hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+            D = self.head_dim
+            perm = torch.stack([torch.arange(D // 2), torch.arange(D // 2) + D // 2], dim=-1).flatten()
+            for name in ("q_proj.weight", "k_proj.weight"):
+                if f"{prefix}{name}" in state_dict:
+                    w = state_dict[f"{prefix}{name}"]
+                    state_dict[f"{prefix}{name}"] = w.unflatten(0, (-1, D))[:, perm].flatten(0, 1)
+            for name in ("q_norm.weight", "k_norm.weight"):
+                if f"{prefix}{name}" in state_dict:
+                    state_dict[f"{prefix}{name}"] = state_dict[f"{prefix}{name}"][perm]
+
+        self.register_load_state_dict_pre_hook(rope_hook)
         self.register_load_state_dict_pre_hook(create_weight_merge_hook(["q_proj", "k_proj", "v_proj"], "qkv_proj"))
 
-    def forward(self, x: Tensor, pos_embeds: Tensor, add: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        pos_embeds: Tensor,
+        add: Tensor | None = None,
+        attn_mask: Tensor | None = None,
+    ) -> Tensor:
         qkv = self.qkv_proj(x).view(*x.shape[:-1], -1, self.head_dim)
         q, k, v = qkv.split((self.num_qo_heads, self.num_kv_heads, self.num_kv_heads), dim=-2)
         q = apply_rope(q, pos_embeds, self.q_norm.weight, self.eps).transpose(1, 2)
         k = apply_rope(k, pos_embeds, self.k_norm.weight, self.eps).transpose(1, 2)
         v = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        if attn_mask is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=True)
         out = self.o_proj(out.transpose(1, 2).flatten(-2), add)
         return out
 
@@ -63,8 +87,8 @@ class Qwen3DecoderLayer(nn.Module):
         self.mlp = Qwen3MLP(cfg)
         self.layer_id = layer_id
 
-    def forward(self, x: Tensor, pos_embeds: Tensor) -> Tensor:
-        x = self.self_attn(self.input_layernorm(x), pos_embeds, x)
+    def forward(self, x: Tensor, pos_embeds: Tensor, attn_mask: Tensor | None = None) -> Tensor:
+        x = self.self_attn(self.input_layernorm(x), pos_embeds, x, attn_mask)
         x = self.mlp(self.post_attention_layernorm(x), x)
         return x
 
@@ -78,7 +102,14 @@ class Qwen3Model(nn.Module):
         self.layers = nn.ModuleList([Qwen3DecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers)])
         self.norm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
-    def forward(self, input_ids: Tensor, *, output_indices: tuple[int, ...] | None = None) -> Tensor:
+    # attn_mask: [B, 1, L, L] bool, True means attend. default to causal mask.
+    def forward(
+        self,
+        input_ids: Tensor,
+        *,
+        output_indices: tuple[int, ...] | None = None,
+        attn_mask: Tensor | None = None,
+    ) -> Tensor:
         x = self.embed_tokens(input_ids)
 
         theta = self.cfg.rope_parameters["rope_theta"]
@@ -86,7 +117,7 @@ class Qwen3Model(nn.Module):
 
         intermediates = []
         for i, layer in enumerate(self.layers):
-            x = layer(x, pos_embeds)
+            x = layer(x, pos_embeds, attn_mask)
             if output_indices and i in output_indices:
                 intermediates.append(x)
 
