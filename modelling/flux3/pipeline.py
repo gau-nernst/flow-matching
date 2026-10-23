@@ -102,7 +102,7 @@ I2I_SCAFFOLD = (
 )
 
 
-class Flux3Upsampler:
+class Flux3PromptUpsampler:
     def __init__(self, url: str = "http://localhost:8001", model: str = "pup") -> None:
         self.url = f"{url}/v1/chat/completions"
         self.model = model
