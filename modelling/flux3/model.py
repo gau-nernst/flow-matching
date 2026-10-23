@@ -3,6 +3,7 @@
 from typing import NamedTuple
 
 import torch
+from gn_kernels import permute_nv_sf
 from torch import Tensor, nn
 
 from ..attn import dispatch_attn
@@ -203,6 +204,12 @@ class Flux3(nn.Module):
 
 def _load_flux3(repo_id: str, filename: str):
     state_dict = load_hf_state_dict(repo_id, filename)
+
+    # official NVFP4 checkpoint stores unswizzled block scales. our kernels expect swizzled ones.
+    for key in list(state_dict.keys()):
+        if key.endswith(".weight_scale_2"):
+            ws_key = key.removesuffix("_2")
+            state_dict[ws_key] = permute_nv_sf(state_dict[ws_key])
 
     num_mode_blocks = 0
     num_single_blocks = 0
