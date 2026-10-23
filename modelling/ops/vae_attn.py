@@ -362,7 +362,8 @@ class VaeAttn:
 
 
 def vae_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-    if any(x.requires_grad for x in (q, k, v)):
+    # our kernel only supports DIM=512. Flux.2 small decoder has DIM=384.
+    if any(x.requires_grad for x in (q, k, v)) or q.shape[-1] != VaeAttn.DIM:
         # F.sdpa's memory-efficient impl requires ndim=4
         return F.scaled_dot_product_attention(q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)).squeeze(1)
 

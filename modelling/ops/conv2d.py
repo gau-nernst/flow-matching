@@ -116,7 +116,7 @@ def conv2d_triton(
 
     out = x.new_empty(N, Hout, Wout, Cout)
     BLOCK_M = 64 if Hout * Wout <= 256 * 256 else 128
-    BLOCK_N = 128
+    BLOCK_N = next(n for n in (128, 64, 32) if Cout % n == 0)  # Flux.2 small decoder has Cout=192
     BLOCK_K = 32
 
     grid = (Cout // BLOCK_N, Hout * triton.cdiv(Wout, BLOCK_M), N)
