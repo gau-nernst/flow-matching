@@ -147,7 +147,7 @@ class Linear(nn.Module):
 
 
 @triton.jit(do_not_specialize=["M"])
-def _fp8_tensor_quantize_kernel(
+def _fp8_quantize_kernel(
     x_ptr,
     o_ptr,
     s_ptr,
@@ -157,26 +157,44 @@ def _fp8_tensor_quantize_kernel(
     stride_om,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    ROWWISE: tl.constexpr,
 ):
     # x and o: [M, N]
-    pid_n = tl.program_id(0)
-    pid_m = tl.program_id(1)
+    # tensor-wise: s is a given scalar. each program handles 1 [BLOCK_M, BLOCK_N] tile.
+    # row-wise: s is [M], computed here. each program handles BLOCK_M rows.
+    if ROWWISE:
+        pid_m = tl.program_id(0)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
 
-    scale = tl.load(s_ptr)
+        amax = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
+        for n in range(0, N, BLOCK_N):
+            offs_n = n + tl.arange(0, BLOCK_N)
+            mask = (offs_m < M) & (offs_n < N)
+            x = tl.load(x_ptr + offs_m * stride_xm + offs_n, mask, other=0.0).to(tl.float32)
+            amax = tl.maximum(amax, tl.max(tl.abs(x), axis=1, keep_dims=True))
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = (offs_m < M) & (offs_n < N)
-    x = tl.load(x_ptr + offs_m * stride_xm + offs_n, mask)  # [BLOCK_M, BLOCK_N]
-    x /= scale
-    tl.store(o_ptr + offs_m * stride_om + offs_n, x, mask)
+        scale = tl.maximum(amax / 448.0, 1e-12)
+        tl.store(s_ptr + offs_m, scale, offs_m < M)
 
+        for n in range(0, N, BLOCK_N):
+            offs_n = n + tl.arange(0, BLOCK_N)
+            mask = (offs_m < M) & (offs_n < N)
+            x = tl.load(x_ptr + offs_m * stride_xm + offs_n, mask).to(tl.float32)
+            x = tl.clamp(x / scale, -448.0, 448.0)
+            tl.store(o_ptr + offs_m * stride_om + offs_n, x, mask)
 
-# TODO: triton kernel
-def fp8_rowwise_quantize(x: Tensor) -> tuple[Tensor, Tensor]:
-    scale = (x.abs().amax(dim=1, keepdim=True).float() / 448.0).clip(1e-12)
-    xq = (x.float() / scale).clip(-448.0, 448.0).to(torch.float8_e4m3fn)
-    return xq, scale
+    else:
+        pid_n = tl.program_id(0)
+        pid_m = tl.program_id(1)
+
+        scale = tl.load(s_ptr)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (offs_m < M) & (offs_n < N)
+        x = tl.load(x_ptr + offs_m * stride_xm + offs_n, mask)  # [BLOCK_M, BLOCK_N]
+        x /= scale
+        tl.store(o_ptr + offs_m * stride_om + offs_n, x, mask)
 
 
 def fp8_tensor_quantize(x: Tensor, scale: Tensor):
@@ -185,8 +203,20 @@ def fp8_tensor_quantize(x: Tensor, scale: Tensor):
     BLOCK_N = 128
     out = x.new_empty(M, N, dtype=torch.float8_e4m3fn)
     grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(M, BLOCK_M), 1)
-    _fp8_tensor_quantize_kernel[grid](x, out, scale, M, N, x.stride(0), out.stride(0), BLOCK_M, BLOCK_N)
+    _fp8_quantize_kernel[grid](x, out, scale, M, N, x.stride(0), out.stride(0), BLOCK_M, BLOCK_N, ROWWISE=False)
     return out
+
+
+# returns scale with shape [M, 1]
+def fp8_rowwise_quantize(x: Tensor) -> tuple[Tensor, Tensor]:
+    M, N = x.shape
+    BLOCK_M = 4
+    BLOCK_N = 1024
+    out = x.new_empty(M, N, dtype=torch.float8_e4m3fn)
+    scale = x.new_empty(M, 1, dtype=torch.float32)
+    grid = (triton.cdiv(M, BLOCK_M),)
+    _fp8_quantize_kernel[grid](x, out, scale, M, N, x.stride(0), out.stride(0), BLOCK_M, BLOCK_N, ROWWISE=True)
+    return out, scale
 
 
 class FP8_1d2dFunc(torch.autograd.Function):
