@@ -95,15 +95,13 @@ class Flux3(nn.Module):
         if cfg.flow_map:
             self.ref_time_in = MLPEmbedder(256, cfg.dim, bias=False)
 
-        # use our Linear, since modulation weights are quantized in FP8/NVFP4 checkpoints
-        def make_mod():
-            mod = Modulation(cfg.dim, double=False, bias=False)
-            mod.lin = Linear(cfg.dim, cfg.dim * 3, bias=False)
-            return mod
+        def make_mods():
+            return nn.ModuleDict(
+                {k: Modulation(cfg.dim, double=False, bias=False) for k in ("image", "image_cond", "txt")}
+            )
 
-        modes = ("image", "image_cond", "txt")
-        self.early_stream_modulations = nn.ModuleDict({k: make_mod() for k in modes})
-        self.single_stream_modulations = nn.ModuleDict({k: make_mod() for k in modes})
+        self.early_stream_modulations = make_mods()
+        self.single_stream_modulations = make_mods()
 
         # per-mode blocks: each mode only attends to itself
         self.content_mode_blocks = nn.ModuleDict({k: make_blocks(cfg.num_mode_blocks) for k in ("image", "image_cond")})
@@ -116,29 +114,25 @@ class Flux3(nn.Module):
     # - image:     (0, h/2, w/2, 0)
     # - image_cond (reference image i, 0-indexed): (0, h/2, w/2, -(i+1))
     # - text:      (0, 0, 0, l)
+    # ids: [L, 4] -> [L, 64] complex. each axis uses 32 dims.
     @staticmethod
     def make_rope(ids: Tensor) -> Tensor:
-        rope_list = []
-        for i in range(ids.shape[-1]):
-            dim = 32
-            omega = 1.0 / (10_000 ** (torch.arange(0, dim, 2, dtype=torch.float64, device=ids.device) / dim))
-            freqs = ids[:, i, None].double() * omega
-            rope_list.append(torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64))
-        return torch.cat(rope_list, dim=-1)
+        omega = 1.0 / (10_000 ** (torch.arange(0, 32, 2, dtype=torch.float64, device=ids.device) / 32))
+        freqs = (ids.double()[..., None] * omega).flatten(-2)
+        return torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
 
     @staticmethod
-    def make_img_rope(H: int, W: int, l: int = 0, device: torch.types.Device = None) -> Tensor:
+    def make_img_rope(H: int, W: int, l_pos: int = 0, device: torch.types.Device = None) -> Tensor:
         h, w = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij")
         zeros = torch.zeros_like(h)
-        ids = torch.stack([zeros, h * 0.5, w * 0.5, torch.full_like(h, l)], dim=-1).flatten(0, 1)
+        ids = torch.stack([zeros, h * 0.5, w * 0.5, torch.full_like(h, l_pos)], dim=-1).flatten(0, 1)
         return Flux3.make_rope(ids)
 
     @staticmethod
     def make_txt_rope(L: int, device: torch.types.Device = None) -> Tensor:
-        l = torch.arange(L, device=device)
-        zeros = torch.zeros_like(l)
-        ids = torch.stack([zeros, zeros, zeros, l], dim=-1)
-        return Flux3.make_rope(ids)
+        pos = torch.arange(L, device=device)
+        zeros = torch.zeros_like(pos)
+        return Flux3.make_rope(torch.stack([zeros, zeros, zeros, pos], dim=-1))
 
     def time_embed(self, mlp: MLPEmbedder, t: Tensor) -> Tensor:
         # official code does t * 1000 in BF16
@@ -189,12 +183,11 @@ class Flux3(nn.Module):
                 (ress[k],), (xs[k],) = blocks[k][i]([xs[k]], [ress[k]], ropes[k], [mods[k]])
         xs = {k: torch.addcmul(xs[k], mods[k][-1], ress[k]) for k in xs}
 
-        # single-stream blocks. image must be the 1st segment.
-        keys = list(xs)
-        mods = [self.single_stream_modulations[k](vecs[k]) for k in keys]
-        rope = torch.cat([ropes[k] for k in keys], dim=0)
-        x_list = [xs[k] for k in keys]
-        res_list = [None] * len(keys)
+        # single-stream blocks. image is the 1st segment.
+        mods = [self.single_stream_modulations[k](vecs[k]) for k in xs]
+        rope = torch.cat([ropes[k] for k in xs], dim=0)
+        x_list = list(xs.values())
+        res_list = [None] * len(x_list)
         for block in self.single_blocks:
             res_list, x_list = block(x_list, res_list, rope, mods)
         img = torch.addcmul(x_list[0], mods[0][-1], res_list[0])

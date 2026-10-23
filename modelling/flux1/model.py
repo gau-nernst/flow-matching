@@ -36,9 +36,9 @@ def timestep_embedding(t: Tensor, dim: int, max_period: float = 10_000.0, time_f
 class MLPEmbedder(nn.Sequential):
     def __init__(self, in_dim: int, hidden_dim: int, bias: bool = True) -> None:
         super().__init__()
-        self.in_layer = nn.Linear(in_dim, hidden_dim, bias=bias)
+        self.in_layer = Linear(in_dim, hidden_dim, bias=bias)
         self.silu = nn.SiLU()
-        self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.out_layer = Linear(hidden_dim, hidden_dim, bias=bias)
 
 
 class SelfAttention(nn.Module):
@@ -65,7 +65,7 @@ class Modulation(nn.Module):
         super().__init__()
         self.multiplier = 6 if double else 3
         self.silu = nn.SiLU()
-        self.lin = nn.Linear(dim, self.multiplier * dim, bias=bias)
+        self.lin = Linear(dim, self.multiplier * dim, bias=bias)
 
     def forward(self, vec: Tensor) -> tuple[Tensor, ...]:
         return self.lin(self.silu(vec))[:, None, :].chunk(self.multiplier, dim=-1)
@@ -157,8 +157,8 @@ class SingleStreamBlock(nn.Module):
 class LastLayer(nn.Module):
     def __init__(self, dim: int, patch_size: int, out_channels: int, bias: bool = True) -> None:
         super().__init__()
-        self.linear = nn.Linear(dim, patch_size * patch_size * out_channels, bias=bias)
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim, bias=bias))
+        self.linear = Linear(dim, patch_size * patch_size * out_channels, bias=bias)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), Linear(dim, 2 * dim, bias=bias))
 
     def forward(self, x: Tensor, vec: Tensor) -> Tensor:
         shift, scale = self.adaLN_modulation(vec)[:, None, :].chunk(2, dim=-1)

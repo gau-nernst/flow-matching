@@ -20,12 +20,11 @@ from .model import Flux3, load_flux3
 
 # text-only Qwen3-VL. with text-only inputs, M-RoPE reduces to 1D RoPE, so we can reuse Qwen3Model.
 class Flux3TextEncoder(nn.Module):
-    # pad_multiple=1 disables padding
-    def __init__(self, model_id: str = "Qwen/Qwen3-VL-4B-Instruct-FP8", pad_multiple: int = 80):
+    def __init__(self, model_id: str = "Qwen/Qwen3-VL-4B-Instruct-FP8"):
         super().__init__()
         self.output_indices = [3, 7, 11, 15, 19, 23, 27, 31]  # hidden_states[4, 8, ..., 32] in HF
         self.max_length = 4096
-        self.pad_multiple = pad_multiple
+        self.pad_multiple = 80
 
         # only keep layers we need
         cfg = AutoConfig.from_pretrained(model_id).text_config
@@ -44,17 +43,17 @@ class Flux3TextEncoder(nn.Module):
 
         self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    # all prompts are padded to the same length (multiple of 80). the DiT attends to pad tokens, so we need to
-    # match official pad embeddings: pad tokens don't attend to each other, and have position_id=1.
-    # NOTE: official code encodes 1 prompt at a time. for multiple prompts of different lengths, the shorter ones
-    # will have more pad tokens than official.
+    # same as official: right-pad to a multiple of 80. pad tokens are masked as keys, and have position_id=1.
+    # the DiT attends to pad tokens, so this matters. NOTE: we pad all prompts to the same length.
     @torch.no_grad()
     def forward(self, texts: str | list[str]) -> Tensor:
         if isinstance(texts, str):
             texts = [texts]
 
         texts = [
-            self.tokenizer.apply_chat_template([dict(role="user", content=txt)], tokenize=False, add_generation_prompt=True)
+            self.tokenizer.apply_chat_template(
+                [dict(role="user", content=txt)], tokenize=False, add_generation_prompt=True
+            )
             for txt in texts
         ]
         input_ids_list = [
@@ -125,8 +124,6 @@ class Flux3Pipeline:
 
         # neg_txt may have a different length from txt, so we can't batch them
         neg_txt = self.text_encoder(neg_prompt).expand(bsize, -1, -1) if cfg_scale != 1.0 else None
-        ae = self.ae
-        device = ae.encoder.conv_in.weight.device
 
         # official: a single reference is reflect-padded to a multiple of 16, and the output is cropped back.
         # multiple references are center-cropped instead.
@@ -143,17 +140,11 @@ class Flux3Pipeline:
             crop_box = None
             height, width = (img_size, img_size) if isinstance(img_size, int) else img_size
 
-        cond = cond_rope = None
-        if ref_imgs:
-            cond_list = []
-            cond_rope_list = []
-            for i, img in enumerate(ref_imgs):
-                img = torch.from_numpy(np.array(img)).to(device)
-                z = ae.encode(img.unsqueeze(0))  # (1, h, w, C)
-                cond_list.append(z.flatten(1, 2))
-                cond_rope_list.append(self.flux.make_img_rope(z.shape[1], z.shape[2], l=-(i + 1), device=device))
-            cond = torch.cat(cond_list, dim=1).expand(bsize, -1, -1)
-            cond_rope = torch.cat(cond_rope_list, dim=0)
+        ae = self.ae
+        device = ae.encoder.conv_in.weight.device
+        cond, cond_rope = self.encode_ref_imgs(ref_imgs)
+        if cond is not None:
+            cond = cond.expand(bsize, -1, -1)
 
         H = height // ae.downsample // 2
         W = width // ae.downsample // 2
@@ -183,6 +174,20 @@ class Flux3Pipeline:
             out = out[:, top:bottom, left:right]
         return out
 
+    # reference image i uses RoPE l=-(i+1). returns (1, L, C) tokens and rope.
+    def encode_ref_imgs(self, ref_imgs: list[Image.Image]) -> tuple[Tensor | None, Tensor | None]:
+        if not ref_imgs:
+            return None, None
+
+        device = self.ae.encoder.conv_in.weight.device
+        cond_list = []
+        cond_rope_list = []
+        for i, img in enumerate(ref_imgs):
+            z = self.ae.encode(torch.from_numpy(np.array(img)).to(device).unsqueeze(0))  # (1, h, w, C)
+            cond_list.append(z.flatten(1, 2))
+            cond_rope_list.append(self.flux.make_img_rope(z.shape[1], z.shape[2], l_pos=-(i + 1), device=device))
+        return torch.cat(cond_list, dim=1), torch.cat(cond_rope_list, dim=0)
+
 
 # https://github.com/black-forest-labs/flux-3-image-klein/blob/bfc8889/src/flux3/pipeline.py#L131
 # fit within 4MP (sides <= 4096), then reflect-pad to a multiple of 16 (sides >= 64).
@@ -190,12 +195,11 @@ class Flux3Pipeline:
 def flux3_prepare_reference(img: Image.Image) -> tuple[Image.Image, tuple[int, int, int, int] | None]:
     img = ImageOps.exif_transpose(img).convert("RGB")
     max_pixels = 4 * 1024 * 1024
-    ceil16 = lambda x: -(-x // 16) * 16
 
     scale = min(1.0, math.sqrt(max_pixels / (img.width * img.height)), 4096 / max(img.size))
     while True:
         fit = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
-        w, h = (min(4096, max(64, ceil16(x))) for x in fit)
+        w, h = (min(4096, max(64, math.ceil(x / 16) * 16)) for x in fit)
         if w * h <= max_pixels:
             break
         scale *= 0.995
@@ -232,7 +236,7 @@ def flux3_prepare_multi_reference(img: Image.Image) -> Image.Image:
 
 
 # https://github.com/black-forest-labs/flux-3-image-klein/blob/bfc8889/src/flux3/sampling.py#L9
-# NOTE: official config.json says alpha=6.93, but official pipeline uses alpha=16 by default.
+# NOTE: we follow official code (alpha=16). official config.json, diffusers and ComfyUI use alpha=6.93.
 def flux3_timesteps(num_steps: int, alpha: float) -> list[float]:
     t = torch.linspace(1.0, 0.0, num_steps + 1)
     return (alpha * t / (1.0 + (alpha - 1.0) * t)).tolist()

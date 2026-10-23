@@ -134,7 +134,7 @@ class Linear(nn.Module):
 
     def is_fp8_rowwise(self):
         ws = getattr(self, "weight_scale", None)
-        return ws is not None and ws.dtype == torch.float32 and ws.ndim == 1
+        return ws is not None and ws.ndim == 1
 
     def is_fp8_1d2d(self):
         return hasattr(self, "weight_scale_inv")
@@ -201,9 +201,7 @@ def fp8_rowwise_quantize(x: Tensor) -> tuple[Tensor, Tensor]:
     scale = x.new_empty(M, 1, dtype=torch.float32)
     BLOCK_N = triton.next_power_of_2(N)
     num_warps = 4 if BLOCK_N <= 4096 else 8
-    _fp8_rowwise_quantize_kernel[(M,)](
-        x, out, scale, M, N, x.stride(0), out.stride(0), BLOCK_N, num_warps=num_warps
-    )
+    _fp8_rowwise_quantize_kernel[(M,)](x, out, scale, M, N, x.stride(0), out.stride(0), BLOCK_N, num_warps=num_warps)
     return out, scale
 
 
