@@ -14,6 +14,7 @@ from ..flux1.model import timestep_embedding
 from ..linear import Linear
 from ..rope import RopeND
 from ..utils import load_hf_state_dict
+from ..z_image.gated_norm import gated_norm
 from ..z_image.model import Attention, FeedForward, FinalLayer
 
 
@@ -48,6 +49,7 @@ class Block(nn.Module):
         self.attention_norm2 = nn.RMSNorm(dim, eps=eps)
         self.ffn_norm1 = nn.RMSNorm(dim, eps=eps)
         self.ffn_norm2 = nn.RMSNorm(dim, eps=eps)
+        self.eps = eps
 
         # gated cross-attention to the text encoder
         if cross_dim is not None:
@@ -58,22 +60,23 @@ class Block(nn.Module):
         else:
             self.cross_attention = None
 
-    # vecs: timestep embeddings of each segment of x, along the sequence dim. e.g. [(L_gist, vec_clean), (L_img, vec)]
-    def forward(self, x: Tensor, vecs: list[tuple[int, Tensor]], pe: Tensor, txt: Tensor | None = None) -> Tensor:
-        # per-token modulation: [B, L, D] each
-        mods = [self.adaLN_modulation(vec).unsqueeze(1).expand(-1, n, -1) for n, vec in vecs]
-        mods = torch.cat(mods, dim=1) if len(mods) > 1 else mods[0]
-        scale_msa, gate_msa, scale_mlp, gate_mlp = mods.chunk(4, dim=-1)
+    # vec: [B, S, 256] timestep embedding of each segment of x. with S=2, tokens [0, split) use vec[:, 0]
+    # (gist tokens, t=0), the rest use vec[:, 1] (image tokens).
+    def forward(
+        self, x: Tensor, vec: Tensor, pe: Tensor, txt: Tensor | None = None, split: int | None = None
+    ) -> Tensor:
+        scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(vec).chunk(4, dim=-1)  # [B, S, D] each
+        eps = self.eps
 
-        attn = self.attention(self.attention_norm1(x) * (1 + scale_msa), pe)
-        x = x + gate_msa.tanh() * self.attention_norm2(attn)
+        attn = self.attention(gated_norm(x, self.attention_norm1.weight, scale_msa, eps=eps, split=split), pe)
+        x = gated_norm(attn, self.attention_norm2.weight, gate_msa, x, "tanh", eps, split)
 
         if self.cross_attention is not None:
             cross = self.cross_attention(self.cross_attn_norm1(x), txt)
-            x = x + self.cross_attn_gate.tanh() * self.cross_attn_norm2(cross)
+            x = gated_norm(cross, self.cross_attn_norm2.weight * self.cross_attn_gate.tanh(), add=x, eps=eps)
 
-        ffn = self.feed_forward(self.ffn_norm1(x) * (1 + scale_mlp))
-        return x + gate_mlp.tanh() * self.ffn_norm2(ffn)
+        ffn = self.feed_forward(gated_norm(x, self.ffn_norm1.weight, scale_mlp, eps=eps, split=split))
+        return gated_norm(ffn, self.ffn_norm2.weight, gate_mlp, x, "tanh", eps, split)
 
 
 # gist tokens read the text encoder (cross-attention), then each other (self-attention), then an FFN
@@ -154,7 +157,6 @@ class Fibo(nn.Module):
     # txt: [B, 6, L, txt_dim]. text encoder bundles: the Perceiver's first, then one per injection block.
     def forward(self, img: Tensor, time: Tensor, txt: Tensor) -> Tensor:
         B, H, W, _ = img.shape
-        L_img = H * W
         dtype = self.x_embedder.weight.dtype
 
         # image tokens get the real timestep, clean tokens (gist) get t=0
@@ -166,7 +168,7 @@ class Fibo(nn.Module):
         img_pe = self.pos_embed.create((self.cfg.max_num_gist_tokens + 1, 0, 0), (1, H, W))
         x = self.x_embedder(img.flatten(1, 2).to(dtype))
         for block in self.noise_refiner:
-            x = block(x, [(L_img, vec)], img_pe)
+            x = block(x, vec[:, None], img_pe)
 
         # Perceiver
         txt = txt.to(dtype)
@@ -180,13 +182,27 @@ class Fibo(nn.Module):
         # one stream: gist tokens, then image tokens. injection blocks also read their own text bundle.
         x = torch.cat([gist, x], dim=1)
         pe = torch.cat([gist_pe, img_pe], dim=0)
-        vecs = [(num_gist, vec_clean), (L_img, vec)]
+        vecs = torch.stack([vec_clean, vec], dim=1)
         bundle_ids = {layer_id: i + 1 for i, layer_id in enumerate(self.cfg.injection_layer_ids)}
         for i, block in enumerate(self.layers):
-            x = block(x, vecs, pe, txt[:, bundle_ids[i]] if i in bundle_ids else None)
+            x = block(x, vecs, pe, txt[:, bundle_ids[i]] if i in bundle_ids else None, num_gist)
 
         x = self.final_layer(x[:, num_gist:], vec)
         return x.unflatten(1, (H, W))
+
+    # online block FP8 (1d2d) for the linear layers of the image-stream blocks.
+    # FFN hidden dim (9536) is not a multiple of 128: zero-pad it, which doesn't change the output.
+    def to_fp8(self):
+        for block in [*self.noise_refiner, *self.layers]:
+            ffn = block.feed_forward
+            pad = -ffn.w1.weight.shape[0] % 128
+            for w in (ffn.w1, ffn.w3):
+                w.weight = nn.Parameter(F.pad(w.weight, (0, 0, 0, pad)), requires_grad=False)
+            ffn.w2.weight = nn.Parameter(F.pad(ffn.w2.weight, (0, pad)), requires_grad=False)
+
+            for m in (block.attention.qkv, block.attention.to_out[0], ffn.w1, ffn.w3, ffn.w2):
+                m.to_fp8_1d2d()
+        return self
 
 
 def load_fibo(name: str = "dev"):

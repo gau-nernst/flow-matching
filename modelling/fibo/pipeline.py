@@ -109,9 +109,13 @@ def fibo_clean_prompt(prompt: str) -> str:
 
 
 class FiboPipeline:
-    def __init__(self, fibo: Fibo | None = None, text_encoder_id: str = "Qwen/Qwen3-VL-4B-Instruct-FP8") -> None:
+    # fp8: online block FP8 for the DiT, quantized on GPU in .cuda(). the text encoder uses official FP8 weights.
+    def __init__(
+        self, fibo: Fibo | None = None, text_encoder_id: str = "Qwen/Qwen3-VL-4B-Instruct-FP8", fp8: bool = True
+    ) -> None:
         # apply_rope() takes the slow reference path when params require grad
         self.fibo = (fibo or load_fibo()).requires_grad_(False)
+        self.fp8 = fp8
         self.ae = load_vae("flux2").bfloat16()  # same weights as Flux.2. official runs the VAE in FP32
         self.text_encoder = FiboTextEncoder(text_encoder_id)
 
@@ -123,6 +127,8 @@ class FiboPipeline:
     def cuda(self):
         for m in (self.fibo, self.ae, self.text_encoder):
             m.cuda()
+        if self.fp8 and not self.fibo.layers[0].attention.qkv.is_fp8_1d2d():
+            self.fibo.to_fp8()
         return self
 
     # prompt: a structured JSON caption (preferred), or a short description.
