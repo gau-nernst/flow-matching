@@ -7,14 +7,18 @@ from torch import Tensor
 
 @triton.jit
 def _modulate_kernel(
-    x_ptr,  # [B, L, D]
+    x_ptr,  # [B, L, D], strided
     shift_ptr,  # [B, D]
     scale_ptr,  # [B, D]
-    res_ptr,  # [B, L, D]
+    res_ptr,  # [B, L, D], strided
     gate_ptr,  # [B, D]
     norm_ptr,  # [D]
-    gated_ptr,  # [B, L, D]
-    o_ptr,  # [B, L, D]
+    gated_ptr,  # [B, L, D], contiguous
+    o_ptr,  # [B, L, D], contiguous
+    stride_xb,
+    stride_xl,
+    stride_resb,
+    stride_resl,
     shift_stride,
     scale_stride,
     gate_stride,
@@ -29,10 +33,10 @@ def _modulate_kernel(
     BLOCK_DIM: tl.constexpr = triton.next_power_of_2(D)
     offs = tl.arange(0, BLOCK_DIM)
     mask = offs < D
-    x = tl.load(x_ptr + (pid_b * L * D + pid_l * D + offs), mask, other=0.0)
+    x = tl.load(x_ptr + (pid_b * stride_xb + pid_l * stride_xl + offs), mask, other=0.0)
 
     if res_ptr is not None:
-        res = tl.load(res_ptr + (pid_b * L * D + pid_l * D + offs), mask, other=0.0)
+        res = tl.load(res_ptr + (pid_b * stride_resb + pid_l * stride_resl + offs), mask, other=0.0)
         gate = tl.load(gate_ptr + (pid_b * gate_stride + offs), mask)
         x = (x.to(tl.float32) + gate.to(tl.float32) * res.to(tl.float32)).to(x.dtype)
         tl.store(gated_ptr + (pid_b * L * D + pid_l * D + offs), x, mask)
@@ -74,17 +78,17 @@ def modulate(
         return out, x
 
     B, L, D = x.shape
-    assert x.is_contiguous() and shift[0].is_contiguous() and scale[0].is_contiguous()
+    assert x.stride(-1) == 1 and shift[0].is_contiguous() and scale[0].is_contiguous()
     assert shift.shape in ((B, 1, D), (1, 1, D))
     assert scale.shape in ((B, 1, D), (1, 1, D))
     if res is not None:
         assert gate is not None
-        assert res.is_contiguous() and gate[0].is_contiguous()
+        assert res.shape == x.shape and res.stride(-1) == 1 and gate[0].is_contiguous()
         assert gate.shape in ((B, 1, D), (1, 1, D))
     if norm_weight is not None:
         assert norm_weight.shape == (D,) and norm_weight.is_contiguous()
-    gated = torch.empty_like(x) if res is not None else x
-    out = torch.empty_like(x)
+    gated = x.new_empty(B, L, D) if res is not None else x
+    out = x.new_empty(B, L, D)
     _modulate_kernel[(L, B)](
         x,
         shift,
@@ -94,6 +98,8 @@ def modulate(
         norm_weight,
         gated,
         out,
+        *x.stride()[:2],
+        *(res.stride()[:2] if res is not None else (0, 0)),
         shift.stride(0) if shift.shape[0] > 1 else 0,
         scale.stride(0) if scale.shape[0] > 1 else 0,
         gate.stride(0) if gate is not None and gate.shape[0] > 1 else 0,

@@ -65,8 +65,7 @@ class Block(nn.Module):
 
         # TODO: fuse residual
         out = self.attn_out(attn) + self.mlp(x_mod)
-        # .contiguous() is no-op for batch size 1
-        outs = [o.contiguous() for o in out.split([x.shape[1] for x in xs], dim=1)]
+        outs = list(out.split([x.shape[1] for x in xs], dim=1))
         return outs, new_xs
 
 
