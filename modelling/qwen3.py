@@ -88,17 +88,23 @@ class Qwen3Model(nn.Module):
         self.norm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
     # attn_mask: [B, 1, L, L] bool, True means attend. default to causal mask.
+    # position_ids: [L], shared across batch. default to arange(L).
     def forward(
         self,
         input_ids: Tensor,
         *,
         output_indices: tuple[int, ...] | None = None,
         attn_mask: Tensor | None = None,
+        position_ids: Tensor | None = None,
     ) -> Tensor:
         x = self.embed_tokens(input_ids)
 
         theta = self.cfg.rope_parameters["rope_theta"]
-        pos_embeds = compute_rope(x.shape[-2], self.cfg.head_dim, theta, device=x.device)
+        if position_ids is None:
+            pos_embeds = compute_rope(x.shape[-2], self.cfg.head_dim, theta, device=x.device)
+        else:
+            pos_embeds = compute_rope(int(position_ids.max()) + 1, self.cfg.head_dim, theta, device=x.device)
+            pos_embeds = pos_embeds[position_ids]
 
         intermediates = []
         for i, layer in enumerate(self.layers):
