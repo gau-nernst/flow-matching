@@ -51,11 +51,13 @@ class MOSSImageTextEncoder:
 
 
 class MOSSImagePipeline:
-    def __init__(self, moss: MOSSImage | None = None, text_encoder_fp8: bool = True) -> None:
+    # fp8: online block FP8 for both the DiT and the text encoder, quantized on GPU in .cuda()
+    def __init__(self, moss: MOSSImage | None = None, fp8: bool = True) -> None:
         # apply_rope() takes the slow reference path when params require grad
         self.moss = (moss or load_moss_image()).requires_grad_(False)
         self.ae = load_vae("flux2_small_decoder").bfloat16()  # official runs the VAE in FP32
-        self.text_encoder = MOSSImageTextEncoder(fp8=text_encoder_fp8)
+        self.text_encoder = MOSSImageTextEncoder(fp8=fp8)
+        self.fp8 = fp8
 
     def cpu(self):
         for m in (self.moss, self.ae, self.text_encoder):
@@ -65,6 +67,8 @@ class MOSSImagePipeline:
     def cuda(self):
         for m in (self.moss, self.ae, self.text_encoder):
             m.cuda()
+        if self.fp8 and not self.moss.layers[0].q.is_fp8_1d2d():
+            self.moss.to_fp8()
         return self
 
     # all prompts must have the same token length, since the DiT doesn't support padding.

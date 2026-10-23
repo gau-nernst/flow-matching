@@ -7,9 +7,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..attn import dispatch_attn
+from ..flux1.modulate import modulate
 from ..linear import Linear
 from ..rope import apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
+from .situ import situ
 
 
 class RMSNorm(nn.Module):
@@ -21,11 +23,6 @@ class RMSNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         # official: normalize in FP32, cast to input dtype, then multiply weight
         return F.rms_norm(x.float(), x.shape[-1:], eps=self.eps).to(x.dtype) * self.weight
-
-
-# soft-capped SwiGLU
-def situ(hidden: Tensor, gate: Tensor) -> Tensor:
-    return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (25.0 * torch.tanh(hidden / 25.0))
 
 
 # official RoPE rotates pairs (i, i + D/2), while our apply_rope() rotates pairs (2i, 2i + 1).
@@ -49,7 +46,7 @@ class TextBlock(nn.Module):
         self.k_norm = nn.Parameter(torch.empty(self.head_dim))
         self.qkv = Linear(dim, 3 * dim)
         self.proj = Linear(dim, dim)
-        self.ffn_gate_up = Linear(dim, 2 * ffn_dim)
+        self.ffn_up_gate = Linear(dim, 2 * ffn_dim)
         self.ffn_down = Linear(ffn_dim, dim)
 
         perm = _rope_perm(self.head_dim)
@@ -64,7 +61,7 @@ class TextBlock(nn.Module):
                 if f"{prefix}ffn_gate.{suffix}" in state_dict:
                     gate = state_dict.pop(f"{prefix}ffn_gate.{suffix}")
                     up = state_dict.pop(f"{prefix}ffn_up.{suffix}")
-                    state_dict[f"{prefix}ffn_gate_up.{suffix}"] = torch.cat([gate, up])
+                    state_dict[f"{prefix}ffn_up_gate.{suffix}"] = torch.cat([up, gate])
             for name in ("q_norm", "k_norm"):
                 if f"{prefix}{name}.weight" in state_dict:
                     state_dict[f"{prefix}{name}"] = state_dict.pop(f"{prefix}{name}.weight")[perm]
@@ -76,8 +73,7 @@ class TextBlock(nn.Module):
         q = apply_rope(q, rope, self.q_norm)
         k = apply_rope(k, rope, self.k_norm)
         x = self.proj(dispatch_attn(q, k, v).flatten(-2), x)
-        gate, up = self.ffn_gate_up(self.norm2(x)).chunk(2, dim=-1)
-        return self.ffn_down(situ(up, gate), x)
+        return self.ffn_down(situ(self.ffn_up_gate(self.norm2(x))), x)
 
 
 class Block(nn.Module):
@@ -113,20 +109,22 @@ class Block(nn.Module):
         # must run after remap
         self.register_load_state_dict_pre_hook(hook)
 
-    # x is FP32 (official: BF16 linears with FP32 modulation, which promotes the residual stream to FP32)
-    def forward(self, x: Tensor, rope: Tensor, mod: Tensor) -> Tensor:
-        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.unbind(1)  # [B, D] each, FP32
-        dtype = self.q.weight.dtype
+    # the gated residual of the FFN is deferred to the next block (or the final layer), so that it can be fused
+    # with the next norm. modulation is shared across blocks, so gate_f is the same.
+    # official residual stream is FP32 (FP32 modulation promotes it). using BF16 barely changes the output.
+    def forward(self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor) -> tuple[Tensor, Tensor]:
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.split(1, dim=1)  # [B, 1, D] each, FP32
 
-        y = (torch.addcmul(shift_a[:, None], self.norm1(x), 1 + scale_a[:, None])).to(dtype)
+        y, x = modulate(
+            x, shift_a, scale_a, ffn_out, gate_f if ffn_out is not None else None, 1e-6, self.norm1.weight, True
+        )
         q = apply_rope(self.q(y).unflatten(-1, (-1, self.head_dim)), rope, self.q_norm)
         k = apply_rope(self.k(y).unflatten(-1, (-1, self.head_dim)), rope, self.k_norm)
         v = self.v(y).unflatten(-1, (-1, self.head_dim))
-        x = torch.addcmul(x, self.o(dispatch_attn(q, k, v).flatten(-2)), gate_a[:, None])
+        attn_out = self.o(dispatch_attn(q, k, v).flatten(-2))
 
-        y = (torch.addcmul(shift_f[:, None], self.norm2(x), 1 + scale_f[:, None])).to(dtype)
-        hidden, gate = self.ffn_up_gate(y).chunk(2, dim=-1)
-        return torch.addcmul(x, self.ffn_down(situ(hidden, gate)), gate_f[:, None])
+        y, x = modulate(x, shift_f, scale_f, attn_out, gate_a, 1e-6, self.norm2.weight, True)
+        return x, self.ffn_down(situ(self.ffn_up_gate(y)))
 
 
 class MOSSImageConfig(NamedTuple):
@@ -209,14 +207,23 @@ class MOSSImage(nn.Module):
         for block in self.text_embedder.blocks:
             x_txt = block(x_txt, rope[L_img:])
 
-        x = torch.cat([x_img, x_txt], dim=1).float()
+        x = torch.cat([x_img, x_txt], dim=1)
+        ffn_out = None
         for i, block in enumerate(self.layers):
             if i not in skip_layers:
-                x = block(x, rope, mod)
+                x, ffn_out = block(x, ffn_out, rope, mod)
 
-        x = self.final_norm_video(x[:, :L_img].to(dtype))
-        x = torch.addcmul(shift[:, None], x, 1 + scale[:, None])
-        return self.final_linear_video(x.to(dtype)).unflatten(1, (H, W))
+        gate_f = mod[:, 5:6]
+        y, _ = modulate(x, shift[:, None], scale[:, None], ffn_out, gate_f, 1e-6, self.final_norm_video.weight, True)
+        return self.final_linear_video(y[:, :L_img]).unflatten(1, (H, W))
+
+    # online block FP8 for the DiT blocks' linear layers
+    def to_fp8(self):
+        for block in self.layers:
+            for m in block.modules():
+                if isinstance(m, Linear):
+                    m.to_fp8_1d2d()
+        return self
 
 
 def load_moss_image(name: str = "sft"):
