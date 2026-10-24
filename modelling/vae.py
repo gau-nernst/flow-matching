@@ -225,7 +225,6 @@ class AEConfig(NamedTuple):
     scale_shift: tuple[float, float] = (1.0, 0.0)
     quant_conv: bool = False
     use_bn: bool = False
-    decoder_dim: int | None = None  # Flux.2 small decoder has a narrower decoder
 
 
 class AutoEncoder(nn.Module):
@@ -235,8 +234,7 @@ class AutoEncoder(nn.Module):
         self.downsample = int(2 ** (len(cfg.dim_mult) - 1))
 
         self.encoder = Encoder(cfg.in_dim, cfg.dim, cfg.dim_mult, cfg.num_res_blocks, cfg.z_dim, cfg.quant_conv)
-        decoder_dim = cfg.decoder_dim or cfg.dim
-        self.decoder = Decoder(decoder_dim, cfg.out_dim, cfg.dim_mult, cfg.num_res_blocks, cfg.z_dim, cfg.quant_conv)
+        self.decoder = Decoder(cfg.dim, cfg.out_dim, cfg.dim_mult, cfg.num_res_blocks, cfg.z_dim, cfg.quant_conv)
 
         # Flux.2
         if cfg.use_bn:
@@ -300,38 +298,11 @@ class AutoEncoder(nn.Module):
         return self.decode(self.encode(x, sample), x.dtype == torch.uint8)
 
 
-# diffusers AutoencoderKL(Flux2) -> BFL key names
-def _convert_diffusers_vae(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-    num_up = 1 + max(int(k.split(".")[2]) for k in state_dict if k.startswith("decoder.up_blocks."))
-    out = dict()
-    for k, v in state_dict.items():
-        if k == "bn.num_batches_tracked":
-            continue
-        k = k.replace("quant_conv", "encoder.quant_conv") if k.startswith("quant_conv") else k
-        k = k.replace("post_quant_conv", "decoder.post_quant_conv") if k.startswith("post_quant_conv") else k
-        k = k.replace("down_blocks.", "down.").replace("downsamplers.0", "downsample")
-        k = k.replace("upsamplers.0", "upsample").replace("resnets.", "block.").replace("conv_shortcut", "nin_shortcut")
-        k = k.replace("mid_block.block.0", "mid.block_1").replace("mid_block.block.1", "mid.block_2")
-        k = k.replace("mid_block.attentions.0", "mid.attn_1").replace("group_norm", "norm")
-        k = k.replace("to_q", "q").replace("to_k", "k").replace("to_v", "v").replace("to_out.0", "proj_out")
-        k = k.replace("conv_norm_out", "norm_out")
-        if k.startswith("decoder.up_blocks."):
-            _, _, i, rest = k.split(".", 3)
-            k = f"decoder.up.{num_up - 1 - int(i)}.{rest}"
-        out[k] = v
-    return out
-
-
 def _load_vae(repo_id: str, filename: str, scale_shift: tuple[float, float] = (1.0, 0.0)):
     state_dict = load_hf_state_dict(repo_id, filename)
-    if "decoder.up_blocks.0.resnets.0.conv1.weight" in state_dict:
-        state_dict = _convert_diffusers_vae(state_dict)
 
-    dim = state_dict["encoder.conv_in.weight"].shape[0]
-    decoder_dim = state_dict["decoder.up.0.block.0.conv1.weight"].shape[0]
     cfg = AEConfig(
         z_dim=state_dict["encoder.conv_out.weight"].shape[0] // 2,
-        decoder_dim=decoder_dim if decoder_dim != dim else None,
         scale_shift=scale_shift,
         quant_conv="encoder.quant_conv.weight" in state_dict,
         use_bn="bn.running_mean" in state_dict,
@@ -349,7 +320,5 @@ def load_vae(name: str):
         # original weight is FP32
         flux1=("black-forest-labs/FLUX.1-dev", "ae.safetensors", (0.3611, 0.1159)),
         flux2=("black-forest-labs/FLUX.2-dev", "ae.safetensors", (1.0, 0.0)),
-        # Flux.2 encoder with Flux.2 small decoder, in diffusers format
-        flux2_small_decoder=("OpenMOSS-Team/MOSS-Image-SFT", "vae/diffusion_pytorch_model.safetensors", (1.0, 0.0)),
     )[name]
     return _load_vae(repo_id, filename, scale_shift)
