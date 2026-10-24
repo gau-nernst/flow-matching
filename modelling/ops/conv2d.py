@@ -115,8 +115,6 @@ def conv2d_triton(
 
     out = x.new_empty(N, Hout, Wout, Cout)
     BLOCK_M = 64 if Hout * Wout <= 256 * 256 else 128
-    # Cout=192 (Flux.2 small decoder): BLOCK_N=64 is faster than masked BLOCK_N=128.
-    # Cout<128: one masked tile, e.g. Cout=96 -> 128. tl.dot requires N >= 16.
     BLOCK_N = 64 if Cout > 128 and Cout % 128 == 64 else min(max(triton.next_power_of_2(Cout), 16), 128)
     BLOCK_K = 32
 
