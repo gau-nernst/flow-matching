@@ -8,6 +8,7 @@ import triton.language as tl
 from torch import Tensor, nn
 
 from ..attn import dispatch_attn
+from ..flux1.model import timestep_embedding
 from ..flux1.modulate import modulate
 from ..linear import Linear
 from ..rope import apply_rope, compute_rope
@@ -156,14 +157,6 @@ class MOSSImage(nn.Module):
         ids = torch.cat([img_ids, txt_ids])
         return torch.cat([compute_rope(ids[:, i], HEAD_DIM // 4, 10_000.0) for i in range(4)], dim=-1)
 
-    def time_embed(self, t: Tensor) -> Tensor:
-        # t: [B] in [0, 1000]. sinusoid [cos, sin] in FP64
-        half = 128
-        freqs = 10_000 ** (-torch.arange(half, device=t.device, dtype=torch.float64) / half)
-        phase = t.double()[:, None] * freqs
-        emb = torch.cat([phase.cos(), phase.sin()], dim=-1)
-        return self.time_embedding(emb.to(self.video_embedder.weight.dtype))
-
     def forward(self, img: Tensor, time: Tensor, txt: Tensor, skip_layers: tuple[int, ...] = ()) -> Tensor:
         # img: [B, H, W, C], time: [B] in [0, 1] (1 is noise), txt: [B, L, text_dim] without padding
         # skip_layers: blocks to skip, for the negative branch of CFG
@@ -171,7 +164,7 @@ class MOSSImage(nn.Module):
         L_img = H * W
         dtype = self.video_embedder.weight.dtype
 
-        vec = self.time_embed(time * 1000)
+        vec = self.time_embedding(timestep_embedding(time, 256).to(dtype))
         mod = self.shared_block_modulation(vec).unflatten(1, (6, -1))
         shift, scale = self.video_head_modulation(vec).unflatten(1, (2, -1)).unbind(1)
 
