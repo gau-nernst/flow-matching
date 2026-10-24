@@ -14,9 +14,9 @@ from .model import MOSSImage, load_moss_image
 
 
 class MOSSImageTextEncoder:
-    def __init__(self, repo_id: str = "OpenMOSS-Team/MOSS-Image-SFT") -> None:
-        self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(repo_id, subfolder="tokenizer")
-        self.model = Qwen3_5Model.from_pretrained(repo_id, "text_encoder", prefix="language_model.")
+    def __init__(self, model_id: str = "Qwen/Qwen3.5-9B") -> None:
+        self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.model = Qwen3_5Model.from_pretrained(model_id)
         self.model.requires_grad_(False)
         self.max_length = 4096
 

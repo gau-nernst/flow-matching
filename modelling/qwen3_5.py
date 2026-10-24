@@ -174,12 +174,11 @@ class Qwen3_5Model(nn.Module):
         return self.norm(x)
 
     @staticmethod
-    def from_pretrained(model_id: str, subfolder: str = "", prefix: str | None = None) -> "Qwen3_5Model":
-        cfg = AutoConfig.from_pretrained(model_id, subfolder=subfolder).text_config
+    def from_pretrained(model_id: str) -> "Qwen3_5Model":
+        cfg = AutoConfig.from_pretrained(model_id).text_config
         with torch.device("meta"):
             model = Qwen3_5Model(cfg)
 
-        filename = f"{subfolder}/model.safetensors.index.json" if subfolder else "model.safetensors.index.json"
-        state_dict = load_hf_state_dict(model_id, filename, prefix=prefix)
+        state_dict = load_hf_state_dict(model_id, "model.safetensors.index.json", prefix="model.language_model.")
         model.load_state_dict(state_dict, assign=True)
         return model
