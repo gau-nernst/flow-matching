@@ -3,7 +3,6 @@
 from typing import NamedTuple
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import Tensor, nn
@@ -13,22 +12,6 @@ from ..flux1.modulate import modulate
 from ..linear import Linear
 from ..rope import apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(dim))
-        self.eps = eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        # official: normalize in FP32, cast to input dtype, then multiply weight
-        return F.rms_norm(x.float(), x.shape[-1:], eps=self.eps).to(x.dtype) * self.weight
-
-
-@triton.jit
-def _tanh(x):
-    return 2.0 * tl.sigmoid(2.0 * x) - 1.0
 
 
 @triton.jit
@@ -46,7 +29,8 @@ def _situ_kernel(
     hidden = tl.load(x_ptr + pid_m * 2 * F + offs, mask).to(tl.float32)
     gate = tl.load(x_ptr + pid_m * 2 * F + F + offs, mask).to(tl.float32)
 
-    out = (4.0 * _tanh(gate / 4.0) * tl.sigmoid(gate)) * (25.0 * _tanh(hidden / 25.0))
+    out = 4.0 * tl.extra.libdevice.tanh(gate / 4.0) * tl.sigmoid(gate)
+    out *= 25.0 * tl.extra.libdevice.tanh(hidden / 25.0)
     tl.store(o_ptr + pid_m * F + offs, out, mask)
 
 
@@ -71,8 +55,8 @@ class TextBlock(nn.Module):
     def __init__(self, dim: int, ffn_dim: int, num_heads: int) -> None:
         super().__init__()
         self.head_dim = dim // num_heads
-        self.norm1 = RMSNorm(dim)
-        self.norm2 = RMSNorm(dim)
+        self.norm1 = nn.RMSNorm(dim, eps=1e-6)
+        self.norm2 = nn.RMSNorm(dim, eps=1e-6)
         self.q_norm = nn.Parameter(torch.empty(self.head_dim))
         self.k_norm = nn.Parameter(torch.empty(self.head_dim))
         self.qkv = Linear(dim, 3 * dim)
@@ -104,8 +88,8 @@ class Block(nn.Module):
     def __init__(self, dim: int, ffn_dim: int, num_heads: int) -> None:
         super().__init__()
         self.head_dim = dim // num_heads
-        self.norm1 = RMSNorm(dim)
-        self.norm2 = RMSNorm(dim)
+        self.norm1 = nn.RMSNorm(dim, eps=1e-6)
+        self.norm2 = nn.RMSNorm(dim, eps=1e-6)
         self.q_norm = nn.Parameter(torch.empty(self.head_dim))
         self.k_norm = nn.Parameter(torch.empty(self.head_dim))
         self.q = Linear(dim, dim, bias=False)
@@ -161,7 +145,7 @@ class MOSSImage(nn.Module):
         self.time_embedding = nn.Sequential(Linear(cfg.freq_dim, dim), nn.SiLU(), Linear(dim, dim))
         self.shared_block_modulation = Linear(dim, 6 * dim)
         self.layers = nn.ModuleList([Block(dim, cfg.ffn_dim, cfg.num_heads) for _ in range(cfg.num_layers)])
-        self.final_norm_video = RMSNorm(dim)
+        self.final_norm_video = nn.RMSNorm(dim, eps=1e-6)
         self.final_linear_video = Linear(dim, cfg.latent_channels, bias=False)
         self.video_head_modulation = Linear(dim, 2 * dim)
 

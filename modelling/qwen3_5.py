@@ -4,6 +4,8 @@
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 from torch import Tensor, nn
 from transformers import AutoConfig
@@ -14,21 +16,28 @@ from .rope import apply_rope
 from .utils import create_weight_merge_hook, load_hf_state_dict
 
 
-# zero-centered weight: y = norm(x) * (1 + w). add 1 at load, and keep it in FP32 since (1 + w) loses precision in BF16.
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(dim))
-        self.eps = eps
+@triton.jit
+def _rms_norm_kernel(x_ptr, w_ptr, o_ptr, D: tl.constexpr, eps: float):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, triton.next_power_of_2(D))
+    mask = offs < D
+    x = tl.load(x_ptr + pid * D + offs, mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + offs, mask).to(tl.float32)
+    rrms = tl.rsqrt(tl.sum(x * x) * (1.0 / D) + eps)
+    tl.store(o_ptr + pid * D + offs, x * rrms * (1.0 + w), mask)
 
-        def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-            if f"{prefix}weight" in state_dict:
-                state_dict[f"{prefix}weight"] = state_dict[f"{prefix}weight"].float() + 1.0
 
-        self.register_load_state_dict_pre_hook(hook)
-
+# zero-centered weight: y = norm(x) * (1 + w)
+class RMSNorm(nn.RMSNorm):
     def forward(self, x: Tensor) -> Tensor:
-        return F.rms_norm(x.float(), x.shape[-1:], self.weight, self.eps).type_as(x)
+        if torch.is_grad_enabled():
+            return (F.rms_norm(x.float(), x.shape[-1:], eps=self.eps) * (1.0 + self.weight.float())).type_as(x)
+
+        assert x.is_contiguous()
+        out = torch.empty_like(x)
+        D = x.shape[-1]
+        _rms_norm_kernel[(x.numel() // D,)](x, self.weight, out, D, self.eps)
+        return out
 
 
 class Qwen3_5Attention(nn.Module):
@@ -56,7 +65,8 @@ class Qwen3_5Attention(nn.Module):
                 state_dict[f"{prefix}q_proj.weight"] = torch.cat([q.flatten(0, 1), gate.flatten(0, 1)])
             for name in ("q_norm.weight", "k_norm.weight"):
                 if f"{prefix}{name}" in state_dict:
-                    state_dict[f"{prefix}{name[:6]}"] = state_dict.pop(f"{prefix}{name}").float() + 1.0  # zero-centered
+                    # zero-centered. add 1 in FP32 since (1 + w) loses precision in BF16
+                    state_dict[f"{prefix}{name[:6]}"] = state_dict.pop(f"{prefix}{name}").float() + 1.0
 
         self.register_load_state_dict_pre_hook(hook)
 
