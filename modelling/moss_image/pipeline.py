@@ -60,7 +60,6 @@ class MOSSImagePipeline:
             m.cuda()
         return self
 
-    # all prompts must have the same token length (no padding)
     @torch.no_grad()
     def generate(
         self,
@@ -76,36 +75,35 @@ class MOSSImagePipeline:
         pbar: bool = False,
         progress_cb: Callable[[int, int], None] | None = None,
     ) -> Tensor:
-        txt = self.text_encoder(prompt)
-        assert all(x.shape == txt[0].shape for x in txt), "all prompts must have the same token length"
-        txt = torch.stack(txt)
-        bsize = txt.shape[0]
-        neg_txt = self.text_encoder(neg_prompt)[0].expand(bsize, -1, -1) if cfg_scale != 1.0 else None
+        txts = self.text_encoder(prompt)
+        neg_txt = self.text_encoder(neg_prompt)[0][None] if cfg_scale != 1.0 else None
 
         height, width = (img_size, img_size) if isinstance(img_size, int) else img_size
         ae = self.ae
         H = height // ae.downsample // 2
         W = width // ae.downsample // 2
         device = ae.encoder.conv_in.weight.device
-
-        # FP32 noise in NCHW layout, sampled on GPU, to reproduce seeds of the reference pipeline
         rng = torch.Generator(device).manual_seed(seed) if seed is not None else None
-        noise = torch.randn(bsize, ae.cfg.z_dim * 4, H, W, device=device, generator=rng)
-        noise = noise.permute(0, 2, 3, 1)
 
-        latents = moss_image_generate(
-            moss=self.moss,
-            latents=noise,
-            timesteps=moss_image_timesteps(num_steps, shift),
-            txt=txt,
-            neg_txt=neg_txt,
-            cfg_scale=cfg_scale,
-            uncond_skip_layers=uncond_skip_layers,
-            solver=solver,
-            pbar=pbar,
-            progress_cb=progress_cb,
-        )
-        return ae.decode(latents, uint8=True)
+        # the DiT doesn't support padding, so generate each prompt separately
+        imgs = []
+        for i, txt in enumerate(txts):
+            noise = torch.randn(1, H, W, ae.cfg.z_dim * 4, device=device, generator=rng)
+            cb = (lambda step, n, i=i: progress_cb(i * n + step, len(txts) * n)) if progress_cb else None
+            latents = moss_image_generate(
+                moss=self.moss,
+                latents=noise,
+                timesteps=moss_image_timesteps(num_steps, shift),
+                txt=txt[None],
+                neg_txt=neg_txt,
+                cfg_scale=cfg_scale,
+                uncond_skip_layers=uncond_skip_layers,
+                solver=solver,
+                pbar=pbar,
+                progress_cb=cb,
+            )
+            imgs.append(ae.decode(latents, uint8=True))
+        return torch.cat(imgs)
 
 
 # shifted grid, snapped to the nearest training timestep. ends with 0
