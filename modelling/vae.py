@@ -225,7 +225,7 @@ class AEConfig(NamedTuple):
     scale_shift: tuple[float, float] = (1.0, 0.0)
     quant_conv: bool = False
     use_bn: bool = False
-    decoder_dim: int | None = None  # defaults to dim
+    decoder_dim: int = 128
 
 
 class AutoEncoder(nn.Module):
@@ -235,8 +235,9 @@ class AutoEncoder(nn.Module):
         self.downsample = int(2 ** (len(cfg.dim_mult) - 1))
 
         self.encoder = Encoder(cfg.in_dim, cfg.dim, cfg.dim_mult, cfg.num_res_blocks, cfg.z_dim, cfg.quant_conv)
-        decoder_dim = cfg.decoder_dim or cfg.dim
-        self.decoder = Decoder(decoder_dim, cfg.out_dim, cfg.dim_mult, cfg.num_res_blocks, cfg.z_dim, cfg.quant_conv)
+        self.decoder = Decoder(
+            cfg.decoder_dim, cfg.out_dim, cfg.dim_mult, cfg.num_res_blocks, cfg.z_dim, cfg.quant_conv
+        )
 
         # Flux.2
         if cfg.use_bn:
@@ -302,11 +303,10 @@ class AutoEncoder(nn.Module):
 
 def _load_vae(repo_id: str, filename: str, scale_shift: tuple[float, float] = (1.0, 0.0)):
     state_dict = load_hf_state_dict(repo_id, filename)
-    dim = state_dict["encoder.conv_in.weight"].shape[0]
-    decoder_dim = state_dict["decoder.up.0.block.0.conv1.weight"].shape[0]
+
     cfg = AEConfig(
         z_dim=state_dict["encoder.conv_out.weight"].shape[0] // 2,
-        decoder_dim=decoder_dim if decoder_dim != dim else None,
+        decoder_dim=state_dict["decoder.up.0.block.0.conv1.weight"].shape[0],
         scale_shift=scale_shift,
         quant_conv="encoder.quant_conv.weight" in state_dict,
         use_bn="bn.running_mean" in state_dict,
@@ -324,10 +324,6 @@ def load_vae(name: str):
         # original weight is FP32
         flux1=("black-forest-labs/FLUX.1-dev", "ae.safetensors", (0.3611, 0.1159)),
         flux2=("black-forest-labs/FLUX.2-dev", "ae.safetensors", (1.0, 0.0)),
-        flux2_small_decoder=(
-            "black-forest-labs/FLUX.2-small-decoder",
-            "full_encoder_small_decoder.safetensors",
-            (1.0, 0.0),
-        ),
+        flux2_small=("black-forest-labs/FLUX.2-small-decoder", "full_encoder_small_decoder.safetensors", (1.0, 0.0)),
     )[name]
     return _load_vae(repo_id, filename, scale_shift)

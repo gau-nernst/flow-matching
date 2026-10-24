@@ -7,7 +7,6 @@ from torch import Tensor
 from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from ..linear import Linear
 from ..qwen3_5 import Qwen3_5Model
 from ..solvers import get_solver
 from ..vae import load_vae
@@ -15,11 +14,10 @@ from .model import MOSSImage, load_moss_image
 
 
 class MOSSImageTextEncoder:
-    def __init__(self, repo_id: str = "OpenMOSS-Team/MOSS-Image-SFT", fp8: bool = True) -> None:
+    def __init__(self, repo_id: str = "OpenMOSS-Team/MOSS-Image-SFT") -> None:
         self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(repo_id, subfolder="tokenizer")
         self.model = Qwen3_5Model.from_pretrained(repo_id, "text_encoder", prefix="language_model.")
         self.model.requires_grad_(False)
-        self.fp8 = fp8
         self.max_length = 4096
 
     def cpu(self):
@@ -28,11 +26,6 @@ class MOSSImageTextEncoder:
 
     def cuda(self):
         self.model.cuda()
-        # quantize on GPU since it's much faster. skip layers whose dim is not a multiple of 128
-        if self.fp8:
-            for m in self.model.modules():
-                if isinstance(m, Linear) and m.weight.shape[0] % 128 == 0 and not m.is_fp8_1d2d():
-                    m.to_fp8_1d2d()
         return self
 
     # encode each prompt separately, without padding
@@ -53,13 +46,11 @@ class MOSSImageTextEncoder:
 
 
 class MOSSImagePipeline:
-    # fp8: online block FP8, quantized in .cuda()
-    def __init__(self, moss: MOSSImage | None = None, fp8: bool = True) -> None:
+    def __init__(self, moss: MOSSImage | None = None) -> None:
         # apply_rope() takes the slow reference path when params require grad
         self.moss = (moss or load_moss_image()).requires_grad_(False)
-        self.ae = load_vae("flux2_small_decoder").bfloat16()  # reference runs the VAE in FP32
-        self.text_encoder = MOSSImageTextEncoder(fp8=fp8)
-        self.fp8 = fp8
+        self.ae = load_vae("flux2_small").bfloat16()  # reference runs the VAE in FP32
+        self.text_encoder = MOSSImageTextEncoder()
 
     def cpu(self):
         for m in (self.moss, self.ae, self.text_encoder):
@@ -69,10 +60,6 @@ class MOSSImagePipeline:
     def cuda(self):
         for m in (self.moss, self.ae, self.text_encoder):
             m.cuda()
-        if self.fp8:
-            for m in self.moss.layers.modules():
-                if isinstance(m, Linear) and not m.is_fp8_1d2d():
-                    m.to_fp8_1d2d()
         return self
 
     # all prompts must have the same token length (no padding)
