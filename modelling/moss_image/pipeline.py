@@ -17,7 +17,6 @@ class MOSSImageTextEncoder:
     def __init__(self, model_id: str = "Qwen/Qwen3.5-9B") -> None:
         self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(model_id)
         self.model = Qwen3_5Model.from_pretrained(model_id)
-        self.model.requires_grad_(False)
         self.max_length = 4096
 
     def cpu(self):
@@ -47,8 +46,7 @@ class MOSSImageTextEncoder:
 
 class MOSSImagePipeline:
     def __init__(self, moss: MOSSImage | None = None) -> None:
-        # apply_rope() takes the slow reference path when params require grad
-        self.moss = (moss or load_moss_image()).requires_grad_(False)
+        self.moss = moss or load_moss_image()
         self.ae = load_vae("flux2_small").bfloat16()  # reference runs the VAE in FP32
         self.text_encoder = MOSSImageTextEncoder()
 

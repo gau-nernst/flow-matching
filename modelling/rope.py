@@ -141,7 +141,7 @@ def apply_rope(
     # rope: [L, D/2] in complex
     # rot_dim: partial rotary for half-split layout. rope must have angle 0 beyond rot_dim/2
     # gemma_norm: GemmaRMSNorm i.e. norm(x) * (1 + w)
-    if any([x.requires_grad, rope.requires_grad, norm.requires_grad if norm is not None else False]):
+    if torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (x, rope, norm)):
         out_ = _norm_rope_ref(x, rope, norm, eps, interleaved, rot_dim, gemma_norm)
         return out.copy_(out_) if out is not None else out_.type_as(x)
 
