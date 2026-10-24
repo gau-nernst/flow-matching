@@ -270,6 +270,13 @@ class Flux2(nn.Module):
 def _load_flux2(repo_id: str, filename: str):
     state_dict = load_hf_state_dict(repo_id, filename)
 
+    # official NVFP4 checkpoints store element 0 in the high nibble. swap to low nibble.
+    for key in list(state_dict.keys()):
+        if key.endswith(".weight_scale_2"):
+            w_key = key.removesuffix("_scale_2")
+            w = state_dict[w_key]
+            state_dict[w_key] = (w << 4) | (w >> 4)
+
     num_double_blocks = 0
     num_single_blocks = 0
 

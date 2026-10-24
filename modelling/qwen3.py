@@ -25,13 +25,22 @@ class Qwen3Attention(nn.Module):
 
         self.register_load_state_dict_pre_hook(create_weight_merge_hook(["q_proj", "k_proj", "v_proj"], "qkv_proj"))
 
-    def forward(self, x: Tensor, pos_embeds: Tensor, add: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        pos_embeds: Tensor,
+        add: Tensor | None = None,
+        attn_mask: Tensor | None = None,
+    ) -> Tensor:
         qkv = self.qkv_proj(x).view(*x.shape[:-1], -1, self.head_dim)
         q, k, v = qkv.split((self.num_qo_heads, self.num_kv_heads, self.num_kv_heads), dim=-2)
-        q = apply_rope(q, pos_embeds, self.q_norm.weight, self.eps).transpose(1, 2)
-        k = apply_rope(k, pos_embeds, self.k_norm.weight, self.eps).transpose(1, 2)
+        q = apply_rope(q, pos_embeds, self.q_norm.weight, self.eps, interleaved=False).transpose(1, 2)
+        k = apply_rope(k, pos_embeds, self.k_norm.weight, self.eps, interleaved=False).transpose(1, 2)
         v = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        if attn_mask is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=True)
         out = self.o_proj(out.transpose(1, 2).flatten(-2), add)
         return out
 
@@ -63,8 +72,8 @@ class Qwen3DecoderLayer(nn.Module):
         self.mlp = Qwen3MLP(cfg)
         self.layer_id = layer_id
 
-    def forward(self, x: Tensor, pos_embeds: Tensor) -> Tensor:
-        x = self.self_attn(self.input_layernorm(x), pos_embeds, x)
+    def forward(self, x: Tensor, pos_embeds: Tensor, attn_mask: Tensor | None = None) -> Tensor:
+        x = self.self_attn(self.input_layernorm(x), pos_embeds, x, attn_mask)
         x = self.mlp(self.post_attention_layernorm(x), x)
         return x
 
@@ -78,7 +87,14 @@ class Qwen3Model(nn.Module):
         self.layers = nn.ModuleList([Qwen3DecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers)])
         self.norm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
-    def forward(self, input_ids: Tensor, *, output_indices: tuple[int, ...] | None = None) -> Tensor:
+    # attn_mask: [B, 1, L, L] bool, True means attend. default to causal mask.
+    def forward(
+        self,
+        input_ids: Tensor,
+        *,
+        output_indices: tuple[int, ...] | None = None,
+        attn_mask: Tensor | None = None,
+    ) -> Tensor:
         x = self.embed_tokens(input_ids)
 
         theta = self.cfg.rope_parameters["rope_theta"]
@@ -86,7 +102,7 @@ class Qwen3Model(nn.Module):
 
         intermediates = []
         for i, layer in enumerate(self.layers):
-            x = layer(x, pos_embeds)
+            x = layer(x, pos_embeds, attn_mask)
             if output_indices and i in output_indices:
                 intermediates.append(x)
 

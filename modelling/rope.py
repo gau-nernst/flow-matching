@@ -21,17 +21,24 @@ def compute_rope(
 
 
 @triton.jit
-def _rope(x, cos, sin, bwd: tl.constexpr = False):
+def _rope(x, cos, sin, bwd: tl.constexpr = False, interleaved: tl.constexpr = True):
+    # interleaved: rotate pairs (2i, 2i + 1). otherwise (i, i + D/2) like HF
     BLOCK_H: tl.constexpr = x.shape[0]
     BLOCK_D: tl.constexpr = x.shape[1]
-    x0, x1 = x.reshape(BLOCK_H, BLOCK_D // 2, 2).split()
+    if interleaved:
+        x0, x1 = x.reshape(BLOCK_H, BLOCK_D // 2, 2).split()
+    else:
+        x0, x1 = x.reshape(BLOCK_H, 2, BLOCK_D // 2).permute(0, 2, 1).split()
     if not bwd:
         y0 = x0 * cos - x1 * sin
         y1 = x0 * sin + x1 * cos
     else:
         y0 = x0 * cos + x1 * sin
         y1 = -x0 * sin + x1 * cos
-    return tl.join(y0, y1).reshape(BLOCK_H, BLOCK_D)
+    y = tl.join(y0, y1)
+    if not interleaved:
+        y = y.permute(0, 2, 1)
+    return y.reshape(BLOCK_H, BLOCK_D)
 
 
 @triton.jit
@@ -47,6 +54,7 @@ def _norm_rope_kernel(
     H,
     D: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    interleaved: tl.constexpr,
     eps=1e-6,
 ):
     pid_l = tl.program_id(0)
@@ -76,23 +84,26 @@ def _norm_rope_kernel(
             x = x * rrms * norm
             # x = x.to(tl.bfloat16).to(tl.float32)
 
-        tl.store(y_ptrs, _rope(x, cos, sin), mask)
+        tl.store(y_ptrs, _rope(x, cos, sin, interleaved=interleaved), mask)
 
         x_ptrs += BLOCK_H * D
         y_ptrs += BLOCK_H * D
 
 
-def _norm_rope_ref(x: Tensor, rope: Tensor, norm: Tensor | None = None, eps: float = 1e-6):
+def _norm_rope_ref(
+    x: Tensor, rope: Tensor, norm: Tensor | None = None, eps: float = 1e-6, interleaved: bool = True
+) -> Tensor:
     if norm is not None:
         x = F.rms_norm(x, x.shape[-1:], norm, eps)
     cos, sin = torch.view_as_real(rope).unsqueeze(-3).unbind(-1)  # [L, 1, D/2] each
-    x0, x1 = x.float().unflatten(-1, (-1, 2)).unbind(-1)  # [B, L, nH, D/2] each
+    pair_dim = -1 if interleaved else -2
+    x0, x1 = x.float().unflatten(-1, (-1, 2) if interleaved else (2, -1)).unbind(pair_dim)  # [B, L, nH, D/2] each
     return torch.stack(
         [
             torch.addcmul(x0 * cos, x1, sin, value=-1),
             torch.addcmul(x0 * sin, x1, cos),
         ],
-        dim=-1,
+        dim=pair_dim,
     ).flatten(-2)
 
 
@@ -102,12 +113,13 @@ def apply_rope(
     norm: Tensor | None = None,
     eps: float = 1e-6,
     *,
+    interleaved: bool = True,
     out: Tensor | None = None,
 ) -> Tensor:
     # x: [B, L, nH, D] in real
     # rope: [L, D/2] in complex
     if any([x.requires_grad, rope.requires_grad, norm.requires_grad if norm is not None else False]):
-        out_ = _norm_rope_ref(x, rope, norm, eps)
+        out_ = _norm_rope_ref(x, rope, norm, eps, interleaved)
         return out.copy_(out_) if out is not None else out_.type_as(x)
 
     assert x[0, 0].is_contiguous() and rope.is_contiguous()
@@ -119,9 +131,12 @@ def apply_rope(
     else:
         out = torch.empty_like(x)
     B, L, H, D = x.shape
+    assert interleaved or D & (D - 1) == 0  # half split requires power-of-2 D
     BLOCK_H = 8  # 8x128 = 1024. so 4 warps issue 16B
     grid = (L, B)
-    _norm_rope_kernel[grid](x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], H, D, BLOCK_H, eps=eps)
+    _norm_rope_kernel[grid](
+        x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], H, D, BLOCK_H, interleaved, eps=eps
+    )
     return out
 
 
