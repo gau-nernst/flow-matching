@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from gn_kernels import quantize_fp8_1d, quantize_nvfp4_triton
-from gn_kernels.cutedsl.sm120 import sm120_mm_fp8_1d2d
+from gn_kernels.cutedsl.sm120 import sm120_mm_fp8_1d2d, sm120_mm_fp8_rowwise
 from torch import Tensor, nn
 from torch.utils.flop_counter import register_flop_formula
 
@@ -94,16 +94,9 @@ class Linear(nn.Module):
 
         elif self.is_fp8_rowwise():
             xq, xs = fp8_rowwise_quantize(x)
-            out = F.scaled_mm(
-                xq,
-                self.weight.T,
-                xs,
-                F.ScalingType.RowWise,
-                self.weight_scale[None],
-                F.ScalingType.RowWise,
-                bias=self.bias,
-                use_fast_accum=True,
-            )
+            out = sm120_mm_fp8_rowwise.mm(xq, xs, self.weight, self.weight_scale)
+            if self.bias is not None:
+                out = out + self.bias
             if add is not None:
                 out = out + add
 
