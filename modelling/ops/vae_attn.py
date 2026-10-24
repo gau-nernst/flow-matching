@@ -29,13 +29,13 @@ from gn_kernels.cutedsl.utils import EVICT_FIRST, mma_sync, permute, simple_tma_
 class VaeAttn:
     # TODO: support BQ=64 / 4x2 warp
     BQ: int = 32
-    BK: int = 128
     num_stages: int = 3
 
     def __init__(self, dim: int) -> None:
-        # K and V share smem stages. a stage holds either a [BK, 64] K tile or a [16, DIM] V tile.
-        assert dim % 64 == 0 and 16 * dim <= self.BK * 64
+        # K tile [BK, 64] and V tile [16, DIM] share smem stages
+        assert dim % 64 == 0
         self.DIM = dim
+        self.BK = dim // 4
 
     @cute.jit
     def prepare_tma(
@@ -44,14 +44,13 @@ class VaeAttn:
         BLOCK_L: cutlass.Constexpr[int],
         BLOCK_D: cutlass.Constexpr[int],
         num_stages: cutlass.Constexpr[int],
-        stage_size: cutlass.Constexpr[int],
         tma_op: cpasync.TmaCopyOp,
     ):
         # QK: [B, L, D]
         swizzle = cute.make_swizzle(3, 4, 3)  # 128B
         s_layout = cute.make_layout(
             (1, BLOCK_L, (64, BLOCK_D // 64), num_stages),
-            stride=(0, 64, (1, BLOCK_L * 64), stage_size),
+            stride=(0, 64, (1, BLOCK_L * 64), BLOCK_L * BLOCK_D),
         )
         s_layout = cute.make_composed_layout(swizzle, 0, s_layout)
         return cpasync.make_tiled_tma_atom(tma_op, x, s_layout, (1, BLOCK_L, BLOCK_D))
@@ -61,9 +60,9 @@ class VaeAttn:
         B, Lq, _ = gQ.shape
 
         tma_g2s = cpasync.CopyBulkTensorTileG2SOp()
-        Q_tma = self.prepare_tma(gQ, self.BQ, self.DIM, 1, self.BQ * self.DIM, tma_g2s)
-        K_tma = self.prepare_tma(gK, self.BK, 64, self.num_stages, self.BK * 64, tma_g2s)
-        V_tma = self.prepare_tma(gV, 16, self.DIM, self.num_stages, self.BK * 64, tma_g2s)
+        Q_tma = self.prepare_tma(gQ, self.BQ, self.DIM, 1, tma_g2s)
+        K_tma = self.prepare_tma(gK, self.BK, 64, self.num_stages, tma_g2s)
+        V_tma = self.prepare_tma(gV, 16, self.DIM, self.num_stages, tma_g2s)
 
         grid = (cute.ceil_div(Lq, self.BQ), B, 1)
         block = (5 * 32, 1, 1)
@@ -92,7 +91,7 @@ class VaeAttn:
         sQ = allocate_smem(smem, Q_tma.smem_layout)[0, None, None, 0]  # 32 KiB
         sK = allocate_smem(smem, K_tma.smem_layout)[0, None, None, None]  # 32 KiB
 
-        # V and K share the same slots. V tile may be smaller than K tile.
+        # V and K share the same slots
         sV = cute.make_tensor(sK.iterator, V_tma.smem_layout.outer)[0, None, None, None]
 
         sP = smem.allocate_tensor(
@@ -236,7 +235,7 @@ class VaeAttn:
                     for i in cutlass.range_constexpr(4):
                         rS[i, n] *= sm_scale
 
-                # mask out-of-bounds keys of the last KV tile. TMA zero-fills K and V there.
+                # mask out-of-bounds keys. TMA zero-fills K/V there.
                 if (iter_l + 1) * BK > Lk:
                     for n in cutlass.range_constexpr(WK // 8):
                         for i in cutlass.range_constexpr(4):
@@ -373,7 +372,7 @@ class VaeAttn:
 
 
 def vae_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-    # q: [B, Lq, D], k/v: [B, Lk, D]. our kernel supports D = 384 or 512, Lq a multiple of 32.
+    # q: [B, Lq, D], k/v: [B, Lk, D]
     if any(x.requires_grad for x in (q, k, v)) or q.shape[-1] not in (384, 512) or q.shape[1] % VaeAttn.BQ != 0:
         # F.sdpa's memory-efficient impl requires ndim=4
         return F.scaled_dot_product_attention(q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)).squeeze(1)
