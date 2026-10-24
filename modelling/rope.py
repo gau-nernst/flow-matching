@@ -51,6 +51,7 @@ def _norm_rope_kernel(
     y_ptr,
     stride_xb,
     stride_xl,
+    stride_xh,
     stride_ob,
     stride_ol,
     H,
@@ -69,7 +70,7 @@ def _norm_rope_kernel(
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < D
 
-    x_ptrs = x_ptr + (pid_b * stride_xb + pid_l * stride_xl + offs_h * D + offs_d)
+    x_ptrs = x_ptr + (pid_b * stride_xb + pid_l * stride_xl + offs_h * stride_xh + offs_d)
     y_ptrs = y_ptr + (pid_b * stride_ob + pid_l * stride_ol + offs_h * D + offs_d)
 
     rope = tl.load(rope_ptr + (pid_l * D + offs_d), mask_d)
@@ -92,7 +93,7 @@ def _norm_rope_kernel(
 
         tl.store(y_ptrs, _rope(x, cos, sin, interleaved=interleaved, ROT_D=ROT_D), mask)
 
-        x_ptrs += BLOCK_H * D
+        x_ptrs += BLOCK_H * stride_xh
         y_ptrs += BLOCK_H * D
 
 
@@ -145,20 +146,20 @@ def apply_rope(
         out_ = _norm_rope_ref(x, rope, norm, eps, interleaved, rot_dim, gemma_norm)
         return out.copy_(out_) if out is not None else out_.type_as(x)
 
-    assert x[0, 0].is_contiguous() and rope.is_contiguous()
+    assert x.stride(-1) == 1 and rope.is_contiguous()
     if norm is not None:
         assert norm.is_contiguous()
     rope_real = torch.view_as_real(rope)
     if out is not None:
         assert out[0, 0].is_contiguous()
     else:
-        out = torch.empty_like(x)
+        out = x.new_empty(x.shape)
     B, L, H, D = x.shape
     ROT_D = rot_dim or D
     assert interleaved or (D & (D - 1) == 0 and D % ROT_D == 0)  # half split requires power-of-2 D
     BLOCK_H = 8  # 8x128 = 1024. so 4 warps issue 16B
     grid = (L, B)
-    strides = (*x.stride()[:2], *out.stride()[:2])
+    strides = (*x.stride()[:3], *out.stride()[:2])
     _norm_rope_kernel[grid](x, rope_real, norm, out, *strides, H, D, BLOCK_H, interleaved, ROT_D, gemma_norm, eps=eps)
     return out
 
