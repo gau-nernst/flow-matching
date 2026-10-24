@@ -52,30 +52,25 @@ class Qwen3_5Attention(nn.Module):
         self.q_norm = nn.Parameter(torch.empty(D))
         self.k_norm = nn.Parameter(torch.empty(D))
 
-        # partial RoPE on the first rot_dim dims. HF rotates pairs (i, i + rot_dim/2), while our apply_rope() rotates
-        # pairs (2i, 2i + 1). permute q/k rows within each head so that they are equivalent.
-        rot_dim = int(D * cfg.rope_parameters["partial_rotary_factor"])
-        perm = torch.arange(D, device="cpu")
-        perm[:rot_dim] = perm[:rot_dim].view(2, rot_dim // 2).T.flatten()
+        self.rot_dim = int(D * cfg.rope_parameters["partial_rotary_factor"])
 
         def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
             if f"{prefix}q_proj.weight" in state_dict:
                 # [H, (q, gate), D, in] -> [(q, gate), H, D, in], so that q and gate are contiguous chunks
                 q, gate = state_dict[f"{prefix}q_proj.weight"].unflatten(0, (H, 2, D)).unbind(1)
-                state_dict[f"{prefix}q_proj.weight"] = torch.cat([q[:, perm].flatten(0, 1), gate.flatten(0, 1)])
-            if f"{prefix}k_proj.weight" in state_dict:
-                w = state_dict[f"{prefix}k_proj.weight"]
-                state_dict[f"{prefix}k_proj.weight"] = w.unflatten(0, (-1, D))[:, perm].flatten(0, 1)
+                state_dict[f"{prefix}q_proj.weight"] = torch.cat([q.flatten(0, 1), gate.flatten(0, 1)])
             for name in ("q_norm.weight", "k_norm.weight"):
                 if f"{prefix}{name}" in state_dict:
-                    state_dict[f"{prefix}{name[:6]}"] = state_dict.pop(f"{prefix}{name}")[perm].float() + 1.0
+                    state_dict[f"{prefix}{name[:6]}"] = state_dict.pop(f"{prefix}{name}").float() + 1.0
 
         self.register_load_state_dict_pre_hook(hook)
 
     def forward(self, x: Tensor, pos_embeds: Tensor, add: Tensor | None = None) -> Tensor:
         q, gate = self.q_proj(x).chunk(2, dim=-1)
-        q = apply_rope(q.unflatten(-1, (-1, self.head_dim)), pos_embeds, self.q_norm, self.eps).transpose(1, 2)
-        k = apply_rope(self.k_proj(x).unflatten(-1, (-1, self.head_dim)), pos_embeds, self.k_norm, self.eps)
+        q = q.unflatten(-1, (-1, self.head_dim))
+        k = self.k_proj(x).unflatten(-1, (-1, self.head_dim))
+        q = apply_rope(q, pos_embeds, self.q_norm, self.eps, interleaved=False, rot_dim=self.rot_dim).transpose(1, 2)
+        k = apply_rope(k, pos_embeds, self.k_norm, self.eps, interleaved=False, rot_dim=self.rot_dim)
         v = self.v_proj(x).unflatten(-1, (-1, self.head_dim))
         out = F.scaled_dot_product_attention(q, k.transpose(1, 2), v.transpose(1, 2), is_causal=True, enable_gqa=True)
         out = out.transpose(1, 2).flatten(-2) * torch.sigmoid(gate)

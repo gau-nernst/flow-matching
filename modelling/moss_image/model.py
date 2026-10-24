@@ -25,16 +25,6 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x.float(), x.shape[-1:], eps=self.eps).to(x.dtype) * self.weight
 
 
-# official RoPE rotates pairs (i, i + D/2), while our apply_rope() rotates pairs (2i, 2i + 1).
-# permute q/k rows within each head so that they are equivalent.
-def _rope_perm(head_dim: int) -> Tensor:
-    return torch.arange(head_dim, device="cpu").view(2, head_dim // 2).T.flatten()
-
-
-def _permute_heads(x: Tensor, perm: Tensor) -> Tensor:
-    return x.unflatten(0, (-1, perm.shape[0]))[:, perm].flatten(0, 1)
-
-
 # text refiner block: pre-norm, no modulation
 class TextBlock(nn.Module):
     def __init__(self, dim: int, ffn_dim: int, num_heads: int) -> None:
@@ -49,29 +39,22 @@ class TextBlock(nn.Module):
         self.ffn_up_gate = Linear(dim, 2 * ffn_dim)
         self.ffn_down = Linear(ffn_dim, dim)
 
-        perm = _rope_perm(self.head_dim)
-
         def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
             for suffix in ("weight", "bias"):
-                if f"{prefix}qkv.{suffix}" in state_dict:
-                    q, k, v = state_dict[f"{prefix}qkv.{suffix}"].chunk(3)
-                    state_dict[f"{prefix}qkv.{suffix}"] = torch.cat(
-                        [_permute_heads(q, perm), _permute_heads(k, perm), v]
-                    )
                 if f"{prefix}ffn_gate.{suffix}" in state_dict:
                     gate = state_dict.pop(f"{prefix}ffn_gate.{suffix}")
                     up = state_dict.pop(f"{prefix}ffn_up.{suffix}")
                     state_dict[f"{prefix}ffn_up_gate.{suffix}"] = torch.cat([up, gate])
             for name in ("q_norm", "k_norm"):
                 if f"{prefix}{name}.weight" in state_dict:
-                    state_dict[f"{prefix}{name}"] = state_dict.pop(f"{prefix}{name}.weight")[perm]
+                    state_dict[f"{prefix}{name}"] = state_dict.pop(f"{prefix}{name}.weight")
 
         self.register_load_state_dict_pre_hook(hook)
 
     def forward(self, x: Tensor, rope: Tensor) -> Tensor:
         q, k, v = self.qkv(self.norm1(x)).unflatten(-1, (3, -1, self.head_dim)).unbind(2)
-        q = apply_rope(q, rope, self.q_norm)
-        k = apply_rope(k, rope, self.k_norm)
+        q = apply_rope(q, rope, self.q_norm, interleaved=False)
+        k = apply_rope(k, rope, self.k_norm, interleaved=False)
         x = self.proj(dispatch_attn(q, k, v).flatten(-2), x)
         return self.ffn_down(situ(self.ffn_up_gate(self.norm2(x))), x)
 
@@ -96,19 +79,6 @@ class Block(nn.Module):
         remap_pairs += [("q_norm.weight", "q_norm"), ("k_norm.weight", "k_norm")]
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
-        perm = _rope_perm(self.head_dim)
-
-        def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-            for name in ("q.weight", "k.weight"):
-                if f"{prefix}{name}" in state_dict:
-                    state_dict[f"{prefix}{name}"] = _permute_heads(state_dict[f"{prefix}{name}"], perm)
-            for name in ("q_norm", "k_norm"):
-                if f"{prefix}{name}" in state_dict:
-                    state_dict[f"{prefix}{name}"] = state_dict[f"{prefix}{name}"][perm]
-
-        # must run after remap
-        self.register_load_state_dict_pre_hook(hook)
-
     # the gated residual of the FFN is deferred to the next block (or the final layer), so that it can be fused
     # with the next norm. modulation is shared across blocks, so gate_f is the same.
     # official residual stream is FP32 (FP32 modulation promotes it). using BF16 barely changes the output.
@@ -118,8 +88,8 @@ class Block(nn.Module):
         y, x = modulate(
             x, shift_a, scale_a, ffn_out, gate_f if ffn_out is not None else None, 1e-6, self.norm1.weight, True
         )
-        q = apply_rope(self.q(y).unflatten(-1, (-1, self.head_dim)), rope, self.q_norm)
-        k = apply_rope(self.k(y).unflatten(-1, (-1, self.head_dim)), rope, self.k_norm)
+        q = apply_rope(self.q(y).unflatten(-1, (-1, self.head_dim)), rope, self.q_norm, interleaved=False)
+        k = apply_rope(self.k(y).unflatten(-1, (-1, self.head_dim)), rope, self.k_norm, interleaved=False)
         v = self.v(y).unflatten(-1, (-1, self.head_dim))
         attn_out = self.o(dispatch_attn(q, k, v).flatten(-2))
 

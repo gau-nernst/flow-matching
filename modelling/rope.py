@@ -21,14 +21,15 @@ def compute_rope(
 
 
 @triton.jit
-def _rope(x, cos, sin, bwd: tl.constexpr = False, interleaved: tl.constexpr = True):
-    # interleaved: rotate pairs (2i, 2i + 1). otherwise (i, i + D/2) like HF
+def _rope(x, cos, sin, bwd: tl.constexpr = False, interleaved: tl.constexpr = True, ROT_D: tl.constexpr = 0):
+    # interleaved: rotate pairs (2i, 2i + 1). otherwise (i, i + ROT_D/2) within each chunk of ROT_D, like HF
     BLOCK_H: tl.constexpr = x.shape[0]
     BLOCK_D: tl.constexpr = x.shape[1]
     if interleaved:
         x0, x1 = x.reshape(BLOCK_H, BLOCK_D // 2, 2).split()
     else:
-        x0, x1 = x.reshape(BLOCK_H, 2, BLOCK_D // 2).permute(0, 2, 1).split()
+        x = x.reshape(BLOCK_H, BLOCK_D // ROT_D, 2, ROT_D // 2).permute(0, 1, 3, 2)
+        x0, x1 = x.reshape(BLOCK_H, BLOCK_D // 2, 2).split()
     if not bwd:
         y0 = x0 * cos - x1 * sin
         y1 = x0 * sin + x1 * cos
@@ -37,7 +38,7 @@ def _rope(x, cos, sin, bwd: tl.constexpr = False, interleaved: tl.constexpr = Tr
         y1 = -x0 * sin + x1 * cos
     y = tl.join(y0, y1)
     if not interleaved:
-        y = y.permute(0, 2, 1)
+        y = y.reshape(BLOCK_H, BLOCK_D // ROT_D, ROT_D // 2, 2).permute(0, 1, 3, 2)
     return y.reshape(BLOCK_H, BLOCK_D)
 
 
@@ -55,6 +56,7 @@ def _norm_rope_kernel(
     D: tl.constexpr,
     BLOCK_H: tl.constexpr,
     interleaved: tl.constexpr,
+    ROT_D: tl.constexpr,
     eps=1e-6,
 ):
     pid_l = tl.program_id(0)
@@ -84,27 +86,37 @@ def _norm_rope_kernel(
             x = x * rrms * norm
             # x = x.to(tl.bfloat16).to(tl.float32)
 
-        tl.store(y_ptrs, _rope(x, cos, sin, interleaved=interleaved), mask)
+        tl.store(y_ptrs, _rope(x, cos, sin, interleaved=interleaved, ROT_D=ROT_D), mask)
 
         x_ptrs += BLOCK_H * D
         y_ptrs += BLOCK_H * D
 
 
 def _norm_rope_ref(
-    x: Tensor, rope: Tensor, norm: Tensor | None = None, eps: float = 1e-6, interleaved: bool = True
+    x: Tensor,
+    rope: Tensor,
+    norm: Tensor | None = None,
+    eps: float = 1e-6,
+    interleaved: bool = True,
+    rot_dim: int | None = None,
 ) -> Tensor:
     if norm is not None:
         x = F.rms_norm(x, x.shape[-1:], norm, eps)
     cos, sin = torch.view_as_real(rope).unsqueeze(-3).unbind(-1)  # [L, 1, D/2] each
-    pair_dim = -1 if interleaved else -2
-    x0, x1 = x.float().unflatten(-1, (-1, 2) if interleaved else (2, -1)).unbind(pair_dim)  # [B, L, nH, D/2] each
-    return torch.stack(
+    R = rot_dim or x.shape[-1]
+    if not interleaved:  # reorder to interleaved, then back
+        x = x.unflatten(-1, (-1, 2, R // 2)).transpose(-1, -2).flatten(-3)
+    x0, x1 = x.float().unflatten(-1, (-1, 2)).unbind(-1)  # [B, L, nH, D/2] each
+    out = torch.stack(
         [
             torch.addcmul(x0 * cos, x1, sin, value=-1),
             torch.addcmul(x0 * sin, x1, cos),
         ],
-        dim=pair_dim,
+        dim=-1,
     ).flatten(-2)
+    if not interleaved:
+        out = out.unflatten(-1, (-1, R // 2, 2)).transpose(-1, -2).flatten(-3)
+    return out
 
 
 def apply_rope(
@@ -114,12 +126,14 @@ def apply_rope(
     eps: float = 1e-6,
     *,
     interleaved: bool = True,
+    rot_dim: int | None = None,
     out: Tensor | None = None,
 ) -> Tensor:
     # x: [B, L, nH, D] in real
     # rope: [L, D/2] in complex
+    # rot_dim: partial rotary for half-split layout. rope must have angle 0 beyond rot_dim/2
     if any([x.requires_grad, rope.requires_grad, norm.requires_grad if norm is not None else False]):
-        out_ = _norm_rope_ref(x, rope, norm, eps, interleaved)
+        out_ = _norm_rope_ref(x, rope, norm, eps, interleaved, rot_dim)
         return out.copy_(out_) if out is not None else out_.type_as(x)
 
     assert x[0, 0].is_contiguous() and rope.is_contiguous()
@@ -131,11 +145,12 @@ def apply_rope(
     else:
         out = torch.empty_like(x)
     B, L, H, D = x.shape
-    assert interleaved or D & (D - 1) == 0  # half split requires power-of-2 D
+    ROT_D = rot_dim or D
+    assert interleaved or (D & (D - 1) == 0 and D % ROT_D == 0)  # half split requires power-of-2 D
     BLOCK_H = 8  # 8x128 = 1024. so 4 warps issue 16B
     grid = (L, B)
     _norm_rope_kernel[grid](
-        x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], H, D, BLOCK_H, interleaved, eps=eps
+        x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], H, D, BLOCK_H, interleaved, ROT_D, eps=eps
     )
     return out
 
