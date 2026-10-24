@@ -35,7 +35,7 @@ class MOSSImageTextEncoder:
                     m.to_fp8_1d2d()
         return self
 
-    # official encodes each prompt separately, without padding
+    # encode each prompt separately, without padding
     @torch.no_grad()
     def __call__(self, texts: str | list[str]) -> list[Tensor]:
         if isinstance(texts, str):
@@ -57,7 +57,7 @@ class MOSSImagePipeline:
     def __init__(self, moss: MOSSImage | None = None, fp8: bool = True) -> None:
         # apply_rope() takes the slow reference path when params require grad
         self.moss = (moss or load_moss_image()).requires_grad_(False)
-        self.ae = load_vae("flux2_small_decoder").bfloat16()  # official runs the VAE in FP32
+        self.ae = load_vae("flux2_small_decoder").bfloat16()  # reference runs the VAE in FP32
         self.text_encoder = MOSSImageTextEncoder(fp8=fp8)
         self.fp8 = fp8
 
@@ -103,7 +103,7 @@ class MOSSImagePipeline:
         W = width // ae.downsample // 2
         device = ae.encoder.conv_in.weight.device
 
-        # same as official: FP32 noise in NCHW layout, sampled on GPU
+        # FP32 noise in NCHW layout, sampled on GPU, to reproduce seeds of the reference pipeline
         rng = torch.Generator(device).manual_seed(seed) if seed is not None else None
         noise = torch.randn(bsize, ae.cfg.z_dim * 4, H, W, device=device, generator=rng)
         noise = noise.permute(0, 2, 3, 1)
@@ -123,7 +123,7 @@ class MOSSImagePipeline:
         return ae.decode(latents, uint8=True)
 
 
-# official: shifted grid, snapped to the nearest training timestep. ends with 0
+# shifted grid, snapped to the nearest training timestep. ends with 0
 def moss_image_timesteps(num_steps: int, shift: float = 5.0, num_train_timesteps: int = 1000) -> list[float]:
     def grid(count: int, shift: float):
         values = torch.linspace(1, shift / (num_train_timesteps + shift - 1), count)

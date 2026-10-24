@@ -13,6 +13,8 @@ from ..linear import Linear
 from ..rope import apply_rope, compute_rope
 from ..utils import create_remap_hook, load_hf_state_dict
 
+HEAD_DIM = 128
+
 
 @triton.jit
 def _situ_kernel(
@@ -118,17 +120,12 @@ class Block(nn.Module):
         return x, self.ffn_down(situ(hidden, gate))
 
 
-HEAD_DIM = 128
-
-
 class MOSSImageConfig(NamedTuple):
     dim: int = 3072
     ffn_dim: int = 8192
     num_layers: int = 42
     text_dim: int = 4096
-    freq_dim: int = 256
     latent_channels: int = 128
-    rope_base: float = 10_000.0
 
 
 class MOSSImage(nn.Module):
@@ -140,15 +137,15 @@ class MOSSImage(nn.Module):
         self.text_embedder = nn.Module()
         self.text_embedder.proj = Linear(cfg.text_dim, dim)
         self.text_embedder.blocks = nn.ModuleList([TextBlock(dim, cfg.ffn_dim) for _ in range(2)])
-        self.time_embedding = nn.Sequential(Linear(cfg.freq_dim, dim), nn.SiLU(), Linear(dim, dim))
+        self.time_embedding = nn.Sequential(Linear(256, dim), nn.SiLU(), Linear(dim, dim))
         self.shared_block_modulation = Linear(dim, 6 * dim)
         self.layers = nn.ModuleList([Block(dim, cfg.ffn_dim) for _ in range(cfg.num_layers)])
         self.final_norm_video = nn.RMSNorm(dim, eps=1e-6)
         self.final_linear_video = Linear(dim, cfg.latent_channels, bias=False)
         self.video_head_modulation = Linear(dim, 2 * dim)
 
-    # 4D RoPE (r, f, h, w). image tokens (0, L_txt, h - (H-1)/2, w - (W-1)/2), then text tokens (0, l, 0, 0)
     def make_rope(self, H: int, W: int, L_txt: int, device: torch.types.Device = None) -> Tensor:
+        # 4D RoPE (r, f, h, w). image tokens (0, L_txt, h - (H-1)/2, w - (W-1)/2), then text tokens (0, l, 0, 0)
         h, w = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij")
         img_ids = torch.stack([torch.zeros_like(h), torch.full_like(h, L_txt), h, w], dim=-1).flatten(0, 1).double()
         img_ids[:, 2] -= (H - 1) / 2
@@ -157,21 +154,19 @@ class MOSSImage(nn.Module):
         txt_ids[:, 1] = torch.arange(L_txt, device=device)
 
         ids = torch.cat([img_ids, txt_ids])
-        return torch.cat([compute_rope(ids[:, i], HEAD_DIM // 4, self.cfg.rope_base) for i in range(4)], dim=-1)
+        return torch.cat([compute_rope(ids[:, i], HEAD_DIM // 4, 10_000.0) for i in range(4)], dim=-1)
 
-    # sinusoid in FP64, [cos, sin], t in [0, 1000]
     def time_embed(self, t: Tensor) -> Tensor:
-        half = self.cfg.freq_dim // 2
+        # t: [B] in [0, 1000]. sinusoid [cos, sin] in FP64
+        half = 128
         freqs = 10_000 ** (-torch.arange(half, device=t.device, dtype=torch.float64) / half)
         phase = t.double()[:, None] * freqs
         emb = torch.cat([phase.cos(), phase.sin()], dim=-1)
         return self.time_embedding(emb.to(self.video_embedder.weight.dtype))
 
-    # img: [B, H, W, C] (Flux.2 VAE latents, patchified + normalized)
-    # time: [B] in [0, 1], 1 is noise
-    # txt: [B, L, text_dim]. no padding
-    # skip_layers: blocks to skip, for the negative branch of CFG
     def forward(self, img: Tensor, time: Tensor, txt: Tensor, skip_layers: tuple[int, ...] = ()) -> Tensor:
+        # img: [B, H, W, C], time: [B] in [0, 1] (1 is noise), txt: [B, L, text_dim] without padding
+        # skip_layers: blocks to skip, for the negative branch of CFG
         _, H, W, _ = img.shape
         L_img = H * W
         dtype = self.video_embedder.weight.dtype

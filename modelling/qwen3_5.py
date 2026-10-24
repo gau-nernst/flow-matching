@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from fla.modules import FusedRMSNormGated
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 from torch import Tensor, nn
 from transformers import AutoConfig
@@ -88,7 +89,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.num_v_heads = cfg.linear_num_value_heads
         self.head_k_dim = cfg.linear_key_head_dim
         self.head_v_dim = cfg.linear_value_head_dim
-        self.eps = cfg.rms_norm_eps
         key_dim = self.num_k_heads * self.head_k_dim
         value_dim = self.num_v_heads * self.head_v_dim
         self.conv_dim = key_dim * 2 + value_dim
@@ -106,8 +106,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.dt_bias = nn.Parameter(torch.empty(self.num_v_heads))
         self.A_log = nn.Parameter(torch.empty(self.num_v_heads))
-        self.norm = nn.Module()
-        self.norm.weight = nn.Parameter(torch.empty(self.head_v_dim))
+        self.norm = FusedRMSNormGated(self.head_v_dim, eps=cfg.rms_norm_eps)
         self.out_proj = Linear(value_dim, cfg.hidden_size, bias=False)
 
         self.register_load_state_dict_pre_hook(create_weight_merge_hook(["in_proj_qkv", "in_proj_z"], "in_proj_qkvz"))
@@ -128,9 +127,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
         out, _ = chunk_gated_delta_rule(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)
 
-        # gated RMSNorm
-        out = F.rms_norm(out.float(), out.shape[-1:], eps=self.eps).type_as(x) * self.norm.weight
-        out = (out.float() * F.silu(z.unflatten(-1, (-1, self.head_v_dim)).float())).type_as(x)
+        out = self.norm(out, z.unflatten(-1, (-1, self.head_v_dim)))
         return self.out_proj(out.flatten(-2), add)
 
 
