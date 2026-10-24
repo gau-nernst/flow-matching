@@ -11,8 +11,10 @@ from ..flux1.model import LastLayer, MLPEmbedder, Modulation, timestep_embedding
 from ..flux1.modulate import modulate
 from ..flux2.model import MLP
 from ..linear import Linear
-from ..rope import apply_rope
+from ..rope import apply_rope, compute_rope
 from ..utils import create_remap_hook, load_hf_state_dict
+
+HEAD_DIM = 128
 
 
 # same as Flux.2's SingleStreamBlock, but with separate q/k/v/mlp_in and attn_out/mlp_out weights.
@@ -22,7 +24,6 @@ from ..utils import create_remap_hook, load_hf_state_dict
 class Block(nn.Module):
     def __init__(self, dim: int, mlp_ratio: float, eps: float = 1e-6) -> None:
         super().__init__()
-        self.head_dim = 128
         self.eps = eps
         self.attn_impl = "pt"
 
@@ -31,12 +32,12 @@ class Block(nn.Module):
         self.v_proj = Linear(dim, dim, bias=False)
         self.attn_out = Linear(dim, dim, bias=False)
         self.mlp = MLP(dim, int(dim * mlp_ratio))
-        self.q_norm = nn.Parameter(torch.empty(self.head_dim))
-        self.k_norm = nn.Parameter(torch.empty(self.head_dim))
+        self.q_norm = nn.RMSNorm(HEAD_DIM, eps=eps)
+        self.k_norm = nn.RMSNorm(HEAD_DIM, eps=eps)
 
         remap_pairs = [
-            ("norm.query_norm.scale", "q_norm"),
-            ("norm.key_norm.scale", "k_norm"),
+            ("norm.query_norm.scale", "q_norm.weight"),
+            ("norm.key_norm.scale", "k_norm.weight"),
         ]
         for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale"):
             remap_pairs.append((f"mlp_in.{suffix}", f"mlp.0.{suffix}"))
@@ -58,9 +59,9 @@ class Block(nn.Module):
             new_xs.append(x)
         x_mod = torch.cat(x_mods, dim=1) if len(x_mods) > 1 else x_mods[0]
 
-        q = apply_rope(self.q_proj(x_mod).unflatten(2, (-1, self.head_dim)), pe, self.q_norm, self.eps)
-        k = apply_rope(self.k_proj(x_mod).unflatten(2, (-1, self.head_dim)), pe, self.k_norm, self.eps)
-        v = self.v_proj(x_mod).unflatten(2, (-1, self.head_dim))
+        q = apply_rope(self.q_proj(x_mod).unflatten(2, (-1, HEAD_DIM)), pe, self.q_norm.weight, self.eps)
+        k = apply_rope(self.k_proj(x_mod).unflatten(2, (-1, HEAD_DIM)), pe, self.k_norm.weight, self.eps)
+        v = self.v_proj(x_mod).unflatten(2, (-1, HEAD_DIM))
         attn = dispatch_attn(q, k, v, impl=self.attn_impl).flatten(2)
 
         # TODO: fuse residual
@@ -114,12 +115,10 @@ class Flux3(nn.Module):
     # - image:     (0, h/2, w/2, 0)
     # - image_cond (reference image i, 0-indexed): (0, h/2, w/2, -(i+1))
     # - text:      (0, 0, 0, l)
-    # ids: [L, 4] -> [L, 64] complex. each axis uses 32 dims.
+    # ids: [L, 4] -> [L, 64] complex
     @staticmethod
     def make_rope(ids: Tensor) -> Tensor:
-        omega = 1.0 / (10_000 ** (torch.arange(0, 32, 2, dtype=torch.float64, device=ids.device) / 32))
-        freqs = (ids.double()[..., None] * omega).flatten(-2)
-        return torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
+        return torch.cat([compute_rope(ids[:, i], HEAD_DIM // 4, 10_000.0) for i in range(4)], dim=-1)
 
     @staticmethod
     def make_img_rope(H: int, W: int, l_pos: int = 0, device: torch.types.Device = None) -> Tensor:
@@ -135,7 +134,7 @@ class Flux3(nn.Module):
         return Flux3.make_rope(torch.stack([zeros, zeros, zeros, pos], dim=-1))
 
     def time_embed(self, mlp: MLPEmbedder, t: Tensor) -> Tensor:
-        # official code does t * 1000 in BF16
+        # t * 1000 in BF16, as in the reference code
         t = (t.bfloat16() * 1000).float()
         return mlp(timestep_embedding(t, 256, time_factor=1.0).to(self.txt_in.weight.dtype))
 
@@ -195,10 +194,16 @@ class Flux3(nn.Module):
         return self.final_layer["image"](img, vec_img)
 
 
-def _load_flux3(repo_id: str, filename: str):
+def load_flux3(name: str = "klein"):
+    repo_id, filename = {
+        "klein": ("black-forest-labs/flux-3-image-klein", "model.safetensors"),
+        "klein-fp8": ("black-forest-labs/flux-3-image-klein", "variants/fp8r/model.safetensors"),
+        "klein-nvfp4": ("black-forest-labs/flux-3-image-klein", "variants/nvfp4/model.safetensors"),
+        "klein-base": ("black-forest-labs/flux-3-image-klein-base", "model.safetensors"),
+    }[name]
     state_dict = load_hf_state_dict(repo_id, filename)
 
-    # official NVFP4 checkpoint stores unswizzled block scales. our kernels expect swizzled ones.
+    # NVFP4 checkpoint stores unswizzled block scales. our kernels expect swizzled ones.
     for key in list(state_dict.keys()):
         if key.endswith(".weight_scale_2"):
             ws_key = key.removesuffix("_2")
@@ -207,7 +212,7 @@ def _load_flux3(repo_id: str, filename: str):
     num_mode_blocks = 0
     num_single_blocks = 0
 
-    for key in state_dict.keys():
+    for key in state_dict:
         if key.startswith("txt_mode_blocks."):
             num_mode_blocks = max(num_mode_blocks, int(key.split(".")[1]) + 1)
         elif key.startswith("single_blocks."):
@@ -228,14 +233,3 @@ def _load_flux3(repo_id: str, filename: str):
 
     model.load_state_dict(state_dict, assign=True)
     return model
-
-
-def load_flux3(name: str = "klein"):
-    repo_id, filename = {
-        "klein": ("black-forest-labs/flux-3-image-klein", "model.safetensors"),
-        "klein-fp8": ("black-forest-labs/flux-3-image-klein", "variants/fp8r/model.safetensors"),
-        "klein-nvfp4": ("black-forest-labs/flux-3-image-klein", "variants/nvfp4/model.safetensors"),
-        "klein-base": ("black-forest-labs/flux-3-image-klein-base", "model.safetensors"),
-    }[name]
-
-    return _load_flux3(repo_id, filename)

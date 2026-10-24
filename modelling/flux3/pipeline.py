@@ -50,7 +50,7 @@ class Flux3TextEncoder(nn.Module):
 
         self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    # same as official: right-pad to a multiple of 80. pad tokens are masked as keys, and have position_id=1.
+    # right-pad to a multiple of 80. pad tokens are masked as keys, and have position_id=1.
     # the DiT attends to pad tokens, so this matters. NOTE: we pad all prompts to the same length.
     @torch.no_grad()
     def forward(self, texts: str | list[str]) -> Tensor:
@@ -165,7 +165,7 @@ class Flux3Pipeline:
 
     def __init__(self, flux: Flux3 | None = None, text_encoder_id: str = "Qwen/Qwen3-VL-4B-Instruct-FP8") -> None:
         self.flux = flux or load_flux3()
-        self.ae = load_vae("flux2").bfloat16()  # same weights as Flux.2. official code keeps it in FP32
+        self.ae = load_vae("flux2").bfloat16()  # same weights as Flux.2. reference code keeps it in FP32
         self.text_encoder = Flux3TextEncoder(text_encoder_id)
 
     def cpu(self):
@@ -201,7 +201,7 @@ class Flux3Pipeline:
         # neg_txt may have a different length from txt, so we can't batch them
         neg_txt = self.text_encoder(neg_prompt).expand(bsize, -1, -1) if cfg_scale != 1.0 else None
 
-        # official: a single reference is reflect-padded to a multiple of 16, and the output is cropped back.
+        # a single reference is reflect-padded to a multiple of 16, and the output is cropped back.
         # multiple references are center-cropped instead.
         ref_imgs = list(ref_imgs or [])
         crop_box = None
@@ -225,7 +225,7 @@ class Flux3Pipeline:
         H = height // ae.downsample // 2
         W = width // ae.downsample // 2
 
-        # same as official: CPU RNG, round to BF16, keep latents in FP32
+        # CPU RNG, round to BF16, keep latents in FP32
         rng = torch.Generator().manual_seed(seed) if seed is not None else None
         noise = torch.randn(bsize, H * W, ae.cfg.z_dim * 4, generator=rng).bfloat16().float().to(device)
 
@@ -311,7 +311,7 @@ def flux3_prepare_multi_reference(img: Image.Image) -> Image.Image:
     return img.crop((left, top, left + w, top + h))
 
 
-# official: RGB over white, LANCZOS resize to a pixel budget (depends on the number of references) with sides
+# RGB over white, LANCZOS resize to a pixel budget (depends on the number of references) with sides
 # a multiple of 32, then JPEG q92
 def flux3_prepare_pup_reference(img: Image.Image, num_refs: int) -> str:
     img = ImageOps.exif_transpose(img)
@@ -462,7 +462,7 @@ def _reconcile_boxes(text: str, locked: list[dict]) -> str:
 
 
 # https://github.com/black-forest-labs/flux-3-image-klein/blob/bfc8889/src/flux3/sampling.py#L9
-# NOTE: we follow official code (alpha=16). official config.json, diffusers and ComfyUI use alpha=6.93.
+# NOTE: we follow the reference code (alpha=16). its config.json, diffusers and ComfyUI use alpha=6.93.
 def flux3_timesteps(num_steps: int, alpha: float) -> list[float]:
     t = torch.linspace(1.0, 0.0, num_steps + 1)
     return (alpha * t / (1.0 + (alpha - 1.0) * t)).tolist()

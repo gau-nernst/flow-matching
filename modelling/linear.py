@@ -31,7 +31,7 @@ class Linear(nn.Module):
                 self.register_buffer("weight_scale_2", torch.empty((), dtype=torch.float32))
 
             elif f"{prefix}weight_scale" in state_dict and state_dict[f"{prefix}weight_scale"].ndim == 1:
-                # fp8 row-wise weight, dynamic row-wise activation e.g. Flux.3
+                # fp8 row-wise weight, dynamic row-wise activation
                 self.register_buffer("weight_scale", torch.empty(out_dim, dtype=torch.float32))
 
             elif f"{prefix}weight_scale" in state_dict:

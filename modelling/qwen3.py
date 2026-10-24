@@ -100,11 +100,8 @@ class Qwen3Model(nn.Module):
         x = self.embed_tokens(input_ids)
 
         theta = self.cfg.rope_parameters["rope_theta"]
-        if position_ids is None:
-            pos_embeds = compute_rope(x.shape[-2], self.cfg.head_dim, theta, device=x.device)
-        else:
-            pos_embeds = compute_rope(int(position_ids.max()) + 1, self.cfg.head_dim, theta, device=x.device)
-            pos_embeds = pos_embeds[position_ids]
+        pos = x.shape[-2] if position_ids is None else position_ids
+        pos_embeds = compute_rope(pos, self.cfg.head_dim, theta, device=x.device)
 
         intermediates = []
         for i, layer in enumerate(self.layers):
