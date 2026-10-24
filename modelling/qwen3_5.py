@@ -65,8 +65,7 @@ class Qwen3_5Attention(nn.Module):
                 state_dict[f"{prefix}q_proj.weight"] = torch.cat([q.flatten(0, 1), gate.flatten(0, 1)])
             for name in ("q_norm.weight", "k_norm.weight"):
                 if f"{prefix}{name}" in state_dict:
-                    # zero-centered. add 1 in FP32 since (1 + w) loses precision in BF16
-                    state_dict[f"{prefix}{name[:6]}"] = state_dict.pop(f"{prefix}{name}").float() + 1.0
+                    state_dict[f"{prefix}{name[:6]}"] = state_dict.pop(f"{prefix}{name}")
 
         self.register_load_state_dict_pre_hook(hook)
 
@@ -74,8 +73,9 @@ class Qwen3_5Attention(nn.Module):
         q, gate = self.q_proj(x).chunk(2, dim=-1)
         q = q.unflatten(-1, (-1, self.head_dim))
         k = self.k_proj(x).unflatten(-1, (-1, self.head_dim))
-        q = apply_rope(q, pos_embeds, self.q_norm, self.eps, interleaved=False, rot_dim=self.rot_dim).transpose(1, 2)
-        k = apply_rope(k, pos_embeds, self.k_norm, self.eps, interleaved=False, rot_dim=self.rot_dim)
+        rope_kwargs = {"interleaved": False, "rot_dim": self.rot_dim, "gemma_norm": True}
+        q = apply_rope(q, pos_embeds, self.q_norm, self.eps, **rope_kwargs).transpose(1, 2)
+        k = apply_rope(k, pos_embeds, self.k_norm, self.eps, **rope_kwargs)
         v = self.v_proj(x).unflatten(-1, (-1, self.head_dim))
         out = F.scaled_dot_product_attention(q, k.transpose(1, 2), v.transpose(1, 2), is_causal=True, enable_gqa=True)
         out = out.transpose(1, 2).flatten(-2) * torch.sigmoid(gate)

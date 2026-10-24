@@ -57,6 +57,7 @@ def _norm_rope_kernel(
     BLOCK_H: tl.constexpr,
     interleaved: tl.constexpr,
     ROT_D: tl.constexpr,
+    IS_GEMMA: tl.constexpr,
     eps=1e-6,
 ):
     pid_l = tl.program_id(0)
@@ -74,6 +75,8 @@ def _norm_rope_kernel(
     cos, sin = rope.reshape(BLOCK_D // 2, 2).split()
     if norm_ptr is not None:
         norm = tl.load(norm_ptr + offs_d, mask_d).to(tl.float32)
+        if IS_GEMMA:
+            norm += 1.0
 
     for h in range(tl.cdiv(H, BLOCK_H)):
         mask_h = offs_h < H - h * BLOCK_H
@@ -99,8 +102,11 @@ def _norm_rope_ref(
     eps: float = 1e-6,
     interleaved: bool = True,
     rot_dim: int | None = None,
+    gemma_norm: bool = False,
 ) -> Tensor:
-    if norm is not None:
+    if norm is not None and gemma_norm:
+        x = F.rms_norm(x.float(), x.shape[-1:], eps=eps) * (1.0 + norm.float())
+    elif norm is not None:
         x = F.rms_norm(x, x.shape[-1:], norm, eps)
     cos, sin = torch.view_as_real(rope).unsqueeze(-3).unbind(-1)  # [L, 1, D/2] each
     R = rot_dim or x.shape[-1]
@@ -127,13 +133,15 @@ def apply_rope(
     *,
     interleaved: bool = True,
     rot_dim: int | None = None,
+    gemma_norm: bool = False,
     out: Tensor | None = None,
 ) -> Tensor:
     # x: [B, L, nH, D] in real
     # rope: [L, D/2] in complex
     # rot_dim: partial rotary for half-split layout. rope must have angle 0 beyond rot_dim/2
+    # gemma_norm: zero-centered norm weight i.e. norm(x) * (1 + w)
     if any([x.requires_grad, rope.requires_grad, norm.requires_grad if norm is not None else False]):
-        out_ = _norm_rope_ref(x, rope, norm, eps, interleaved, rot_dim)
+        out_ = _norm_rope_ref(x, rope, norm, eps, interleaved, rot_dim, gemma_norm)
         return out.copy_(out_) if out is not None else out_.type_as(x)
 
     assert x[0, 0].is_contiguous() and rope.is_contiguous()
@@ -149,9 +157,8 @@ def apply_rope(
     assert interleaved or (D & (D - 1) == 0 and D % ROT_D == 0)  # half split requires power-of-2 D
     BLOCK_H = 8  # 8x128 = 1024. so 4 warps issue 16B
     grid = (L, B)
-    _norm_rope_kernel[grid](
-        x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], H, D, BLOCK_H, interleaved, ROT_D, eps=eps
-    )
+    strides = (*x.stride()[:2], *out.stride()[:2])
+    _norm_rope_kernel[grid](x, rope_real, norm, out, *strides, H, D, BLOCK_H, interleaved, ROT_D, gemma_norm, eps=eps)
     return out
 
 
