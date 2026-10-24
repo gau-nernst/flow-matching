@@ -149,12 +149,6 @@ class MOSSImage(nn.Module):
         self.final_linear_video = Linear(dim, cfg.latent_channels, bias=False)
         self.video_head_modulation = Linear(dim, 2 * dim)
 
-        # official stores RoPE bands as a buffer, but always recomputes them in FP32
-        def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-            state_dict.pop(f"{prefix}rope.bands", None)
-
-        self.register_load_state_dict_pre_hook(hook)
-
     # 4D RoPE (r, f, h, w), each axis uses head_dim/8 bands, with sequence order image then text
     # - image: (0, L_txt, h - (H-1)/2, w - (W-1)/2)
     # - text:  (0, l, 0, 0)
@@ -227,6 +221,7 @@ def load_moss_image(name: str = "sft"):
         "sft": "OpenMOSS-Team/MOSS-Image-SFT",
     }[name]
     state_dict = load_hf_state_dict(repo_id, "transformer/diffusion_pytorch_model.safetensors.index.json")
+    state_dict.pop("rope.bands")  # recomputed in make_rope()
 
     with torch.device("meta"):
         model = MOSSImage()
