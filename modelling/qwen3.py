@@ -23,20 +23,6 @@ class Qwen3Attention(nn.Module):
         self.q_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
 
-        # HF rotates pairs (i, i + D/2), apply_rope() rotates (2i, 2i + 1). permute q/k rows to match.
-        # must run before weight merge.
-        def rope_hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-            D = self.head_dim
-            perm = torch.stack([torch.arange(D // 2), torch.arange(D // 2) + D // 2], dim=-1).flatten()
-            for name in ("q_proj.weight", "k_proj.weight"):
-                if f"{prefix}{name}" in state_dict:
-                    w = state_dict[f"{prefix}{name}"]
-                    state_dict[f"{prefix}{name}"] = w.unflatten(0, (-1, D))[:, perm].flatten(0, 1)
-            for name in ("q_norm.weight", "k_norm.weight"):
-                if f"{prefix}{name}" in state_dict:
-                    state_dict[f"{prefix}{name}"] = state_dict[f"{prefix}{name}"][perm]
-
-        self.register_load_state_dict_pre_hook(rope_hook)
         self.register_load_state_dict_pre_hook(create_weight_merge_hook(["q_proj", "k_proj", "v_proj"], "qkv_proj"))
 
     def forward(
@@ -48,8 +34,8 @@ class Qwen3Attention(nn.Module):
     ) -> Tensor:
         qkv = self.qkv_proj(x).view(*x.shape[:-1], -1, self.head_dim)
         q, k, v = qkv.split((self.num_qo_heads, self.num_kv_heads, self.num_kv_heads), dim=-2)
-        q = apply_rope(q, pos_embeds, self.q_norm.weight, self.eps).transpose(1, 2)
-        k = apply_rope(k, pos_embeds, self.k_norm.weight, self.eps).transpose(1, 2)
+        q = apply_rope(q, pos_embeds, self.q_norm.weight, self.eps, interleaved=False).transpose(1, 2)
+        k = apply_rope(k, pos_embeds, self.k_norm.weight, self.eps, interleaved=False).transpose(1, 2)
         v = v.transpose(1, 2)
         if attn_mask is None:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
