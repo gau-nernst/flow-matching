@@ -6,29 +6,31 @@ from torch import Tensor, nn
 
 
 def compute_rope(
-    length: int,
+    pos: int | Tensor,
     dim: int,
     theta: float,
     *,
     dtype: torch.dtype = torch.float32,
     device: torch.types.Device = None,
 ) -> Tensor:
-    # initial computations in fp64
-    omega = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float64, device=device) / dim))
-    timestep = torch.arange(length, device=device, dtype=torch.float64)
-    freqs = (timestep[:, None] * omega).to(dtype)
+    # pos: sequence length, or [L] positions. initial computations in fp64
+    if isinstance(pos, int):
+        pos = torch.arange(pos, device=device)
+    omega = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim))
+    freqs = (pos.double()[:, None] * omega).to(dtype)
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
 @triton.jit
-def _rope(x, cos, sin, bwd: tl.constexpr = False, interleaved: tl.constexpr = True):
-    # interleaved: rotate pairs (2i, 2i + 1). otherwise (i, i + D/2) like HF
+def _rope(x, cos, sin, bwd: tl.constexpr = False, interleaved: tl.constexpr = True, ROT_D: tl.constexpr = 0):
+    # interleaved: rotate pairs (2i, 2i + 1). otherwise (i, i + ROT_D/2) within each chunk of ROT_D, like HF
     BLOCK_H: tl.constexpr = x.shape[0]
     BLOCK_D: tl.constexpr = x.shape[1]
     if interleaved:
         x0, x1 = x.reshape(BLOCK_H, BLOCK_D // 2, 2).split()
     else:
-        x0, x1 = x.reshape(BLOCK_H, 2, BLOCK_D // 2).permute(0, 2, 1).split()
+        x = x.reshape(BLOCK_H, BLOCK_D // ROT_D, 2, ROT_D // 2).permute(0, 1, 3, 2)
+        x0, x1 = x.reshape(BLOCK_H, BLOCK_D // 2, 2).split()
     if not bwd:
         y0 = x0 * cos - x1 * sin
         y1 = x0 * sin + x1 * cos
@@ -37,7 +39,7 @@ def _rope(x, cos, sin, bwd: tl.constexpr = False, interleaved: tl.constexpr = Tr
         y1 = -x0 * sin + x1 * cos
     y = tl.join(y0, y1)
     if not interleaved:
-        y = y.permute(0, 2, 1)
+        y = y.reshape(BLOCK_H, BLOCK_D // ROT_D, ROT_D // 2, 2).permute(0, 1, 3, 2)
     return y.reshape(BLOCK_H, BLOCK_D)
 
 
@@ -49,12 +51,15 @@ def _norm_rope_kernel(
     y_ptr,
     stride_xb,
     stride_xl,
+    stride_xh,
     stride_ob,
     stride_ol,
     H,
     D: tl.constexpr,
     BLOCK_H: tl.constexpr,
     interleaved: tl.constexpr,
+    ROT_D: tl.constexpr,
+    IS_GEMMA: tl.constexpr,
     eps=1e-6,
 ):
     pid_l = tl.program_id(0)
@@ -65,13 +70,15 @@ def _norm_rope_kernel(
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < D
 
-    x_ptrs = x_ptr + (pid_b * stride_xb + pid_l * stride_xl + offs_h * D + offs_d)
+    x_ptrs = x_ptr + (pid_b * stride_xb + pid_l * stride_xl + offs_h * stride_xh + offs_d)
     y_ptrs = y_ptr + (pid_b * stride_ob + pid_l * stride_ol + offs_h * D + offs_d)
 
     rope = tl.load(rope_ptr + (pid_l * D + offs_d), mask_d)
     cos, sin = rope.reshape(BLOCK_D // 2, 2).split()
     if norm_ptr is not None:
         norm = tl.load(norm_ptr + offs_d, mask_d).to(tl.float32)
+        if IS_GEMMA:
+            norm += 1.0
 
     for h in range(tl.cdiv(H, BLOCK_H)):
         mask_h = offs_h < H - h * BLOCK_H
@@ -84,27 +91,40 @@ def _norm_rope_kernel(
             x = x * rrms * norm
             # x = x.to(tl.bfloat16).to(tl.float32)
 
-        tl.store(y_ptrs, _rope(x, cos, sin, interleaved=interleaved), mask)
+        tl.store(y_ptrs, _rope(x, cos, sin, interleaved=interleaved, ROT_D=ROT_D), mask)
 
-        x_ptrs += BLOCK_H * D
+        x_ptrs += BLOCK_H * stride_xh
         y_ptrs += BLOCK_H * D
 
 
 def _norm_rope_ref(
-    x: Tensor, rope: Tensor, norm: Tensor | None = None, eps: float = 1e-6, interleaved: bool = True
+    x: Tensor,
+    rope: Tensor,
+    norm: Tensor | None = None,
+    eps: float = 1e-6,
+    interleaved: bool = True,
+    rot_dim: int | None = None,
+    gemma_norm: bool = False,
 ) -> Tensor:
-    if norm is not None:
+    if norm is not None and gemma_norm:
+        x = F.rms_norm(x.float(), x.shape[-1:], norm.float() + 1.0, eps)
+    elif norm is not None:
         x = F.rms_norm(x, x.shape[-1:], norm, eps)
     cos, sin = torch.view_as_real(rope).unsqueeze(-3).unbind(-1)  # [L, 1, D/2] each
-    pair_dim = -1 if interleaved else -2
-    x0, x1 = x.float().unflatten(-1, (-1, 2) if interleaved else (2, -1)).unbind(pair_dim)  # [B, L, nH, D/2] each
-    return torch.stack(
+    R = rot_dim or x.shape[-1]
+    if not interleaved:  # reorder to interleaved, then back
+        x = x.unflatten(-1, (-1, 2, R // 2)).transpose(-1, -2).flatten(-3)
+    x0, x1 = x.float().unflatten(-1, (-1, 2)).unbind(-1)  # [B, L, nH, D/2] each
+    out = torch.stack(
         [
             torch.addcmul(x0 * cos, x1, sin, value=-1),
             torch.addcmul(x0 * sin, x1, cos),
         ],
-        dim=pair_dim,
+        dim=-1,
     ).flatten(-2)
+    if not interleaved:
+        out = out.unflatten(-1, (-1, R // 2, 2)).transpose(-1, -2).flatten(-3)
+    return out
 
 
 def apply_rope(
@@ -114,28 +134,46 @@ def apply_rope(
     eps: float = 1e-6,
     *,
     interleaved: bool = True,
+    rot_dim: int | None = None,
+    gemma_norm: bool = False,
     out: Tensor | None = None,
 ) -> Tensor:
     # x: [B, L, nH, D] in real
     # rope: [L, D/2] in complex
-    if any([x.requires_grad, rope.requires_grad, norm.requires_grad if norm is not None else False]):
-        out_ = _norm_rope_ref(x, rope, norm, eps, interleaved)
+    # rot_dim: half-split layout only. pairs (i, i + rot_dim/2) within each chunk of rot_dim.
+    #   for partial rotary, rope must have angle 0 beyond rot_dim/2
+    # gemma_norm: GemmaRMSNorm i.e. norm(x) * (1 + w)
+    if torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (x, rope, norm)):
+        out_ = _norm_rope_ref(x, rope, norm, eps, interleaved, rot_dim, gemma_norm)
         return out.copy_(out_) if out is not None else out_.type_as(x)
 
-    assert x[0, 0].is_contiguous() and rope.is_contiguous()
+    assert x.stride(-1) == 1 and rope.is_contiguous()
     if norm is not None:
         assert norm.is_contiguous()
     rope_real = torch.view_as_real(rope)
     if out is not None:
         assert out[0, 0].is_contiguous()
     else:
-        out = torch.empty_like(x)
+        out = x.new_empty(x.shape)
     B, L, H, D = x.shape
-    assert interleaved or D & (D - 1) == 0  # half split requires power-of-2 D
+    ROT_D = rot_dim or D
+    assert interleaved or (D & (D - 1) == 0 and D % ROT_D == 0)  # half split requires power-of-2 D
     BLOCK_H = 8  # 8x128 = 1024. so 4 warps issue 16B
     grid = (L, B)
     _norm_rope_kernel[grid](
-        x, rope_real, norm, out, *x.stride()[:2], *out.stride()[:2], H, D, BLOCK_H, interleaved, eps=eps
+        x,
+        rope_real,
+        norm,
+        out,
+        *x.stride()[:3],
+        *out.stride()[:2],
+        H,
+        D,
+        BLOCK_H,
+        interleaved,
+        ROT_D,
+        gemma_norm,
+        eps=eps,
     )
     return out
 

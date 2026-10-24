@@ -19,11 +19,13 @@ def _group_norm_kernel1(
     tile_id = tl.program_id(0)
     batch_id = tl.program_id(1)
 
+    # DIM may not be a power of 2
+    BLOCK_DIM: tl.constexpr = triton.next_power_of_2(DIM)
     offs_l = tile_id * BLOCK_L + tl.arange(0, BLOCK_L)[:, None, None]
-    offs_d = tl.arange(0, NUM_GROUPS)[:, None] * DIM + tl.arange(0, DIM)
-    mask = offs_l < L
+    offs_d = tl.arange(0, NUM_GROUPS)[:, None] * DIM + tl.arange(0, BLOCK_DIM)
+    mask = (offs_l < L) & (tl.arange(0, BLOCK_DIM) < DIM)
     x_ptrs = x_ptr + (batch_id * L + offs_l) * NUM_GROUPS * DIM + offs_d
-    x = tl.load(x_ptrs, mask, other=0.0).to(tl.float32)  # [BLOCK_L, NUM_GROUPS, DIM]
+    x = tl.load(x_ptrs, mask, other=0.0).to(tl.float32)  # [BLOCK_L, NUM_GROUPS, BLOCK_DIM]
 
     cnt = tl.minimum(L - tile_id * BLOCK_L, BLOCK_L) * DIM
     mean = tl.sum(tl.sum(x, axis=2), axis=0) / cnt  # [NUM_GROUPS]
@@ -104,13 +106,15 @@ def _group_norm_kernel3(
     tile_id = tl.program_id(0)
     batch_id = tl.program_id(1)
 
+    BLOCK_DIM: tl.constexpr = triton.next_power_of_2(DIM)
     offs_l = tile_id * BLOCK_L + tl.arange(0, BLOCK_L)[:, None, None]
-    offs_d = tl.arange(0, NUM_GROUPS)[:, None] * DIM + tl.arange(0, DIM)
-    mask = offs_l < L
+    offs_d = tl.arange(0, NUM_GROUPS)[:, None] * DIM + tl.arange(0, BLOCK_DIM)
+    mask_d = tl.arange(0, BLOCK_DIM) < DIM
+    mask = (offs_l < L) & mask_d
     x_ptrs = x_ptr + (batch_id * L + offs_l) * NUM_GROUPS * DIM + offs_d
-    x = tl.load(x_ptrs, mask, other=0.0)  # [BLOCK_L, NUM_GROUPS, DIM]
-    w = tl.load(w_ptr + offs_d)  # [NUM_GROUPS, DIM]
-    b = tl.load(b_ptr + offs_d)
+    x = tl.load(x_ptrs, mask, other=0.0)  # [BLOCK_L, NUM_GROUPS, BLOCK_DIM]
+    w = tl.load(w_ptr + offs_d, mask_d)  # [NUM_GROUPS, BLOCK_DIM]
+    b = tl.load(b_ptr + offs_d, mask_d)
 
     offs_g = tl.arange(0, NUM_GROUPS)[:, None]
     mean = tl.load(mean_ptr + (batch_id * NUM_GROUPS + offs_g) * stride)

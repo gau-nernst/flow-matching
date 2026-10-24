@@ -12,6 +12,7 @@ def _modulate_kernel(
     scale_ptr,  # [B, D]
     res_ptr,  # [B, L, D]
     gate_ptr,  # [B, D]
+    norm_ptr,  # [D]
     gated_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
     shift_stride,
@@ -19,6 +20,7 @@ def _modulate_kernel(
     gate_stride,
     L: tl.constexpr,
     D: tl.constexpr,
+    RMS: tl.constexpr,
     eps: float = 1e-6,
 ):
     pid_l = tl.program_id(0)
@@ -39,11 +41,14 @@ def _modulate_kernel(
     scale = tl.load(scale_ptr + (pid_b * scale_stride + offs), mask)
 
     x = x.to(tl.float32)
-    x -= tl.sum(x) * (1.0 / D)
+    if not RMS:
+        x -= tl.sum(x) * (1.0 / D)
     var = tl.sum(x * x) * (1.0 / D)
-    rrms = tl.rsqrt(var + eps)
+    x = x * tl.rsqrt(var + eps)
+    if norm_ptr is not None:
+        x = x * tl.load(norm_ptr + offs, mask).to(tl.float32)
 
-    x = x * rrms * (1.0 + scale.to(tl.float32)) + shift.to(tl.float32)
+    x = x * (1.0 + scale.to(tl.float32)) + shift.to(tl.float32)
     tl.store(o_ptr + (pid_b * L * D + pid_l * D + offs), x, mask)
 
 
@@ -54,11 +59,17 @@ def modulate(
     res: Tensor | None = None,
     gate: Tensor | None = None,
     eps: float = 1e-6,
+    norm_weight: Tensor | None = None,
+    rms: bool = False,
 ) -> Tensor:
+    # norm is LayerNorm (default) or RMSNorm, with optional weight
     if torch.is_grad_enabled():
         if res is not None:
             x = torch.addcmul(x, gate, res)
-        out = F.layer_norm(x, x.shape[-1:], eps=eps)
+        if rms:
+            out = F.rms_norm(x, x.shape[-1:], norm_weight, eps=eps)
+        else:
+            out = F.layer_norm(x, x.shape[-1:], norm_weight, eps=eps)
         out = torch.addcmul(out, out, scale) + shift
         return out, x
 
@@ -70,6 +81,8 @@ def modulate(
         assert gate is not None
         assert res.is_contiguous() and gate[0].is_contiguous()
         assert gate.shape in ((B, 1, D), (1, 1, D))
+    if norm_weight is not None:
+        assert norm_weight.shape == (D,) and norm_weight.is_contiguous()
     gated = torch.empty_like(x) if res is not None else x
     out = torch.empty_like(x)
     _modulate_kernel[(L, B)](
@@ -78,6 +91,7 @@ def modulate(
         scale,
         res,
         gate,
+        norm_weight,
         gated,
         out,
         shift.stride(0) if shift.shape[0] > 1 else 0,
@@ -85,6 +99,7 @@ def modulate(
         gate.stride(0) if gate is not None and gate.shape[0] > 1 else 0,
         L,
         D,
+        rms,
         eps,
     )
     return out, gated
