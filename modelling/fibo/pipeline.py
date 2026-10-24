@@ -33,7 +33,7 @@ DEFAULT_NEG_PROMPT = (
 )
 
 
-# Qwen3-VL-4B. Fibo 2.0's text encoder is the stock model, so we can use the official FP8 weights.
+# Qwen3-VL-4B. Fibo 2.0's text encoder is the stock model, so we can use Qwen's FP8 weights.
 # the vision tower (BF16 in the FP8 checkpoint) sees the images to edit and the images of the caption's text.
 class FiboTextEncoder(nn.Module):
     # HF hidden_states indices behind the DiT's text inputs: the Perceiver's, then one per injection block.
@@ -64,7 +64,7 @@ class FiboTextEncoder(nn.Module):
         self.visual.load_state_dict(
             load_hf_state_dict(model_id, "model.safetensors.index.json", prefix="model.visual."), assign=True
         )
-        self.eval().requires_grad_(False)
+        self.eval()
 
         # Fibo 2.0's processor: Qwen3-VL's tokenizer, with its own image processor settings
         self.processor = AutoProcessor.from_pretrained("briaai/Fibo-2.0-dev", subfolder="processor")
@@ -244,17 +244,12 @@ class FiboPipeline:
     # at every step.
     TEXT_IMAGES_MAX_NOISE_LEVEL = 0.9
 
-    # fp8: online block FP8 for the DiT, quantized on GPU in .cuda(). the text encoder uses official FP8 weights.
-    def __init__(
-        self, fibo: Fibo | None = None, text_encoder_id: str = "Qwen/Qwen3-VL-4B-Instruct-FP8", fp8: bool = True
-    ) -> None:
-        # apply_rope() takes the slow reference path when params require grad
-        self.fibo = (fibo or load_fibo()).requires_grad_(False)
-        self.fp8 = fp8
-        self.ae = load_vae("flux2").bfloat16()  # same weights as Flux.2. official runs the VAE in FP32
+    def __init__(self, fibo: Fibo | None = None, text_encoder_id: str = "Qwen/Qwen3-VL-4B-Instruct-FP8") -> None:
+        self.fibo = fibo or load_fibo()
+        self.ae = load_vae("flux2").bfloat16()  # same weights as Flux.2. reference code runs the VAE in FP32
         self.text_encoder = FiboTextEncoder(text_encoder_id)
 
-        # training drew the characters Pillow's built-in font lacks in these fonts. official uses them only if passed.
+        # fallback fonts for characters Pillow's built-in font lacks, as in training
         font_dir = Path(snapshot_download("briaai/Fibo-2.0-dev", allow_patterns="fonts/*")) / "fonts"
         self.fonts = [load_font(str(font_dir / name)) for name in ("Aileron-Regular.otf", "DejaVuSans.ttf")]
 
@@ -266,8 +261,6 @@ class FiboPipeline:
     def cuda(self):
         for m in (self.fibo, self.ae, self.text_encoder):
             m.cuda()
-        if self.fp8 and not self.fibo.layers[0].attention.qkv.is_fp8_1d2d():
-            self.fibo.to_fp8()
         return self
 
     # prompt: a structured JSON caption (preferred), or a short description.
@@ -276,7 +269,6 @@ class FiboPipeline:
     # images: up to 5 images to edit, which the instruction can refer to as <image_1>, <image_2>, ...
     # mask: the region of the single image to regenerate, white on black.
     # text_images: show Qwen3-VL an image of each text in the caption's text_render, as training did.
-    # all prompts must have the same token length, since the DiT doesn't support padding.
     @torch.no_grad()
     def generate(
         self,
@@ -320,12 +312,7 @@ class FiboPipeline:
                 crop.thumbnail((self.TEXT_ENCODER_IMAGE_SIZE, self.TEXT_ENCODER_IMAGE_SIZE))
                 te_images.append(crop)
             device = self.ae.encoder.conv_in.weight.device
-            ctx = [
-                self.ae.encode(torch.from_numpy(np.array(crop)).to(device)[None])
-                .bfloat16()
-                .expand(len(prompts), -1, -1, -1)
-                for crop in crops
-            ]
+            ctx = [self.ae.encode(torch.from_numpy(np.array(crop)).to(device)[None]).bfloat16() for crop in crops]
 
         # the images of each prompt's text
         captions = [fibo_parse_prompt(p)[0] for p in prompts]
@@ -344,45 +331,43 @@ class FiboPipeline:
             base_prompts.append(_dumps(fibo_mark_text_images(json.loads(p), "")) if own else p)
             te_prompts.append(_dumps(fibo_mark_text_images(json.loads(p), VISION_MARKER)) if own else p)
 
-        txt = self.text_encoder(te_prompts, [te_images + own for own in own_text_images])
-        assert all(x.shape == txt[0].shape for x in txt), "all prompts must have the same token length"
-        txt = torch.stack(txt)
-        base_txt = None
+        txts = self.text_encoder(te_prompts, [te_images + own for own in own_text_images])
+        base_txts = [None] * len(prompts)
         if images is None and any(own_text_images):
-            base_txt = self.text_encoder(base_prompts)
-            assert all(x.shape == base_txt[0].shape for x in base_txt), "all prompts must have the same token length"
-            base_txt = torch.stack(base_txt)
-        bsize = txt.shape[0]
-        neg_txt = self.text_encoder(neg_prompt)[0].expand(bsize, -1, -1, -1) if cfg_scale != 1.0 else None
+            base_txts = self.text_encoder(base_prompts)
+        neg_txt = self.text_encoder(neg_prompt)[0][None] if cfg_scale != 1.0 else None
 
         ae = self.ae
         H = height // ae.downsample // 2
         W = width // ae.downsample // 2
         device = ae.encoder.conv_in.weight.device
 
-        # same as official: FP32 noise in unpatchified NCHW layout, sampled on GPU
         rng = torch.Generator(device).manual_seed(seed) if seed is not None else None
-        noise = torch.randn(bsize, ae.cfg.z_dim, H * 2, W * 2, device=device, generator=rng)
-        noise = noise.unflatten(2, (H, 2)).unflatten(4, (W, 2)).permute(0, 2, 4, 1, 3, 5).flatten(3)
 
-        latents = fibo_generate(
-            fibo=self.fibo,
-            latents=noise,
-            timesteps=fibo_timesteps(num_steps, H * W),
-            txt=txt,
-            neg_txt=neg_txt,
-            ctx=ctx,
-            base_txt=base_txt,
-            base_max_noise_level=self.TEXT_IMAGES_MAX_NOISE_LEVEL,
-            cfg_scale=cfg_scale,
-            solver=solver,
-            pbar=pbar,
-            progress_cb=progress_cb,
-        )
-        return ae.decode(latents, uint8=True)
+        # the DiT doesn't support padding, so generate each prompt separately
+        imgs = []
+        for i, (txt, base_txt) in enumerate(zip(txts, base_txts)):
+            noise = torch.randn(1, H, W, ae.cfg.z_dim * 4, device=device, generator=rng)
+            cb = (lambda step, n, i=i: progress_cb(i * n + step, len(txts) * n)) if progress_cb else None
+            latents = fibo_generate(
+                fibo=self.fibo,
+                latents=noise,
+                timesteps=fibo_timesteps(num_steps, H * W),
+                txt=txt[None],
+                neg_txt=neg_txt,
+                ctx=ctx,
+                base_txt=None if base_txt is None else base_txt[None],
+                base_max_noise_level=self.TEXT_IMAGES_MAX_NOISE_LEVEL,
+                cfg_scale=cfg_scale,
+                solver=solver,
+                pbar=pbar,
+                progress_cb=cb,
+            )
+            imgs.append(ae.decode(latents, uint8=True))
+        return torch.cat(imgs)
 
 
-# official: sigmas from 1 to 1/num_steps, with resolution-dependent exponential shift. ends with 0.
+# sigmas from 1 to 1/num_steps, with resolution-dependent exponential shift. ends with 0.
 def fibo_timesteps(num_steps: int, img_seq_len: int) -> list[float]:
     base_len, max_len, base_shift, max_shift = 256, 4096, 0.5, 1.15
     mu = base_shift + (max_shift - base_shift) / (max_len - base_len) * (img_seq_len - base_len)
