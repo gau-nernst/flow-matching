@@ -3,13 +3,11 @@
 import json
 import math
 from collections.abc import Callable
-from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from huggingface_hub import snapshot_download
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch import Tensor, nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor
@@ -20,7 +18,6 @@ from ..solvers import get_solver
 from ..utils import load_hf_state_dict
 from ..vae import load_vae
 from .model import Fibo, load_fibo
-from .text_images import draw_text_image, load_font
 
 # where an image stands in a Qwen3-VL prompt
 VISION_MARKER = "<|vision_start|><|image_pad|><|vision_end|>"
@@ -183,6 +180,31 @@ def fibo_mark_text_images(caption: dict, marker: str) -> dict:
     return caption
 
 
+# an image of a text, as training drew it: one line (split every 256 characters), black on white, in Pillow's built-in
+# font at size 20. each line is placed by its bounding box, and is at least as tall as "Ag".
+def fibo_draw_text(text: str) -> Image.Image:
+    font = ImageFont.load_default(20)
+    line = " ".join(text.split())
+    lines = [line[i : i + 256] for i in range(0, len(line), 256)] or [""]
+    padding, spacing = 2, 4
+
+    draw = ImageDraw.Draw(Image.new("RGB", (1, 1), "white"))
+    min_box = draw.textbbox((0, 0), "Ag", font=font)
+    min_height = max(1, min_box[3] - min_box[1])
+    boxes = [draw.textbbox((0, 0), line or " ", font=font) for line in lines]
+    heights = [max(min_height, box[3] - box[1]) for box in boxes]
+    width = max([1] + [box[2] - box[0] for box in boxes])
+    height = sum(heights) + spacing * (len(lines) - 1)
+
+    img = Image.new("RGB", (width + padding * 2, height + padding * 2), "white")
+    draw = ImageDraw.Draw(img)
+    y = padding
+    for line, box, line_height in zip(lines, boxes, heights):
+        draw.text((padding - box[0], y - box[1]), line, font=font, fill=(0, 0, 0))
+        y += line_height + spacing
+    return img
+
+
 # an edit prompt is one JSON object: a vision marker per image, the caption of the result when the prompt has one,
 # then the edit instruction. with text images, each text entry gets the marker of its image (after the images to edit).
 def fibo_edit_prompt(prompt: str, num_images: int, text_images: bool = False) -> str:
@@ -249,10 +271,6 @@ class FiboPipeline:
         self.ae = load_vae("flux2").bfloat16()  # same weights as Flux.2. reference code runs the VAE in FP32
         self.text_encoder = FiboTextEncoder(text_encoder_id)
 
-        # fallback fonts for characters Pillow's built-in font lacks, as in training
-        font_dir = Path(snapshot_download("briaai/Fibo-2.0-dev", allow_patterns="fonts/*")) / "fonts"
-        self.fonts = [load_font(str(font_dir / name)) for name in ("Aileron-Regular.otf", "DejaVuSans.ttf")]
-
     def cpu(self):
         for m in (self.fibo, self.ae, self.text_encoder):
             m.cpu()
@@ -316,9 +334,7 @@ class FiboPipeline:
 
         # the images of each prompt's text
         captions = [fibo_parse_prompt(p)[0] for p in prompts]
-        own_text_images = [
-            [draw_text_image(t, self.fonts) for t in fibo_caption_texts(c)] if text_images else [] for c in captions
-        ]
+        own_text_images = [[fibo_draw_text(t) for t in fibo_caption_texts(c)] if text_images else [] for c in captions]
 
         # Qwen3-VL prompts, and their images: the images to edit, then the text images
         te_prompts = []
