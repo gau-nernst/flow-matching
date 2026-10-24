@@ -2,8 +2,8 @@
 # Z-Image blocks, plus a Perceiver that compresses the text encoder's hidden states into "gist" tokens, and gated
 # cross-attention to the text encoder in a few blocks.
 
-import dataclasses
 import math
+from typing import NamedTuple
 
 import torch
 from torch import Tensor, nn
@@ -17,6 +17,8 @@ from ..z_image.gated_norm import gated_norm
 from ..z_image.model import Attention, FeedForward, FinalLayer
 
 HEAD_DIM = 128
+MAX_NUM_GIST_TOKENS = 512
+INJECTION_LAYER_IDS = (6, 14, 22, 30, 38)
 
 
 # attention without RoPE, with optional different K/V input
@@ -96,61 +98,44 @@ class PerceiverLayer(nn.Module):
         return x + self.ffn(self.ffn_norm(x))
 
 
-@dataclasses.dataclass
-class FiboConfig:
-    img_dim: int = 32
-    patch_size: int = 2
+class FiboConfig(NamedTuple):
     dim: int = 3584
-    n_layers: int = 44
-    n_refiner_layers: int = 2
+    num_layers: int = 44
     txt_dim: int = 7680  # 3 Qwen3-VL-4B layers concatenated
-    injection_layer_ids: tuple[int, ...] = (6, 14, 22, 30, 38)
-    perceiver_num_layers: int = 2
-    min_num_gist_tokens: int = 256
-    max_num_gist_tokens: int = 512
-    gist_step: int = 64
-    gist_min_text_len: int = 256
-    gist_max_text_len: int = 2048
-    rope_dims: tuple[int, int, int] = (32, 48, 48)
-    rope_lens: tuple[int, int, int] = (2048, 512, 512)
+    img_dim: int = 128  # patchified latents
 
 
 class Fibo(nn.Module):
-    def __init__(self, cfg: FiboConfig | None = None) -> None:
+    def __init__(self, cfg: FiboConfig = FiboConfig()) -> None:
         super().__init__()
-        cfg = cfg or FiboConfig()
         self.cfg = cfg
         dim = cfg.dim
         mlp_dim = (dim * 8 // 3) // 64 * 64
-        patchified_dim = cfg.patch_size * cfg.patch_size * cfg.img_dim
 
-        self.x_embedder = Linear(patchified_dim, dim)
+        self.x_embedder = Linear(cfg.img_dim, dim)
         self.t_embedder = nn.Sequential()
         self.t_embedder.mlp = nn.Sequential(Linear(256, 1024), nn.SiLU(), Linear(1024, 256))
-        self.pos_embed = RopeND(cfg.rope_dims, cfg.rope_lens, theta=256.0)
+        self.pos_embed = RopeND((32, 48, 48), (2048, 512, 512), theta=256.0)
 
-        self.noise_refiner = nn.ModuleList([Block(dim, mlp_dim) for _ in range(cfg.n_refiner_layers)])
+        self.noise_refiner = nn.ModuleList([Block(dim, mlp_dim) for _ in range(2)])
         self.perceiver = nn.Module()
-        self.perceiver.latent_queries = nn.Parameter(torch.empty(cfg.max_num_gist_tokens, dim))
-        self.perceiver.layers = nn.ModuleList(
-            [PerceiverLayer(dim, mlp_dim, cfg.txt_dim) for _ in range(cfg.perceiver_num_layers)]
-        )
+        self.perceiver.latent_queries = nn.Parameter(torch.empty(MAX_NUM_GIST_TOKENS, dim))
+        self.perceiver.layers = nn.ModuleList([PerceiverLayer(dim, mlp_dim, cfg.txt_dim) for _ in range(2)])
         self.perceiver.norm_out = nn.RMSNorm(dim, eps=1e-5)
         self.layers = nn.ModuleList(
             [
-                Block(dim, mlp_dim, cross_dim=cfg.txt_dim if i in cfg.injection_layer_ids else None)
-                for i in range(cfg.n_layers)
+                Block(dim, mlp_dim, cross_dim=cfg.txt_dim if i in INJECTION_LAYER_IDS else None)
+                for i in range(cfg.num_layers)
             ]
         )
-        self.final_layer = FinalLayer(dim, patchified_dim)
+        self.final_layer = FinalLayer(dim, cfg.img_dim)
 
-    # number of gist tokens from text length: linear between min and max, rounded up to a multiple of gist_step
-    def num_gist_tokens(self, txt_len: int) -> int:
-        cfg = self.cfg
-        ratio = min(1.0, max(0.0, (txt_len - cfg.gist_min_text_len) / (cfg.gist_max_text_len - cfg.gist_min_text_len)))
-        n = cfg.min_num_gist_tokens + ratio * (cfg.max_num_gist_tokens - cfg.min_num_gist_tokens)
-        n = math.ceil(n / cfg.gist_step) * cfg.gist_step
-        return max(cfg.min_num_gist_tokens, min(cfg.max_num_gist_tokens, n))
+    # number of gist tokens: 256 for text length <= 256, linear up to 512 at text length 2048, rounded up to a
+    # multiple of 64
+    @staticmethod
+    def num_gist_tokens(txt_len: int) -> int:
+        ratio = min(max((txt_len - 256) / (2048 - 256), 0.0), 1.0)
+        return math.ceil((256 + ratio * (MAX_NUM_GIST_TOKENS - 256)) / 64) * 64
 
     # img: [B, H, W, C] (Flux.2 VAE latents, patchified + normalized)
     # time: [B] in [0, 1], 1 is noise
@@ -167,11 +152,11 @@ class Fibo(nn.Module):
         vec_clean = t_mlp(timestep_embedding(torch.zeros_like(time), 256).to(dtype))
         vecs = torch.stack([vec_clean, vec], dim=1)
 
-        # RoPE axes (plane, h, w). gist token i is on plane 1+i, the image on plane max_num_gist_tokens+1,
+        # RoPE axes (plane, h, w). gist token i is on plane 1+i, the image on plane MAX_NUM_GIST_TOKENS+1,
         # context image k on the k-th plane after it.
         # reference order is [gist, image, context]. we put context before the image, so that clean and noisy tokens
         # are 2 contiguous segments. positions come from RoPE, so this only changes rounding.
-        img_plane = self.cfg.max_num_gist_tokens + 1
+        img_plane = MAX_NUM_GIST_TOKENS + 1
         ctx_pe = [self.pos_embed.create((img_plane + 1 + k, 0, 0), (1, *c.shape[1:3])) for k, c in enumerate(ctx)]
         img_pe = self.pos_embed.create((img_plane, 0, 0), (1, H, W))
         pe = torch.cat([*ctx_pe, img_pe], dim=0)
@@ -192,7 +177,7 @@ class Fibo(nn.Module):
         # one stream: gist tokens, context tokens, then image tokens. injection blocks also read their own text bundle.
         x = torch.cat([gist, x], dim=1)
         pe = torch.cat([gist_pe, pe], dim=0)
-        bundle_ids = {layer_id: i + 1 for i, layer_id in enumerate(self.cfg.injection_layer_ids)}
+        bundle_ids = {layer_id: i + 1 for i, layer_id in enumerate(INJECTION_LAYER_IDS)}
         for i, block in enumerate(self.layers):
             x = block(x, vecs, pe, txt[:, bundle_ids[i]] if i in bundle_ids else None, num_gist + num_ctx)
 
