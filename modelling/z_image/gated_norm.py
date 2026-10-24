@@ -9,9 +9,12 @@ from torch import Tensor
 def _gated_norm_kernel(
     x_ptr,  # [B, L, D]
     w_ptr,  # [D]
-    gate_ptr,  # [B, D]
+    gate_ptr,  # [B, S, D], strided. token l uses segment (l >= split)
     add_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
+    stride_gb,
+    stride_gs,
+    split,
     L: tl.constexpr,
     D: tl.constexpr,
     gate_type: tl.constexpr,
@@ -26,7 +29,8 @@ def _gated_norm_kernel(
     x = tl.load(x_ptr + (pid_b * L * D + pid_l * D + offs), mask, other=0.0)
     w = tl.load(w_ptr + offs, mask)
     if gate_ptr is not None:
-        gate = tl.load(gate_ptr + (pid_b * D + offs), mask)
+        seg = (pid_l >= split).to(tl.int32)
+        gate = tl.load(gate_ptr + (pid_b * stride_gb + seg * stride_gs + offs), mask)
 
     x = x.to(tl.float32)
     var = tl.sum(x * x) * (1.0 / D)
@@ -55,10 +59,17 @@ def gated_norm(
     add: Tensor | None = None,
     gate_type: str = "plus_one",
     eps: float = 1e-6,
+    split: int | None = None,
 ) -> Tensor:
+    # gate: [B, 1, D], or [B, 2, D] with split: tokens [0, split) use gate[:, 0], the rest use gate[:, 1].
+    if gate is not None and split is not None:
+        assert gate.shape[1] == 2
     if torch.is_grad_enabled():
         # if True:
         x = F.rms_norm(x, x.shape[-1:], w, eps=eps)
+        if gate is not None and split is not None:
+            L = x.shape[1]
+            gate = torch.cat([gate[:, :1].expand(-1, split, -1), gate[:, 1:].expand(-1, L - split, -1)], dim=1)
         if gate is not None:
             if gate_type == "plus_one":
                 x = x * (1.0 + gate)
@@ -72,10 +83,12 @@ def gated_norm(
 
     assert x.is_contiguous() and w.is_contiguous()
     if gate is not None:
-        assert gate.is_contiguous()
+        assert gate.stride(-1) == 1
     if add is not None:
         assert add.is_contiguous()
     B, L, D = x.shape
     out = torch.empty_like(x)
-    _gated_norm_kernel[(L, B)](x, w, gate, add, out, L, D, gate_type, eps)
+    stride_gb, stride_gs = (gate.stride(0) if gate.shape[0] > 1 else 0, gate.stride(1)) if gate is not None else (0, 0)
+    split = L if split is None else split  # all tokens use segment 0
+    _gated_norm_kernel[(L, B)](x, w, gate, add, out, stride_gb, stride_gs, split, L, D, gate_type, eps)
     return out

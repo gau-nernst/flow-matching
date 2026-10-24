@@ -1,4 +1,5 @@
 from .flux1 import Flux1, Flux1Config, Flux1Pipeline, Flux1TextEmbedder, load_flux1
+from .fibo import Fibo, FiboConfig, FiboPipeline, FiboTextEncoder, load_fibo
 from .flux2 import Flux2, Flux2Config, Flux2Pipeline, Flux2Qwen3TextEncoder, load_flux2
 from .moss_image import MOSSImage, MOSSImageConfig, MOSSImagePipeline, MOSSImageTextEncoder, load_moss_image
 from .text_embedder import TextEmbedder, load_clip_l, load_t5
