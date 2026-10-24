@@ -51,8 +51,7 @@ class Flux2Qwen3TextEncoder(nn.Module):
         )
         device = next(self.parameters()).device
 
-        # same as HF attention_mask: pad tokens are masked out as keys, but pad queries still attend
-        # to real tokens. the DiT attends to pad tokens, so their embeddings matter.
+        # same as HF: mask pad tokens as keys only. the DiT attends to pad tokens.
         pad_mask = inputs["attention_mask"].to(device).bool()  # [B, L]
         L = pad_mask.shape[1]
         attn_mask = torch.ones(L, L, dtype=torch.bool, device=device).tril() & pad_mask[:, None, None, :]

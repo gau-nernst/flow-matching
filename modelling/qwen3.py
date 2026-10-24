@@ -23,9 +23,8 @@ class Qwen3Attention(nn.Module):
         self.q_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
 
-        # HF Qwen3 rotates pairs (i, i + D/2), while our apply_rope() rotates pairs (2i, 2i + 1).
-        # permute q/k rows within each head so that they are equivalent. this must run before weight merge.
-        # for FP8 weights, each head is exactly 1 block of 128 rows, so weight_scale_inv stays unchanged.
+        # HF rotates pairs (i, i + D/2), apply_rope() rotates (2i, 2i + 1). permute q/k rows to match.
+        # must run before weight merge.
         def rope_hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
             D = self.head_dim
             perm = torch.stack([torch.arange(D // 2), torch.arange(D // 2) + D // 2], dim=-1).flatten()
