@@ -7,6 +7,7 @@ from torch import Tensor
 from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
+from ..linear import Linear
 from ..qwen3_5 import Qwen3_5Model
 from ..solvers import get_solver
 from ..vae import load_vae
@@ -16,9 +17,8 @@ from .model import MOSSImage, load_moss_image
 class MOSSImageTextEncoder:
     def __init__(self, repo_id: str = "OpenMOSS-Team/MOSS-Image-SFT", fp8: bool = True) -> None:
         self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(repo_id, subfolder="tokenizer")
-        self.model = Qwen3_5Model.from_pretrained(repo_id, "text_encoder", prefix="language_model.").requires_grad_(
-            False
-        )
+        self.model = Qwen3_5Model.from_pretrained(repo_id, "text_encoder", prefix="language_model.")
+        self.model.requires_grad_(False)
         self.fp8 = fp8
         self.max_length = 4096
 
@@ -28,12 +28,14 @@ class MOSSImageTextEncoder:
 
     def cuda(self):
         self.model.cuda()
-        # quantize on GPU since it's much faster
-        if self.fp8 and not self.model.layers[0].mlp.w2.is_fp8_1d2d():
-            self.model.to_fp8()
+        # quantize on GPU since it's much faster. skip layers whose dim is not a multiple of 128
+        if self.fp8:
+            for m in self.model.modules():
+                if isinstance(m, Linear) and m.weight.shape[0] % 128 == 0 and not m.is_fp8_1d2d():
+                    m.to_fp8_1d2d()
         return self
 
-    # official encodes each prompt separately without padding. returns the last hidden state for each prompt.
+    # official encodes each prompt separately, without padding
     @torch.no_grad()
     def __call__(self, texts: str | list[str]) -> list[Tensor]:
         if isinstance(texts, str):
@@ -51,7 +53,7 @@ class MOSSImageTextEncoder:
 
 
 class MOSSImagePipeline:
-    # fp8: online block FP8 for both the DiT and the text encoder, quantized on GPU in .cuda()
+    # fp8: online block FP8, quantized in .cuda()
     def __init__(self, moss: MOSSImage | None = None, fp8: bool = True) -> None:
         # apply_rope() takes the slow reference path when params require grad
         self.moss = (moss or load_moss_image()).requires_grad_(False)
@@ -67,12 +69,13 @@ class MOSSImagePipeline:
     def cuda(self):
         for m in (self.moss, self.ae, self.text_encoder):
             m.cuda()
-        if self.fp8 and not self.moss.layers[0].q.is_fp8_1d2d():
-            self.moss.to_fp8()
+        if self.fp8:
+            for m in self.moss.layers.modules():
+                if isinstance(m, Linear) and not m.is_fp8_1d2d():
+                    m.to_fp8_1d2d()
         return self
 
-    # all prompts must have the same token length, since the DiT doesn't support padding.
-    # by default, the negative branch of CFG skips block 22.
+    # all prompts must have the same token length (no padding)
     @torch.no_grad()
     def generate(
         self,
@@ -120,7 +123,7 @@ class MOSSImagePipeline:
         return ae.decode(latents, uint8=True)
 
 
-# official: shifted grid, then snapped to the nearest of the 1000 training timesteps (shift=1). ends with 0.
+# official: shifted grid, snapped to the nearest training timestep. ends with 0
 def moss_image_timesteps(num_steps: int, shift: float = 5.0, num_train_timesteps: int = 1000) -> list[float]:
     def grid(count: int, shift: float):
         values = torch.linspace(1, shift / (num_train_timesteps + shift - 1), count)

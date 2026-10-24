@@ -6,17 +6,18 @@ from torch import Tensor, nn
 
 
 def compute_rope(
-    length: int,
+    pos: int | Tensor,
     dim: int,
     theta: float,
     *,
     dtype: torch.dtype = torch.float32,
     device: torch.types.Device = None,
 ) -> Tensor:
-    # initial computations in fp64
-    omega = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float64, device=device) / dim))
-    timestep = torch.arange(length, device=device, dtype=torch.float64)
-    freqs = (timestep[:, None] * omega).to(dtype)
+    # pos: sequence length, or [L] positions. initial computations in fp64
+    if isinstance(pos, int):
+        pos = torch.arange(pos, device=device)
+    omega = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim))
+    freqs = (pos.double()[:, None] * omega).to(dtype)
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
@@ -105,7 +106,7 @@ def _norm_rope_ref(
     gemma_norm: bool = False,
 ) -> Tensor:
     if norm is not None and gemma_norm:
-        x = F.rms_norm(x.float(), x.shape[-1:], eps=eps) * (1.0 + norm.float())
+        x = F.rms_norm(x.float(), x.shape[-1:], norm.float() + 1.0, eps)
     elif norm is not None:
         x = F.rms_norm(x, x.shape[-1:], norm, eps)
     cos, sin = torch.view_as_real(rope).unsqueeze(-3).unbind(-1)  # [L, 1, D/2] each
@@ -139,7 +140,7 @@ def apply_rope(
     # x: [B, L, nH, D] in real
     # rope: [L, D/2] in complex
     # rot_dim: partial rotary for half-split layout. rope must have angle 0 beyond rot_dim/2
-    # gemma_norm: zero-centered norm weight i.e. norm(x) * (1 + w)
+    # gemma_norm: GemmaRMSNorm i.e. norm(x) * (1 + w)
     if any([x.requires_grad, rope.requires_grad, norm.requires_grad if norm is not None else False]):
         out_ = _norm_rope_ref(x, rope, norm, eps, interleaved, rot_dim, gemma_norm)
         return out.copy_(out_) if out is not None else out_.type_as(x)

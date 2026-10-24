@@ -1,6 +1,5 @@
 # https://github.com/huggingface/transformers/blob/v5.14.0/src/transformers/models/qwen3_5/modeling_qwen3_5.py
-# text-only Qwen3.5, prefill only (no KV cache / recurrent state). 3 Gated DeltaNet layers + 1 gated attention layer,
-# repeated. GDN kernels are from flash-linear-attention.
+# text-only, prefill only. GDN kernels are from flash-linear-attention
 
 import torch
 import torch.nn.functional as F
@@ -12,7 +11,7 @@ from transformers import AutoConfig
 
 from .linear import Linear
 from .qwen3 import Qwen3MLP
-from .rope import apply_rope
+from .rope import apply_rope, compute_rope
 from .utils import create_weight_merge_hook, load_hf_state_dict
 
 
@@ -27,11 +26,11 @@ def _rms_norm_kernel(x_ptr, w_ptr, o_ptr, D: tl.constexpr, eps: float):
     tl.store(o_ptr + pid * D + offs, x * rrms * (1.0 + w), mask)
 
 
-# zero-centered weight: y = norm(x) * (1 + w)
-class RMSNorm(nn.RMSNorm):
+# y = norm(x) * (1 + w)
+class GemmaRMSNorm(nn.RMSNorm):
     def forward(self, x: Tensor) -> Tensor:
         if torch.is_grad_enabled():
-            return (F.rms_norm(x.float(), x.shape[-1:], eps=self.eps) * (1.0 + self.weight.float())).type_as(x)
+            return F.rms_norm(x.float(), x.shape[-1:], self.weight.float() + 1.0, self.eps).type_as(x)
 
         assert x.is_contiguous()
         out = torch.empty_like(x)
@@ -94,7 +93,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         value_dim = self.num_v_heads * self.head_v_dim
         self.conv_dim = key_dim * 2 + value_dim
 
-        # [qkv, z] and [b, a]. the latter is kept separate since its dim is not a multiple of 128 (for block FP8)
+        # [qkv, z] and [b, a]. [b, a] is separate since its dim is not a multiple of 128 (block FP8)
         self.in_proj_qkvz = Linear(cfg.hidden_size, self.conv_dim + value_dim, bias=False)
         self.in_proj_ba = Linear(cfg.hidden_size, self.num_v_heads * 2, bias=False)
         self.conv1d = nn.Conv1d(
@@ -138,12 +137,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 class Qwen3_5DecoderLayer(nn.Module):
     def __init__(self, cfg, layer_type: str) -> None:
         super().__init__()
-        self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.input_layernorm = GemmaRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         if layer_type == "linear_attention":
             self.linear_attn = Qwen3_5GatedDeltaNet(cfg)
         else:
             self.self_attn = Qwen3_5Attention(cfg)
-        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.mlp = Qwen3MLP(cfg)
 
     def forward(self, x: Tensor, pos_embeds: Tensor) -> Tensor:
@@ -161,20 +160,17 @@ class Qwen3_5Model(nn.Module):
         self.cfg = cfg
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList([Qwen3_5DecoderLayer(cfg, layer_type) for layer_type in cfg.layer_types])
-        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.norm = GemmaRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
-    # text-only, so M-RoPE reduces to 1D RoPE. returns the last hidden state, after the final norm.
+    # text-only, so M-RoPE reduces to 1D RoPE
     def forward(self, input_ids: Tensor) -> Tensor:
         x = self.embed_tokens(input_ids)
 
-        L = x.shape[1]
         D = self.cfg.head_dim
         rot_dim = int(D * self.cfg.rope_parameters["partial_rotary_factor"])
-        theta = self.cfg.rope_parameters["rope_theta"]
-        omega = 1.0 / (theta ** (torch.arange(0, rot_dim, 2, dtype=torch.float64, device=x.device) / rot_dim))
-        freqs = torch.arange(L, dtype=torch.float64, device=x.device)[:, None] * omega
-        freqs = F.pad(freqs, (0, (D - rot_dim) // 2)).float()  # non-rotated dims have angle 0
-        pos_embeds = torch.polar(torch.ones_like(freqs), freqs)
+        rope = compute_rope(x.shape[1], rot_dim, self.cfg.rope_parameters["rope_theta"], device=x.device)
+        pad = rope.new_ones(rope.shape[0], (D - rot_dim) // 2)  # angle 0 after rot_dim
+        pos_embeds = torch.cat([rope, pad], dim=-1)
 
         for layer in self.layers:
             x = layer(x, pos_embeds)
@@ -190,10 +186,3 @@ class Qwen3_5Model(nn.Module):
         state_dict = load_hf_state_dict(model_id, filename, prefix=prefix)
         model.load_state_dict(state_dict, assign=True)
         return model
-
-    # online block-FP8 (1x128 activation, 128x128 weight) for all linear layers
-    def to_fp8(self):
-        for m in self.modules():
-            if isinstance(m, Linear) and m.weight.shape[0] % 128 == 0:
-                m.to_fp8_1d2d()
-        return self
