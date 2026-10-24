@@ -11,6 +11,7 @@ from torch import Tensor, nn
 
 from .linear import Linear
 from .qwen3 import Qwen3Model
+from .rope import apply_rope, compute_rope
 
 
 class VisionAttention(nn.Module):
@@ -20,17 +21,12 @@ class VisionAttention(nn.Module):
         self.qkv = Linear(dim, dim * 3)
         self.proj = Linear(dim, dim)
 
-    # x: [L, D]. rope: (cos, sin), [L, head_dim] each, rotate-half layout. attention within each image only.
-    def forward(self, x: Tensor, rope: tuple[Tensor, Tensor], seqlens: list[int]) -> Tensor:
-        q, k, v = self.qkv(x).unflatten(-1, (3, self.num_heads, -1)).unbind(1)  # [L, nH, Dh] each
-
-        cos, sin = rope
-
-        def rotate(x: Tensor):
-            x1, x2 = x.float().chunk(2, dim=-1)
-            return (x.float() * cos + torch.cat([-x2, x1], dim=-1) * sin).type_as(x)
-
-        q, k, v = (t.transpose(0, 1) for t in (rotate(q), rotate(k), v))  # [nH, L, Dh]
+    # x: [L, D]. rope: [L, head_dim / 2] complex, half-split layout. attention within each image only.
+    def forward(self, x: Tensor, rope: Tensor, seqlens: list[int]) -> Tensor:
+        q, k, v = self.qkv(x)[None].unflatten(-1, (3, self.num_heads, -1)).unbind(2)  # [1, L, nH, Dh] each
+        q = apply_rope(q, rope, interleaved=False)
+        k = apply_rope(k, rope, interleaved=False)
+        q, k, v = (t[0].transpose(0, 1) for t in (q, k, v))  # [nH, L, Dh]
         out = [
             F.scaled_dot_product_attention(*args)
             for args in zip(q.split(seqlens, 1), k.split(seqlens, 1), v.split(seqlens, 1))
@@ -48,7 +44,7 @@ class VisionBlock(nn.Module):
         self.mlp.linear_fc1 = Linear(dim, mlp_dim)
         self.mlp.linear_fc2 = Linear(mlp_dim, dim)
 
-    def forward(self, x: Tensor, rope: tuple[Tensor, Tensor], seqlens: list[int]) -> Tensor:
+    def forward(self, x: Tensor, rope: Tensor, seqlens: list[int]) -> Tensor:
         x = x + self.attn(self.norm1(x), rope, seqlens)
         mlp = self.mlp
         return x + mlp.linear_fc2(F.gelu(mlp.linear_fc1(self.norm2(x)), approximate="tanh"))
@@ -130,15 +126,12 @@ class Qwen3VLVisionModel(nn.Module):
         return out[self._block_major(h, w).to(device)].to(table.dtype)
 
     # 2D RoPE: first half of the rotary dims from the patch row, second half from the patch column
-    def _rope(self, h: int, w: int, device) -> tuple[Tensor, Tensor]:
-        dim = self.head_dim // 2
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float, device=device) / dim))
+    def _rope(self, h: int, w: int, device) -> Tensor:
         order = self._block_major(h, w).to(device)
         hpos = torch.arange(h, device=device).repeat_interleave(w)[order]
         wpos = torch.arange(w, device=device).repeat(h)[order]
-        freqs = torch.cat([hpos[:, None] * inv_freq, wpos[:, None] * inv_freq], dim=-1)
-        emb = torch.cat([freqs, freqs], dim=-1)[:, None]  # [L, 1, head_dim]
-        return emb.cos(), emb.sin()
+        dim = self.head_dim // 2
+        return torch.cat([compute_rope(hpos, dim, 10_000.0), compute_rope(wpos, dim, 10_000.0)], dim=-1)
 
     # pixel_values: [L, 3 * 2 * 16 * 16] from the HF image processor. grid_thw: (t, h, w) patches of each image.
     # returns the merged image tokens [L/4, out_dim], and the deepstack features, same shape, one per index.
@@ -147,8 +140,7 @@ class Qwen3VLVisionModel(nn.Module):
         assert all(t == 1 for t, _, _ in grid_thw), "only images are supported"
         x = self.patch_embed.proj(pixel_values.to(self.pos_embed.weight.dtype))
         x = x + torch.cat([self._pos_embed(h, w, device) for _, h, w in grid_thw])
-        ropes = [self._rope(h, w, device) for _, h, w in grid_thw]
-        rope = (torch.cat([c for c, _ in ropes]), torch.cat([s for _, s in ropes]))
+        rope = torch.cat([self._rope(h, w, device) for _, h, w in grid_thw])
         seqlens = [h * w for _, h, w in grid_thw]
 
         deepstack = []
@@ -190,10 +182,8 @@ def qwen3_vl_rope(position_ids: Tensor, head_dim: int, theta: float, mrope_secti
     axis = torch.zeros_like(j)
     axis[(j % 3 == 1) & (j < 3 * mrope_section[1])] = 1
     axis[(j % 3 == 2) & (j < 3 * mrope_section[2])] = 2
-    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float64, device=j.device) / head_dim))
-    pos = position_ids.double()[axis].T.contiguous()  # [L, head_dim / 2]
-    freqs = (pos * inv_freq).float()
-    return torch.polar(torch.ones_like(freqs), freqs)
+    ropes = torch.stack([compute_rope(pos, head_dim, theta) for pos in position_ids])  # [3, L, head_dim / 2]
+    return ropes[axis, :, j].T.contiguous()
 
 
 # Qwen3-VL text model forward for 1 sequence. image tokens' embeddings are replaced by the vision tower's,

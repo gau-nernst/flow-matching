@@ -6,7 +6,6 @@ import dataclasses
 import math
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..attn import dispatch_attn
@@ -17,25 +16,26 @@ from ..utils import load_hf_state_dict
 from ..z_image.gated_norm import gated_norm
 from ..z_image.model import Attention, FeedForward, FinalLayer
 
+HEAD_DIM = 128
+
 
 # attention without RoPE, with optional different K/V input
 class CrossAttention(nn.Module):
     def __init__(self, dim: int, kv_dim: int | None = None, eps: float = 1e-5) -> None:
         super().__init__()
-        self.head_dim = 128
         kv_dim = kv_dim or dim
         self.to_q = Linear(dim, dim, bias=False)
         self.to_k = Linear(kv_dim, dim, bias=False)
         self.to_v = Linear(kv_dim, dim, bias=False)
-        self.norm_q = nn.RMSNorm(self.head_dim, eps=eps)
-        self.norm_k = nn.RMSNorm(self.head_dim, eps=eps)
+        self.norm_q = nn.RMSNorm(HEAD_DIM, eps=eps)
+        self.norm_k = nn.RMSNorm(HEAD_DIM, eps=eps)
         self.to_out = nn.Sequential(Linear(dim, dim, bias=False))
 
     def forward(self, x: Tensor, kv: Tensor | None = None) -> Tensor:
         kv = x if kv is None else kv
-        q = self.norm_q(self.to_q(x).unflatten(-1, (-1, self.head_dim)))
-        k = self.norm_k(self.to_k(kv).unflatten(-1, (-1, self.head_dim)))
-        v = self.to_v(kv).unflatten(-1, (-1, self.head_dim))
+        q = self.norm_q(self.to_q(x).unflatten(-1, (-1, HEAD_DIM)))
+        k = self.norm_k(self.to_k(kv).unflatten(-1, (-1, HEAD_DIM)))
+        v = self.to_v(kv).unflatten(-1, (-1, HEAD_DIM))
         return self.to_out(dispatch_attn(q, k, v).flatten(-2))
 
 
@@ -169,7 +169,7 @@ class Fibo(nn.Module):
 
         # RoPE axes (plane, h, w). gist token i is on plane 1+i, the image on plane max_num_gist_tokens+1,
         # context image k on the k-th plane after it.
-        # official order is [gist, image, context]. we put context before the image, so that clean and noisy tokens
+        # reference order is [gist, image, context]. we put context before the image, so that clean and noisy tokens
         # are 2 contiguous segments. positions come from RoPE, so this only changes rounding.
         img_plane = self.cfg.max_num_gist_tokens + 1
         ctx_pe = [self.pos_embed.create((img_plane + 1 + k, 0, 0), (1, *c.shape[1:3])) for k, c in enumerate(ctx)]
@@ -198,20 +198,6 @@ class Fibo(nn.Module):
 
         x = self.final_layer(x[:, num_gist + num_ctx :], vec)
         return x.unflatten(1, (H, W))
-
-    # online block FP8 (1d2d) for the linear layers of the image-stream blocks.
-    # FFN hidden dim (9536) is not a multiple of 128: zero-pad it, which doesn't change the output.
-    def to_fp8(self):
-        for block in [*self.noise_refiner, *self.layers]:
-            ffn = block.feed_forward
-            pad = -ffn.w1.weight.shape[0] % 128
-            for w in (ffn.w1, ffn.w3):
-                w.weight = nn.Parameter(F.pad(w.weight, (0, 0, 0, pad)), requires_grad=False)
-            ffn.w2.weight = nn.Parameter(F.pad(ffn.w2.weight, (0, pad)), requires_grad=False)
-
-            for m in (block.attention.qkv, block.attention.to_out[0], ffn.w1, ffn.w3, ffn.w2):
-                m.to_fp8_1d2d()
-        return self
 
 
 def load_fibo(name: str = "dev"):
