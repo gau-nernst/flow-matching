@@ -225,7 +225,7 @@ class AEConfig(NamedTuple):
     scale_shift: tuple[float, float] = (1.0, 0.0)
     quant_conv: bool = False
     use_bn: bool = False
-    decoder_dim: int | None = None  # Flux.2 small decoder has a narrower decoder
+    decoder_dim: int | None = None  # defaults to dim
 
 
 class AutoEncoder(nn.Module):

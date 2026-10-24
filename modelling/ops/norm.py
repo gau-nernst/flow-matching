@@ -19,7 +19,7 @@ def _group_norm_kernel1(
     tile_id = tl.program_id(0)
     batch_id = tl.program_id(1)
 
-    # DIM may not be a power of 2 e.g. Flux.2 small decoder
+    # DIM may not be a power of 2
     BLOCK_DIM: tl.constexpr = triton.next_power_of_2(DIM)
     offs_l = tile_id * BLOCK_L + tl.arange(0, BLOCK_L)[:, None, None]
     offs_d = tl.arange(0, NUM_GROUPS)[:, None] * DIM + tl.arange(0, BLOCK_DIM)
