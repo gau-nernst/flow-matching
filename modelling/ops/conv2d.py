@@ -53,8 +53,8 @@ def _conv2d_kernel(
     offs_cout = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     w_ptrs = w_ptr + offs_cout * Kh * Kw * Cin + offs_k[:, None]
+    mask_cout = offs_cout < Cout
 
-    tl.static_assert(Cout % BLOCK_N == 0)
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
 
     tl.static_assert(Cin % BLOCK_K == 0)
@@ -73,21 +73,20 @@ def _conv2d_kernel(
         mask = (0 <= offs_w) & (offs_w < Win * UPSAMPLE) & (0 <= off_h) & (off_h < Hin * UPSAMPLE)
 
         x = tl.load(x_ptrs, mask, other=0.0)  # [BLOCK_M, BLOCK_K]
-        w = tl.load(w_ptrs)  # [BLOCK_K, BLOCK_N]
+        w = tl.load(w_ptrs, mask_cout, other=0.0)  # [BLOCK_K, BLOCK_N]
         acc = tl.dot(x, w, acc)
 
         w_ptrs += BLOCK_K
 
     offs_w = pid_w * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
-    offs_cout = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = offs_w < Wout
+    mask = (offs_w < Wout) & mask_cout
 
     if add_ptr is not None:
         add = tl.load(add_ptr + offs_w * stride_aw + offs_cout, mask)
         acc += add.to(tl.float32)
 
     if b_ptr is not None:
-        acc += tl.load(b_ptr + offs_cout).to(tl.float32)
+        acc += tl.load(b_ptr + offs_cout, mask_cout).to(tl.float32)
 
     o_ptrs = o_ptr + offs_w * stride_ow + offs_cout
     tl.store(o_ptrs, acc, mask)
@@ -116,10 +115,12 @@ def conv2d_triton(
 
     out = x.new_empty(N, Hout, Wout, Cout)
     BLOCK_M = 64 if Hout * Wout <= 256 * 256 else 128
-    BLOCK_N = next(n for n in (128, 64, 32) if Cout % n == 0)  # Flux.2 small decoder has Cout=192
+    # Cout=192 (Flux.2 small decoder): BLOCK_N=64 is faster than masked BLOCK_N=128.
+    # Cout<128: one masked tile, e.g. Cout=96 -> 128. tl.dot requires N >= 16.
+    BLOCK_N = 64 if Cout > 128 and Cout % 128 == 64 else min(max(triton.next_power_of_2(Cout), 16), 128)
     BLOCK_K = 32
 
-    grid = (Cout // BLOCK_N, Hout * triton.cdiv(Wout, BLOCK_M), N)
+    grid = (triton.cdiv(Cout, BLOCK_N), Hout * triton.cdiv(Wout, BLOCK_M), N)
     _conv2d_kernel[grid](
         x,
         w,
@@ -173,7 +174,7 @@ class Conv2d(nn.Module):
             if add is not None:
                 out = out + add
 
-        elif self.stride == 1 and Cin % 32 == 0 and Cout % 128 == 0:
+        elif self.stride == 1 and Cin % 32 == 0:
             out = conv2d_triton(x, self.weight, self.bias, add, self.padding)
 
         else:

@@ -54,7 +54,7 @@ class ResnetBlock(nn.Module):
         h = self.norm2(h, act="silu")
 
         if self.nin_shortcut is not None:
-            return self.conv2(h) + self.nin_shortcut(x)
+            return self.conv2(h, self.nin_shortcut(x))
         else:
             return self.conv2(h, x)
 
