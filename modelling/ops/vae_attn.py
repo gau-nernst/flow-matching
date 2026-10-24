@@ -28,10 +28,14 @@ from gn_kernels.cutedsl.utils import EVICT_FIRST, mma_sync, permute, simple_tma_
 
 class VaeAttn:
     # TODO: support BQ=64 / 4x2 warp
-    DIM: int = 512
     BQ: int = 32
-    BK: int = 128
     num_stages: int = 3
+
+    def __init__(self, dim: int) -> None:
+        # K tile [BK, 64] and V tile [16, DIM] share smem stages
+        assert dim % 64 == 0
+        self.DIM = dim
+        self.BK = dim // 4
 
     @cute.jit
     def prepare_tma(
@@ -88,7 +92,6 @@ class VaeAttn:
         sK = allocate_smem(smem, K_tma.smem_layout)[0, None, None, None]  # 32 KiB
 
         # V and K share the same slots
-        assert cute.size(V_tma.smem_layout) == cute.size(sK)
         sV = cute.make_tensor(sK.iterator, V_tma.smem_layout.outer)[0, None, None, None]
 
         sP = smem.allocate_tensor(
@@ -232,6 +235,14 @@ class VaeAttn:
                     for i in cutlass.range_constexpr(4):
                         rS[i, n] *= sm_scale
 
+                # mask out-of-bounds keys. TMA zero-fills K/V there.
+                if (iter_l + 1) * BK > Lk:
+                    for n in cutlass.range_constexpr(WK // 8):
+                        for i in cutlass.range_constexpr(4):
+                            col = iter_l * BK + (warp_id // 2) * WK + n * 8 + (lane_id % 4) * 2 + i % 2
+                            if col >= Lk:
+                                rS[i, n] = float("-inf")
+
                 # new rowmax
                 rM_new0 = rM[0]
                 rM_new1 = rM[1]
@@ -346,26 +357,26 @@ class VaeAttn:
 
     @cache
     @staticmethod
-    def compile():
+    def compile(dim: int):
         B = cute.sym_int()
         Lq = cute.sym_int()
         Lk = cute.sym_int()
-        D = VaeAttn.DIM
 
-        Q = make_fake_tensor(BFloat16, (B, Lq, D), (cute.sym_int64(16), D, 1), assumed_align=16)
-        K = make_fake_tensor(BFloat16, (B, Lk, D), (cute.sym_int64(16), D, 1), assumed_align=16)
-        V = make_fake_tensor(BFloat16, (B, Lk, D), (cute.sym_int64(16), D, 1), assumed_align=16)
-        O = make_fake_tensor(BFloat16, (B, Lq, D), (cute.sym_int64(16), D, 1), assumed_align=16)
+        Q = make_fake_tensor(BFloat16, (B, Lq, dim), (cute.sym_int64(16), dim, 1), assumed_align=16)
+        K = make_fake_tensor(BFloat16, (B, Lk, dim), (cute.sym_int64(16), dim, 1), assumed_align=16)
+        V = make_fake_tensor(BFloat16, (B, Lk, dim), (cute.sym_int64(16), dim, 1), assumed_align=16)
+        O = make_fake_tensor(BFloat16, (B, Lq, dim), (cute.sym_int64(16), dim, 1), assumed_align=16)
 
         stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-        return cute.compile(VaeAttn(), Q, K, V, O, stream, options="--enable-tvm-ffi")
+        return cute.compile(VaeAttn(dim), Q, K, V, O, stream, options="--enable-tvm-ffi")
 
 
 def vae_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-    if any(x.requires_grad for x in (q, k, v)):
+    # q: [B, Lq, D], k/v: [B, Lk, D]
+    if any(x.requires_grad for x in (q, k, v)) or q.shape[-1] not in (384, 512) or q.shape[1] % VaeAttn.BQ != 0:
         # F.sdpa's memory-efficient impl requires ndim=4
         return F.scaled_dot_product_attention(q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)).squeeze(1)
 
     o = torch.empty_like(q)
-    VaeAttn.compile()(q, k, v, o)
+    VaeAttn.compile(q.shape[-1])(q, k, v, o)
     return o
