@@ -14,23 +14,18 @@ from .rope import apply_rope
 from .utils import create_weight_merge_hook, load_hf_state_dict
 
 
-# Qwen3.5 RMSNorm weights are zero-centered: y = norm(x) * (1 + w). we add 1 at load, and keep weights in FP32
-# since (1 + w) loses precision in BF16.
-def _zero_centered_norm_hook(names: list[str]):
-    def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        for name in names:
-            if f"{prefix}{name}" in state_dict:
-                state_dict[f"{prefix}{name}"] = state_dict[f"{prefix}{name}"].float() + 1.0
-
-    return hook
-
-
+# zero-centered weight: y = norm(x) * (1 + w). add 1 at load, and keep it in FP32 since (1 + w) loses precision in BF16.
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.empty(dim))
         self.eps = eps
-        self.register_load_state_dict_pre_hook(_zero_centered_norm_hook(["weight"]))
+
+        def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+            if f"{prefix}weight" in state_dict:
+                state_dict[f"{prefix}weight"] = state_dict[f"{prefix}weight"].float() + 1.0
+
+        self.register_load_state_dict_pre_hook(hook)
 
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x.float(), x.shape[-1:], self.weight, self.eps).type_as(x)
@@ -61,7 +56,7 @@ class Qwen3_5Attention(nn.Module):
                 state_dict[f"{prefix}q_proj.weight"] = torch.cat([q.flatten(0, 1), gate.flatten(0, 1)])
             for name in ("q_norm.weight", "k_norm.weight"):
                 if f"{prefix}{name}" in state_dict:
-                    state_dict[f"{prefix}{name[:6]}"] = state_dict.pop(f"{prefix}{name}").float() + 1.0
+                    state_dict[f"{prefix}{name[:6]}"] = state_dict.pop(f"{prefix}{name}").float() + 1.0  # zero-centered
 
         self.register_load_state_dict_pre_hook(hook)
 
