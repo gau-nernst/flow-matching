@@ -59,22 +59,19 @@ class TextBlock(nn.Module):
         super().__init__()
         self.norm1 = nn.RMSNorm(dim, eps=1e-6)
         self.norm2 = nn.RMSNorm(dim, eps=1e-6)
-        self.q_norm = nn.Parameter(torch.empty(HEAD_DIM))
-        self.k_norm = nn.Parameter(torch.empty(HEAD_DIM))
+        self.q_norm = nn.RMSNorm(HEAD_DIM, eps=1e-6)
+        self.k_norm = nn.RMSNorm(HEAD_DIM, eps=1e-6)
         self.qkv = Linear(dim, 3 * dim)
         self.proj = Linear(dim, dim)
         self.ffn_up = Linear(dim, ffn_dim)
         self.ffn_gate = Linear(dim, ffn_dim)
         self.ffn_down = Linear(ffn_dim, dim)
-        self.register_load_state_dict_pre_hook(
-            create_remap_hook([("q_norm.weight", "q_norm"), ("k_norm.weight", "k_norm")])
-        )
 
     def forward(self, x: Tensor, rope: Tensor) -> Tensor:
         # attention
         q, k, v = self.qkv(self.norm1(x)).unflatten(-1, (3, -1, HEAD_DIM)).unbind(2)
-        q = apply_rope(q, rope, self.q_norm, interleaved=False)
-        k = apply_rope(k, rope, self.k_norm, interleaved=False)
+        q = apply_rope(q, rope, self.q_norm.weight, interleaved=False)
+        k = apply_rope(k, rope, self.k_norm.weight, interleaved=False)
         x = self.proj(dispatch_attn(q, k, v).flatten(-2), x)
 
         # FFN
@@ -87,8 +84,8 @@ class Block(nn.Module):
         super().__init__()
         self.norm1 = nn.RMSNorm(dim, eps=1e-6)
         self.norm2 = nn.RMSNorm(dim, eps=1e-6)
-        self.q_norm = nn.Parameter(torch.empty(HEAD_DIM))
-        self.k_norm = nn.Parameter(torch.empty(HEAD_DIM))
+        self.q_norm = nn.RMSNorm(HEAD_DIM, eps=1e-6)
+        self.k_norm = nn.RMSNorm(HEAD_DIM, eps=1e-6)
         self.q = Linear(dim, dim, bias=False)
         self.k = Linear(dim, dim, bias=False)
         self.v = Linear(dim, dim, bias=False)
@@ -98,7 +95,6 @@ class Block(nn.Module):
 
         remap_pairs = [(f"proj.{name}.weight", f"{name}.weight") for name in ("q", "k", "v", "o")]
         remap_pairs += [("proj.ffn_up_gate.weight", "ffn_up_gate.weight"), ("proj.ffn_down.weight", "ffn_down.weight")]
-        remap_pairs += [("q_norm.weight", "q_norm"), ("k_norm.weight", "k_norm")]
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     # FFN residual is deferred to the next block's modulate(). modulation is shared, so gate_f is the same.
@@ -111,8 +107,8 @@ class Block(nn.Module):
         q = self.q(y).unflatten(-1, (-1, HEAD_DIM))
         k = self.k(y).unflatten(-1, (-1, HEAD_DIM))
         v = self.v(y).unflatten(-1, (-1, HEAD_DIM))
-        q = apply_rope(q, rope, self.q_norm, interleaved=False)
-        k = apply_rope(k, rope, self.k_norm, interleaved=False)
+        q = apply_rope(q, rope, self.q_norm.weight, interleaved=False)
+        k = apply_rope(k, rope, self.k_norm.weight, interleaved=False)
         attn_out = self.o(dispatch_attn(q, k, v).flatten(-2))
 
         # FFN

@@ -140,7 +140,8 @@ def apply_rope(
 ) -> Tensor:
     # x: [B, L, nH, D] in real
     # rope: [L, D/2] in complex
-    # rot_dim: partial rotary for half-split layout. rope must have angle 0 beyond rot_dim/2
+    # rot_dim: half-split layout only. pairs (i, i + rot_dim/2) within each chunk of rot_dim.
+    #   for partial rotary, rope must have angle 0 beyond rot_dim/2
     # gemma_norm: GemmaRMSNorm i.e. norm(x) * (1 + w)
     if torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (x, rope, norm)):
         out_ = _norm_rope_ref(x, rope, norm, eps, interleaved, rot_dim, gemma_norm)
@@ -159,8 +160,21 @@ def apply_rope(
     assert interleaved or (D & (D - 1) == 0 and D % ROT_D == 0)  # half split requires power-of-2 D
     BLOCK_H = 8  # 8x128 = 1024. so 4 warps issue 16B
     grid = (L, B)
-    strides = (*x.stride()[:3], *out.stride()[:2])
-    _norm_rope_kernel[grid](x, rope_real, norm, out, *strides, H, D, BLOCK_H, interleaved, ROT_D, gemma_norm, eps=eps)
+    _norm_rope_kernel[grid](
+        x,
+        rope_real,
+        norm,
+        out,
+        *x.stride()[:3],
+        *out.stride()[:2],
+        H,
+        D,
+        BLOCK_H,
+        interleaved,
+        ROT_D,
+        gemma_norm,
+        eps=eps,
+    )
     return out
 
 

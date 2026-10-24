@@ -53,24 +53,16 @@ class Qwen3_5Attention(nn.Module):
         self.k_proj = Linear(cfg.hidden_size, self.num_kv_heads * D, bias=False)
         self.v_proj = Linear(cfg.hidden_size, self.num_kv_heads * D, bias=False)
         self.o_proj = Linear(H * D, cfg.hidden_size, bias=False)
-        self.q_norm = nn.Parameter(torch.empty(D))
-        self.k_norm = nn.Parameter(torch.empty(D))
-
+        self.q_norm = GemmaRMSNorm(D, eps=cfg.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(D, eps=cfg.rms_norm_eps)
         self.rot_dim = int(D * cfg.rope_parameters["partial_rotary_factor"])
-
-        def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-            for name in ("q_norm.weight", "k_norm.weight"):
-                if f"{prefix}{name}" in state_dict:
-                    state_dict[f"{prefix}{name[:6]}"] = state_dict.pop(f"{prefix}{name}")
-
-        self.register_load_state_dict_pre_hook(hook)
 
     def forward(self, x: Tensor, pos_embeds: Tensor, add: Tensor | None = None) -> Tensor:
         q, gate = self.q_proj(x).unflatten(-1, (-1, 2 * self.head_dim)).chunk(2, dim=-1)
         k = self.k_proj(x).unflatten(-1, (-1, self.head_dim))
         rope_kwargs = {"interleaved": False, "rot_dim": self.rot_dim, "gemma_norm": True}
-        q = apply_rope(q, pos_embeds, self.q_norm, self.eps, **rope_kwargs).transpose(1, 2)
-        k = apply_rope(k, pos_embeds, self.k_norm, self.eps, **rope_kwargs)
+        q = apply_rope(q, pos_embeds, self.q_norm.weight, self.eps, **rope_kwargs).transpose(1, 2)
+        k = apply_rope(k, pos_embeds, self.k_norm.weight, self.eps, **rope_kwargs)
         v = self.v_proj(x).unflatten(-1, (-1, self.head_dim))
         out = F.scaled_dot_product_attention(q, k.transpose(1, 2), v.transpose(1, 2), is_causal=True, enable_gqa=True)
         out = (out.transpose(1, 2) * torch.sigmoid(gate)).flatten(-2)
