@@ -117,8 +117,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         q = q.unflatten(-1, (-1, self.head_k_dim))
         k = k.unflatten(-1, (-1, self.head_k_dim))
         v = v.unflatten(-1, (-1, self.head_v_dim))
-        kwargs = {"use_gate_in_kernel": True, "use_beta_sigmoid_in_kernel": True, "use_qk_l2norm_in_kernel": True}
-        out, _ = chunk_gated_delta_rule(q, k, v, g=a, beta=b, A_log=self.A_log, dt_bias=self.dt_bias, **kwargs)
+        out, _ = chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g=a,
+            beta=b,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            use_qk_l2norm_in_kernel=True,
+        )
 
         out = self.norm(out, z.unflatten(-1, (-1, self.head_v_dim)))
         return self.out_proj(out.flatten(-2), add)
