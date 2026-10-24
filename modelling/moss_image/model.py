@@ -16,8 +16,10 @@ from ..utils import create_remap_hook, load_hf_state_dict
 
 @triton.jit
 def _situ_kernel(
-    x_ptr,  # [M, 2D] = [hidden, gate]
+    hidden_ptr,  # [M, D]
+    gate_ptr,  # [M, D]
     o_ptr,  # [M, D]
+    stride_m,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -26,8 +28,8 @@ def _situ_kernel(
 
     offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask = offs < D
-    hidden = tl.load(x_ptr + pid_m * 2 * D + offs, mask).to(tl.float32)
-    gate = tl.load(x_ptr + pid_m * 2 * D + D + offs, mask).to(tl.float32)
+    hidden = tl.load(hidden_ptr + pid_m * stride_m + offs, mask).to(tl.float32)
+    gate = tl.load(gate_ptr + pid_m * stride_m + offs, mask).to(tl.float32)
 
     out = 4.0 * tl.extra.libdevice.tanh(gate / 4.0) * tl.sigmoid(gate)
     out *= 25.0 * tl.extra.libdevice.tanh(hidden / 25.0)
@@ -35,18 +37,16 @@ def _situ_kernel(
 
 
 # soft-capped SwiGLU: (4 tanh(gate/4) sigmoid(gate)) * (25 tanh(hidden/25))
-# x: [..., 2D] = [hidden, gate]
-def situ(x: Tensor) -> Tensor:
+def situ(hidden: Tensor, gate: Tensor) -> Tensor:
     if torch.is_grad_enabled():
-        hidden, gate = x.chunk(2, dim=-1)
         return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (25.0 * torch.tanh(hidden / 25.0))
 
-    assert x.is_contiguous()
-    D = x.shape[-1] // 2
-    M = x.numel() // (2 * D)
-    out = x.new_empty(*x.shape[:-1], D)
+    D = hidden.shape[-1]
+    hidden_, gate_ = hidden.flatten(0, -2), gate.flatten(0, -2)  # views. rows may be strided
+    assert hidden_.stride() == gate_.stride() and hidden_.stride(1) == 1
+    out = hidden.new_empty(hidden.shape)
     BLOCK_D = 1024
-    _situ_kernel[(M, triton.cdiv(D, BLOCK_D))](x, out, D, BLOCK_D)
+    _situ_kernel[(hidden_.shape[0], triton.cdiv(D, BLOCK_D))](hidden_, gate_, out, hidden_.stride(0), D, BLOCK_D)
     return out
 
 
@@ -61,27 +61,23 @@ class TextBlock(nn.Module):
         self.k_norm = nn.Parameter(torch.empty(self.head_dim))
         self.qkv = Linear(dim, 3 * dim)
         self.proj = Linear(dim, dim)
-        self.ffn_up_gate = Linear(dim, 2 * ffn_dim)
+        self.ffn_up = Linear(dim, ffn_dim)
+        self.ffn_gate = Linear(dim, ffn_dim)
         self.ffn_down = Linear(ffn_dim, dim)
-
-        def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-            for suffix in ("weight", "bias"):
-                if f"{prefix}ffn_gate.{suffix}" in state_dict:
-                    gate = state_dict.pop(f"{prefix}ffn_gate.{suffix}")
-                    up = state_dict.pop(f"{prefix}ffn_up.{suffix}")
-                    state_dict[f"{prefix}ffn_up_gate.{suffix}"] = torch.cat([up, gate])
-            for name in ("q_norm", "k_norm"):
-                if f"{prefix}{name}.weight" in state_dict:
-                    state_dict[f"{prefix}{name}"] = state_dict.pop(f"{prefix}{name}.weight")
-
-        self.register_load_state_dict_pre_hook(hook)
+        self.register_load_state_dict_pre_hook(
+            create_remap_hook([("q_norm.weight", "q_norm"), ("k_norm.weight", "k_norm")])
+        )
 
     def forward(self, x: Tensor, rope: Tensor) -> Tensor:
+        # attention
         q, k, v = self.qkv(self.norm1(x)).unflatten(-1, (3, -1, self.head_dim)).unbind(2)
         q = apply_rope(q, rope, self.q_norm, interleaved=False)
         k = apply_rope(k, rope, self.k_norm, interleaved=False)
         x = self.proj(dispatch_attn(q, k, v).flatten(-2), x)
-        return self.ffn_down(situ(self.ffn_up_gate(self.norm2(x))), x)
+
+        # FFN
+        y = self.norm2(x)
+        return self.ffn_down(situ(self.ffn_up(y), self.ffn_gate(y)), x)
 
 
 class Block(nn.Module):
@@ -110,16 +106,20 @@ class Block(nn.Module):
     def forward(self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor) -> tuple[Tensor, Tensor]:
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.split(1, dim=1)  # [B, 1, D] each, FP32
 
-        y, x = modulate(
-            x, shift_a, scale_a, ffn_out, gate_f if ffn_out is not None else None, 1e-6, self.norm1.weight, True
-        )
-        q = apply_rope(self.q(y).unflatten(-1, (-1, self.head_dim)), rope, self.q_norm, interleaved=False)
-        k = apply_rope(self.k(y).unflatten(-1, (-1, self.head_dim)), rope, self.k_norm, interleaved=False)
+        # attention. also adds the previous block's FFN residual
+        res_gate = gate_f if ffn_out is not None else None
+        y, x = modulate(x, shift_a, scale_a, ffn_out, res_gate, 1e-6, self.norm1.weight, True)
+        q = self.q(y).unflatten(-1, (-1, self.head_dim))
+        k = self.k(y).unflatten(-1, (-1, self.head_dim))
         v = self.v(y).unflatten(-1, (-1, self.head_dim))
+        q = apply_rope(q, rope, self.q_norm, interleaved=False)
+        k = apply_rope(k, rope, self.k_norm, interleaved=False)
         attn_out = self.o(dispatch_attn(q, k, v).flatten(-2))
 
+        # FFN. its residual is added in the next block
         y, x = modulate(x, shift_f, scale_f, attn_out, gate_a, 1e-6, self.norm2.weight, True)
-        return x, self.ffn_down(situ(self.ffn_up_gate(y)))
+        hidden, gate = self.ffn_up_gate(y).chunk(2, dim=-1)
+        return x, self.ffn_down(situ(hidden, gate))
 
 
 class MOSSImageConfig(NamedTuple):
