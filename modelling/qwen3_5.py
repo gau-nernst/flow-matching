@@ -114,13 +114,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         qkv = F.silu(self.conv1d(qkv.transpose(1, 2))[..., :L]).transpose(1, 2)
         q, k, v = qkv.split((self.num_k_heads * self.head_k_dim,) * 2 + (self.num_v_heads * self.head_v_dim,), dim=-1)
 
-        rep = self.num_v_heads // self.num_k_heads
-        q = q.unflatten(-1, (-1, self.head_k_dim)).repeat_interleave(rep, dim=2)
-        k = k.unflatten(-1, (-1, self.head_k_dim)).repeat_interleave(rep, dim=2)
+        q = q.unflatten(-1, (-1, self.head_k_dim))
+        k = k.unflatten(-1, (-1, self.head_k_dim))
         v = v.unflatten(-1, (-1, self.head_v_dim))
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        out, _ = chunk_gated_delta_rule(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)
+        kwargs = {"use_gate_in_kernel": True, "use_beta_sigmoid_in_kernel": True, "use_qk_l2norm_in_kernel": True}
+        out, _ = chunk_gated_delta_rule(q, k, v, g=a, beta=b, A_log=self.A_log, dt_bias=self.dt_bias, **kwargs)
 
         out = self.norm(out, z.unflatten(-1, (-1, self.head_v_dim)))
         return self.out_proj(out.flatten(-2), add)
