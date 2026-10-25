@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 from torchvision.transforms import v2
 
-from modelling import load_pipeline
+from modelling import MODELS, load_pipeline
 from modelling.linear import Linear
 from time_sampler import TimeSampler
 
@@ -17,6 +17,8 @@ from time_sampler import TimeSampler
 def setup_model(
     model_name: str, lora: int, fp8: bool, use_compile: bool, mem_budget: float = 0.7, ckpt_ratio: float = 0.5
 ):
+    if not hasattr(MODELS[model_name].pipeline_cls, "prepare_train_inputs"):
+        raise ValueError(f"Training is not supported for {model_name} yet")
     pipeline = load_pipeline(model_name).cuda()
     model = pipeline.model
     model.train().requires_grad_(False)
