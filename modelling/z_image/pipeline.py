@@ -14,11 +14,14 @@ from .model import ZImage, load_zimage
 
 
 class ZImagePipeline:
-    BASE_DEFAULTS = dict(num_steps=28, cfg_scale=3.0, time_shift=6.0)
-    TURBO_DEFAULTS = dict(num_steps=8, cfg_scale=1.0, time_shift=3.0)
-
-    def __init__(self, zimage: ZImage | None = None, text_encoder_id: str = "Qwen/Qwen3-4B") -> None:
+    def __init__(
+        self,
+        zimage: ZImage | None = None,
+        text_encoder_id: str = "Qwen/Qwen3-4B",
+        sample_defaults: dict | None = None,  # used by generate(). default: z-image-turbo
+    ) -> None:
         self.zimage = zimage or load_zimage().bfloat16()
+        self.sample_defaults = sample_defaults or MODELS["z-image-turbo"].sample_defaults
         self.ae = load_vae("flux1").bfloat16()
 
         # text stuff
@@ -47,7 +50,8 @@ class ZImagePipeline:
         zimage = load_zimage(name)
         if "nvfp4" not in name:  # HF checkpoints are FP32
             zimage.bfloat16()
-        return cls(zimage, MODELS[name].text_encoder_id)
+        spec = MODELS[name]
+        return cls(zimage, spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
     @staticmethod
     def embed_text(tokenizer: PreTrainedTokenizer, qwen3: Qwen3Model, prompts: str | list[str]):
@@ -90,6 +94,7 @@ class ZImagePipeline:
         txt = self.embed_text(self.tokenizer, self.qwen3, prompts)
         return latents, dict(txt=txt)
 
+    # cfg_scale, num_steps and time_shift default to self.sample_defaults
     @torch.no_grad()
     def generate(
         self,
@@ -98,14 +103,17 @@ class ZImagePipeline:
         img_size: int | tuple[int, int] = 512,
         latents: Tensor | None = None,
         denoise: float = 1.0,
-        cfg_scale: float = 1.0,
-        num_steps: int = 8,
-        time_shift: float = 3.0,
+        cfg_scale: float | None = None,
+        num_steps: int | None = None,
+        time_shift: float | None = None,
         seed: int | None = None,
         solver: str = "euler",
         pbar: bool = False,
         progress_cb: Callable[[int, int], None] | None = None,
     ) -> Tensor:
+        cfg_scale = self.sample_defaults["cfg_scale"] if cfg_scale is None else cfg_scale
+        num_steps = self.sample_defaults["num_steps"] if num_steps is None else num_steps
+        time_shift = self.sample_defaults["time_shift"] if time_shift is None else time_shift
         txt_embeds = self.embed_text(self.tokenizer, self.qwen3, prompt)
         neg_txt_embeds = self.embed_text(self.tokenizer, self.qwen3, neg_prompt) if cfg_scale != 1.0 else None
 

@@ -6,8 +6,8 @@ class ModelSpec:
     pipeline_cls: type
     repo_id: str
     filename: str
-    text_encoder_id: str | None = None  # None: text encoder is not supported
-    sample_defaults: dict = dataclasses.field(default_factory=dict)  # kwargs for pipeline.generate()
+    text_encoder_id: str
+    sample_defaults: dict  # default kwargs for pipeline.generate()
 
 
 # each model family adds its entries in its package __init__.py

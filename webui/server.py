@@ -20,8 +20,7 @@ STATIC_DIR = APP_ROOT / "static"
 IMAGE_DIR = APP_ROOT / "images"
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-# skip models whose text encoder is not supported yet
-MODEL_DEFAULTS = {name: spec.sample_defaults for name, spec in MODELS.items() if spec.text_encoder_id is not None}
+MODEL_DEFAULTS = {name: spec.sample_defaults for name, spec in MODELS.items()}
 
 PIPELINE: Flux2Pipeline | ZImagePipeline | None = None
 ACTIVE_MODEL: str | None = None
