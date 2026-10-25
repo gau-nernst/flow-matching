@@ -8,11 +8,12 @@ from torch import Tensor
 @triton.jit
 def _modulate_kernel(
     x_ptr,  # [B, L, D], strided
-    shift_ptr,  # [B, D]
-    scale_ptr,  # [B, D]
+    shift_ptr,  # [B or N, D]
+    scale_ptr,  # [B or N, D]
     res_ptr,  # [B, L, D]
-    gate_ptr,  # [B, D]
+    gate_ptr,  # [B or N, D]
     norm_ptr,  # [D]
+    idx_ptr,  # [L] sample of each token, for packed input
     gated_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
     x_stride_b,
@@ -33,14 +34,19 @@ def _modulate_kernel(
     mask = offs < D
     x = tl.load(x_ptr + (pid_b * x_stride_b + pid_l * x_stride_l + offs), mask, other=0.0)
 
+    if idx_ptr is not None:
+        row = tl.load(idx_ptr + pid_l)
+    else:
+        row = pid_b
+
     if res_ptr is not None:
         res = tl.load(res_ptr + (pid_b * L * D + pid_l * D + offs), mask, other=0.0)
-        gate = tl.load(gate_ptr + (pid_b * gate_stride + offs), mask)
+        gate = tl.load(gate_ptr + (row * gate_stride + offs), mask)
         x = (x.to(tl.float32) + gate.to(tl.float32) * res.to(tl.float32)).to(x.dtype)
         tl.store(gated_ptr + (pid_b * L * D + pid_l * D + offs), x, mask)
 
-    shift = tl.load(shift_ptr + (pid_b * shift_stride + offs), mask)
-    scale = tl.load(scale_ptr + (pid_b * scale_stride + offs), mask)
+    shift = tl.load(shift_ptr + (row * shift_stride + offs), mask)
+    scale = tl.load(scale_ptr + (row * scale_stride + offs), mask)
 
     x = x.to(tl.float32)
     if not RMS:
@@ -64,9 +70,15 @@ def modulate(
     eps: float = 1e-6,
     norm_weight: Tensor | None = None,
     rms: bool = False,
+    idx: Tensor | None = None,
 ) -> Tensor:
     # norm is LayerNorm (default) or RMSNorm, with optional weight
+    # x: [B, L, D]. shift, scale, gate: [B, 1, D] or [1, 1, D]. packed: [N, 1, D] with idx [L]
     if torch.is_grad_enabled():
+        if idx is not None:
+            shift, scale = [t[:, 0].index_select(0, idx).unsqueeze(0) for t in (shift, scale)]
+            if gate is not None:
+                gate = gate[:, 0].index_select(0, idx).unsqueeze(0)
         if res is not None:
             x = torch.addcmul(x, gate, res)
         if rms:
@@ -77,13 +89,22 @@ def modulate(
         return out, x
 
     B, L, D = x.shape
-    assert x.stride(-1) == 1 and shift[0].is_contiguous() and scale[0].is_contiguous()
-    assert shift.shape in ((B, 1, D), (1, 1, D))
-    assert scale.shape in ((B, 1, D), (1, 1, D))
+    assert x.stride(-1) == 1
+
+    def check(t: Tensor) -> int:  # row stride
+        assert t.ndim == 3 and t.shape[1:] == (1, D) and t.stride(-1) == 1, (x.shape, t.shape, t.stride())
+        if idx is None:
+            assert t.shape[0] in (1, B), (x.shape, t.shape)
+        return t.stride(0) if t.shape[0] > 1 else 0
+
+    if idx is not None:
+        assert B == 1 and idx.shape == (L,), (x.shape, idx.shape)
+    shift_stride, scale_stride = check(shift), check(scale)
+    gate_stride = 0
     if res is not None:
         assert gate is not None
-        assert res.is_contiguous() and gate[0].is_contiguous()
-        assert gate.shape in ((B, 1, D), (1, 1, D))
+        assert res.is_contiguous()
+        gate_stride = check(gate)
     if norm_weight is not None:
         assert norm_weight.shape == (D,) and norm_weight.is_contiguous()
     gated = x.new_empty(B, L, D) if res is not None else x
@@ -95,13 +116,14 @@ def modulate(
         res,
         gate,
         norm_weight,
+        idx,
         gated,
         out,
         x.stride(0),
         x.stride(1),
-        shift.stride(0) if shift.shape[0] > 1 else 0,
-        scale.stride(0) if scale.shape[0] > 1 else 0,
-        gate.stride(0) if gate is not None and gate.shape[0] > 1 else 0,
+        shift_stride,
+        scale_stride,
+        gate_stride,
         L,
         D,
         rms,

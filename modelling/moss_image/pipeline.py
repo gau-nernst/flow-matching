@@ -72,6 +72,12 @@ class MOSSImagePipeline:
         spec = MODELS[name]
         return cls(load_moss_image(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
+    # imgs: uint8 [H_i, W_i, 3]. returns per-sample latents and kwargs for model.prepare()
+    @torch.no_grad()
+    def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
+        latents = [self.ae.encode(x[None])[0] for x in imgs]
+        return latents, dict(txt=self.text_encoder(prompts))
+
     # cfg_scale, num_steps, shift and uncond_skip_layers default to self.sample_defaults
     @torch.no_grad()
     def generate(
@@ -94,7 +100,7 @@ class MOSSImagePipeline:
         if uncond_skip_layers is None:
             uncond_skip_layers = self.sample_defaults["uncond_skip_layers"]
         txts = self.text_encoder(prompt)
-        neg_txt = self.text_encoder(neg_prompt)[0][None] if cfg_scale != 1.0 else None
+        neg_txts = self.text_encoder(neg_prompt) * len(txts) if cfg_scale != 1.0 else None
 
         height, width = (img_size, img_size) if isinstance(img_size, int) else img_size
         ae = self.ae
@@ -103,25 +109,21 @@ class MOSSImagePipeline:
         device = ae.encoder.conv_in.weight.device
         rng = torch.Generator(device).manual_seed(seed) if seed is not None else None
 
-        # the DiT doesn't support padding, so generate each prompt separately
-        imgs = []
-        for i, txt in enumerate(txts):
-            noise = torch.randn(1, H, W, ae.cfg.z_dim * 4, device=device, generator=rng)
-            cb = (lambda step, n, i=i: progress_cb(i * n + step, len(txts) * n)) if progress_cb else None
-            latents = moss_image_generate(
-                moss=self.model,
-                latents=noise,
-                timesteps=moss_image_timesteps(num_steps, shift),
-                txt=txt[None],
-                neg_txt=neg_txt,
-                cfg_scale=cfg_scale,
-                uncond_skip_layers=uncond_skip_layers,
-                solver=solver,
-                pbar=pbar,
-                progress_cb=cb,
-            )
-            imgs.append(ae.decode(latents, uint8=True))
-        return torch.cat(imgs)
+        # sample noise per image, so a seed gives the same image regardless of batch size
+        noise = torch.cat([torch.randn(1, H, W, ae.cfg.z_dim * 4, device=device, generator=rng) for _ in txts])
+        latents = moss_image_generate(
+            moss=self.model,
+            latents=noise,
+            timesteps=moss_image_timesteps(num_steps, shift),
+            txt=txts,
+            neg_txt=neg_txts,
+            cfg_scale=cfg_scale,
+            uncond_skip_layers=uncond_skip_layers,
+            solver=solver,
+            pbar=pbar,
+            progress_cb=progress_cb,
+        )
+        return ae.decode(latents, uint8=True)
 
 
 # shifted grid, snapped to the nearest training timestep. ends with 0
@@ -143,8 +145,8 @@ def moss_image_generate(
     moss: MOSSImage,
     latents: Tensor,
     timesteps: list[float],
-    txt: Tensor,
-    neg_txt: Tensor | None = None,
+    txt: list[Tensor],
+    neg_txt: list[Tensor] | None = None,
     cfg_scale: float = 1.0,
     uncond_skip_layers: tuple[int, ...] = (),
     solver: str = "euler",
@@ -153,19 +155,25 @@ def moss_image_generate(
 ) -> Tensor:
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    B = latents.shape[0]
+
+    # pack, since prompts have different lengths
+    imgs = list(latents)
+    sizes = [x.shape[:2] for x in imgs]
+    img, pos_kwargs = moss.prepare(imgs, txt)  # img: VarlenTensor
+    latents = img.data
+    neg_kwargs = moss.prepare(imgs, neg_txt)[1] if cfg_scale != 1.0 else None
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
-        t = torch.tensor([timesteps[i]], device=latents.device).expand(B)
-        v = moss(latents, t, txt).float()
+        t = torch.tensor([timesteps[i]], device=latents.device)
+        v = moss(img._replace(data=latents), t, **pos_kwargs).float()
 
         # classifier-free guidance
         if cfg_scale != 1.0:
-            neg_v = moss(latents, t, neg_txt, skip_layers=uncond_skip_layers).float()
+            neg_v = moss(img._replace(data=latents), t, **neg_kwargs, skip_layers=uncond_skip_layers).float()
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
         if progress_cb is not None:
             progress_cb(i + 1, num_steps)
 
-    return latents
+    return torch.stack(moss.unpatchify(latents, sizes))

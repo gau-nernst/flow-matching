@@ -18,7 +18,7 @@ import psutil
 import torch
 import wandb
 from PIL import Image, ImageOps
-from torch.utils.data import DataLoader, IterableDataset, default_collate, get_worker_info
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from tqdm import tqdm
 
 from modelling import MODELS
@@ -54,8 +54,9 @@ class ImageDataset(IterableDataset):
         self.shuffle_rng = torch.Generator()
         self.shuffle_rng.seed()
 
+    # yields (list of uint8 [H, W, 3], list of prompts). sizes can differ
     def __iter__(self):
-        buckets = dict()
+        batch = []
         counter = -1
 
         # NOTE: not handle distributed training for now
@@ -80,15 +81,11 @@ class ImageDataset(IterableDataset):
                 img_pil = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
                 img_pt = random_resize(img_pil, self.min_size, self.max_size)
 
-                prompt = self.prompts[idx]
-                img_size = tuple(img_pt.shape[:2])
-                if img_size not in buckets:
-                    buckets[img_size] = []
-                buckets[img_size].append((img_pt, prompt))
-
-                if len(buckets[img_size]) == self.batch_size:
-                    yield default_collate(buckets[img_size])
-                    buckets[img_size] = []
+                batch.append((img_pt, self.prompts[idx]))
+                if len(batch) == self.batch_size:
+                    imgs, prompts = zip(*batch)
+                    yield list(imgs), list(prompts)
+                    batch = []
 
 
 @torch.no_grad()
@@ -229,11 +226,11 @@ if __name__ == "__main__":
 
             if distill_dloader is not None:
                 distill_imgs, distill_prompts = next(distill_dloader)
-                imgs = torch.cat([imgs, distill_imgs], dim=0)
+                imgs = imgs + distill_imgs
                 prompts = prompts + distill_prompts
 
-            latents, model_kwargs = pipeline.prepare_train_inputs(imgs.cuda(), prompts)
-            loss = compute_loss(model, latents, time_sampler, model_kwargs)
+            latents, cond = pipeline.prepare_train_inputs([x.cuda() for x in imgs], prompts)
+            loss = compute_loss(model, latents, time_sampler, cond)
             loss.div(args.gradient_accumulation).backward()
 
         if step % args.log_interval == 0:
