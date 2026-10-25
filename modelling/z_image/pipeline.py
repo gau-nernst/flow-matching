@@ -108,10 +108,8 @@ class ZImagePipeline:
         latents = latents.float().lerp(noise, denoise) if latents is not None else noise
 
         # static shift
-        # Z-Image uses t=0 as noise, and t=1 as data
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1)
         timesteps = time_shift / (time_shift + 1 / timesteps - 1)
-        timesteps = 1 - timesteps
         timesteps = timesteps.tolist()
 
         latents = zimage_generate(

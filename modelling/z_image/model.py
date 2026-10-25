@@ -165,8 +165,10 @@ class ZImage(nn.Module):
         return torch.cat([x, pad_tokens], dim=1)
 
     def forward(self, img: Tensor, timesteps: Tensor, txt: Tensor) -> Tensor:
+        # inputs/outputs follow the repo convention: t=1 is noise, predict velocity (noise - data).
+        # the original Z-Image uses t=0 as noise and predicts (data - noise), so flip both t and v.
         B, H, W, C = img.shape
-        t_embeds = timestep_embedding(timesteps, 256)
+        t_embeds = timestep_embedding(1 - timesteps, 256)
         t_embeds = self.t_embedder(t_embeds.to(self.t_embedder[0][0].weight.dtype))
 
         # patchify
@@ -210,7 +212,7 @@ class ZImage(nn.Module):
         img = unified.view(B, nH, nW, patch_size, patch_size, C)
         img = img.transpose(2, 3)  # (B, nH, 2, nW, 2, C)
         img = img.reshape(B, H, W, C)
-        return img
+        return -img
 
 
 def load_zimage(name: str = "turbo"):
