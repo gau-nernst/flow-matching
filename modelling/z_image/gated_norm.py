@@ -9,7 +9,7 @@ from torch import Tensor
 def _gated_norm_kernel(
     x_ptr,  # [B, L, D]
     w_ptr,  # [D]
-    gate_ptr,  # [B, D] or [1, D], rows can be strided
+    gate_ptr,  # [B, D] or [1, D], strided
     add_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
     L: tl.constexpr,
@@ -75,7 +75,6 @@ def gated_norm(
     B, L, D = x.shape
     gate_stride_b = 0
     if gate is not None:
-        # e.g. a chunk of the adaLN output, so rows are strided
         assert gate.shape in ((B, 1, D), (1, 1, D)) and gate.stride(-1) == 1, (gate.shape, gate.stride())
         gate_stride_b = gate.stride(0) if gate.shape[0] > 1 else 0
     if add is not None:

@@ -7,7 +7,7 @@ from torch import Tensor
 
 @triton.jit
 def _modulate_kernel(
-    x_ptr,  # [B, L, D], batch and row dims can be strided
+    x_ptr,  # [B, L, D], strided
     shift_ptr,  # [B, D]
     scale_ptr,  # [B, D]
     res_ptr,  # [B, L, D]
@@ -45,7 +45,7 @@ def _modulate_kernel(
     x = x.to(tl.float32)
     if not RMS:
         x -= tl.sum(x) * (1.0 / D)
-        x = tl.where(mask, x, 0.0)  # padding lanes must not contribute to the variance
+        x = tl.where(mask, x, 0.0)  # exclude padding from variance
     var = tl.sum(x * x) * (1.0 / D)
     x = x * tl.rsqrt(var + eps)
     if norm_ptr is not None:
@@ -77,7 +77,6 @@ def modulate(
         return out, x
 
     B, L, D = x.shape
-    # x can be a slice e.g. the image part of a [B, L, D] joint sequence. only the last dim must be contiguous
     assert x.stride(-1) == 1 and shift[0].is_contiguous() and scale[0].is_contiguous()
     assert shift.shape in ((B, 1, D), (1, 1, D))
     assert scale.shape in ((B, 1, D), (1, 1, D))
