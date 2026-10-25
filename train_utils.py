@@ -47,16 +47,18 @@ def setup_model(
     return pipeline
 
 
-def compute_loss(model: nn.Module, latents: Tensor, time_sampler: TimeSampler, model_kwargs: dict) -> Tensor:
-    bsize = latents.shape[0]
-    t_vec = time_sampler(bsize, device=latents.device)
-    noise = torch.randn_like(latents)
-    interpolate = latents.lerp(noise, t_vec.view([-1] + [1] * (latents.ndim - 1)))
+# latents: per-sample list, can have different sizes
+def compute_loss(model: nn.Module, latents: list[Tensor], time_sampler: TimeSampler, model_kwargs: dict) -> Tensor:
+    t_vec = time_sampler(len(latents), device=latents[0].device)
+    noise = [torch.randn_like(x) for x in latents]
+    interpolate = [x.lerp(n, t) for x, n, t in zip(latents, noise, t_vec)]
 
     v = model(interpolate, t_vec, **model_kwargs)
 
     # rectified flow loss. predict velocity from latents (t=0) to noise (t=1).
-    return F.mse_loss(noise.float() - latents.float(), v.float())
+    # each sample has the same weight regardless of its resolution, like a batch of same-size images
+    losses = [F.mse_loss(n.float() - x.float(), v_.float()) for x, n, v_ in zip(latents, noise, v)]
+    return torch.stack(losses).mean()
 
 
 def parse_img_size(img_size: str):

@@ -170,6 +170,157 @@ def test_gated_norm_kernel_batched():
         torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_modulate_kernel():
+    if not (TRITON_INTERPRET or torch.cuda.is_available()):
+        return print("  skipped: needs TRITON_INTERPRET=1 on CPU")
+    from modelling.flux1.modulate import modulate
+
+    torch.manual_seed(0)
+    D = 96
+    x = torch.randn(1, 10, D)
+    res = torch.randn(1, 10, D)
+    norm = torch.randn(D)
+    shift, scale, gate = torch.randn(3, 1, 3 * D).chunk(3, dim=2)  # non-contiguous, like Modulation chunks
+    idx = Varlen.from_lens([3, 5, 2]).seq_ids
+    for kwargs in (dict(idx=idx), dict(idx=idx, res=res, gate=gate, norm_weight=norm, rms=True)):
+        with torch.no_grad():
+            out = modulate(x, shift, scale, **kwargs)
+        with torch.enable_grad():
+            expected = modulate(x, shift, scale, **kwargs)
+        for a, b in zip(out, expected):
+            torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
+
+    # existing [B, L, D] usage
+    x = torch.randn(3, 4, D)
+    res = torch.randn_like(x)
+    with torch.no_grad():
+        out = modulate(x, shift, scale, res, gate)
+    with torch.enable_grad():
+        expected = modulate(x, shift, scale, res, gate)
+    for a, b in zip(out, expected):
+        torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
+
+
+def init_random(model: nn.Module) -> nn.Module:
+    torch.manual_seed(0)
+    for p in model.parameters():
+        nn.init.normal_(p, std=0.05)
+    return model
+
+
+def tiny_flux2():
+    from modelling.flux2.model import Flux2, Flux2Config
+
+    cfg = Flux2Config(img_dim=32, txt_dim=64, dim=256, num_double_blocks=1, num_single_blocks=1)
+    return init_random(Flux2(cfg))
+
+
+def flux2_inputs(model, sizes, txt_lens):
+    imgs = [torch.randn(h * w, 32) for h, w in sizes]
+    txts = [torch.randn(L, 64) for L in txt_lens]
+    ropes = [torch.cat([model.make_txt_rope(L), model.make_img_rope(h, w)]) for (h, w), L in zip(sizes, txt_lens)]
+    return imgs, txts, ropes
+
+
+@torch.enable_grad()
+def test_flux2_varlen_matches_single():
+    model = tiny_flux2()
+    imgs, txts, ropes = flux2_inputs(model, [(8, 8), (6, 10), (12, 4)], [16, 16, 16])
+    t = torch.tensor([0.2, 0.5, 0.8])
+    outs = model(imgs, t, txts, ropes)
+    for i in range(3):
+        (expected,) = model([imgs[i]], t[i : i + 1], [txts[i]], [ropes[i]])
+        torch.testing.assert_close(outs[i], expected, atol=1e-5, rtol=1e-5)
+
+    # batched tensor input with a shared rope
+    img = torch.stack([imgs[0], imgs[0] * 0.5])
+    txt = torch.stack([txts[0], txts[1]])
+    out = model(img, torch.tensor([0.3]), txt, ropes[0])
+    for i in range(2):
+        (expected,) = model([img[i]], torch.tensor([0.3]), [txt[i]], [ropes[0]])
+        torch.testing.assert_close(out[i], expected, atol=1e-5, rtol=1e-5)
+
+
+def tiny_flux1():
+    from modelling.flux1.model import Flux1, Flux1Config
+
+    cfg = Flux1Config(img_dim=16, txt_dim=64, vec_dim=32, dim=256, num_double_blocks=1, num_single_blocks=1)
+    return init_random(Flux1(cfg))
+
+
+@torch.enable_grad()
+def test_flux1_varlen_matches_single():
+    model = tiny_flux1()
+    imgs = [torch.randn(4, H, W) for H, W in [(16, 16), (12, 20), (8, 24)]]
+    txts = [torch.randn(L, 64) for L in (10, 10, 10)]
+    vec = torch.randn(3, 32)
+    t = torch.tensor([0.2, 0.5, 0.8])
+    guidance = torch.tensor([3.5])
+    outs = model(imgs, t, txts, vec, guidance)
+    for i in range(3):
+        (expected,) = model([imgs[i]], t[i : i + 1], [txts[i]], vec[i : i + 1], guidance)
+        assert expected.shape == imgs[i].shape
+        torch.testing.assert_close(outs[i], expected, atol=1e-5, rtol=1e-5)
+
+    out = model(torch.stack([imgs[0], imgs[0]]), t[:2], torch.stack(txts[:2]), vec[:2], guidance)
+    torch.testing.assert_close(out[1], model([imgs[0]], t[1:2], [txts[1]], vec[1:2], guidance)[0])
+
+
+def tiny_moss():
+    from modelling.moss_image.model import MOSSImage, MOSSImageConfig
+
+    cfg = MOSSImageConfig(dim=256, ffn_dim=512, num_layers=2, text_dim=64, latent_channels=32)
+    return init_random(MOSSImage(cfg))
+
+
+@torch.enable_grad()
+def test_moss_varlen_matches_single():
+    model = tiny_moss()
+    imgs = [torch.randn(H, W, 32) for H, W in [(8, 8), (6, 10), (4, 12)]]
+    txts = [torch.randn(L, 64) for L in (5, 23, 12)]
+    t = torch.tensor([0.2, 0.5, 0.8])
+    for skip_layers in ((), (1,)):
+        outs = model(imgs, t, txts, skip_layers)
+        for i in range(3):
+            (expected,) = model([imgs[i]], t[i : i + 1], [txts[i]], skip_layers)
+            torch.testing.assert_close(outs[i], expected, atol=1e-5, rtol=1e-5)
+
+    out = model(torch.stack([imgs[0], imgs[0]]), torch.tensor([0.4]), [txts[0], txts[1]])
+    torch.testing.assert_close(out[1], model([imgs[0]], torch.tensor([0.4]), [txts[1]])[0])
+
+
+@torch.enable_grad()
+def test_compute_loss_multires():
+    # loss and grads on a mixed-resolution batch == mean of per-sample losses
+    from time_sampler import Uniform
+    from train_utils import compute_loss
+
+    model = tiny_zimage()
+    latents = [torch.randn(H, W, 16) for H, W in [(16, 16), (12, 20)]]
+    txt = [torch.randn(L, 64) for L in (9, 45)]
+
+    torch.manual_seed(1)
+    loss = compute_loss(model, latents, Uniform(), dict(txt=txt))
+    loss.backward()
+    grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    # replay the same random draws one sample at a time
+    model.zero_grad()
+    torch.manual_seed(1)
+    t = Uniform()(2, device="cpu")
+    noise = [torch.randn_like(x) for x in latents]
+    losses = []
+    for i in range(2):
+        (v,) = model([latents[i].lerp(noise[i], t[i])], t[i : i + 1], [txt[i]])
+        losses.append(F.mse_loss(noise[i] - latents[i], v))
+    expected = torch.stack(losses).mean()
+    expected.backward()
+    torch.testing.assert_close(loss, expected)
+    for n, p in model.named_parameters():
+        if n in grads:
+            torch.testing.assert_close(grads[n], p.grad, atol=1e-5, rtol=1e-4, msg=n)
+
+
 if __name__ == "__main__":
     import sys
 
