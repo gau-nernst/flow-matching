@@ -205,6 +205,16 @@ class Decoder(nn.Module):
         return h
 
 
+def diagonal_gaussian(z: Tensor, sample: bool) -> Tensor:
+    mean, logvar = torch.chunk(z, 2, dim=-1)
+    if sample:
+        # SD clamps logvar to [-30,20]
+        std = (0.5 * logvar).exp()
+        return mean + std * torch.randn_like(mean)
+    else:
+        return mean
+
+
 class AEConfig(NamedTuple):
     in_dim: int = 3
     dim: int = 128
@@ -233,13 +243,13 @@ class AutoEncoder(nn.Module):
         if cfg.use_bn:
             self.bn = BatchNorm2d(4 * cfg.z_dim, eps=1e-4, affine=False)
 
-    # return the posterior mean. sampling from the posterior is only useful for training the VAE.
-    def encode(self, x: Tensor) -> Tensor:
+    # sample=True draws from the posterior, which is only meant for VAE training. use the mean (default) otherwise.
+    def encode(self, x: Tensor, sample: bool = False) -> Tensor:
         if x.dtype == torch.uint8:
             x = x.float() / 127.5 - 1
 
-        mean_logvar = self.encoder(x.to(self.encoder.conv_in.weight.dtype))
-        z = mean_logvar.float().chunk(2, dim=-1)[0]
+        mean_var = self.encoder(x.to(self.encoder.conv_in.weight.dtype))
+        z = diagonal_gaussian(mean_var.float(), sample)
 
         if self.cfg.use_bn:
             # Flux.2 does patchify in AE, before BN. right now for other models, we patchify inside the model
@@ -288,8 +298,8 @@ class AutoEncoder(nn.Module):
             x = x.float().add(1).mul(127.5).round().clip(0, 255).to(torch.uint8)
         return x
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.decode(self.encode(x), x.dtype == torch.uint8)
+    def forward(self, x: Tensor, sample: bool = False) -> Tensor:
+        return self.decode(self.encode(x, sample), x.dtype == torch.uint8)
 
 
 def _load_vae(repo_id: str, filename: str, scale_shift: tuple[float, float] = (1.0, 0.0)):
