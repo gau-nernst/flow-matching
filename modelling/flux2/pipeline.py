@@ -94,7 +94,7 @@ class Flux2Pipeline:
     # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs)
     def prepare_train_inputs(self, imgs: Tensor, prompts: list[str]) -> tuple[Tensor, dict]:
         with torch.no_grad():
-            latents = self.ae.encode(imgs, sample=True)
+            latents = self.ae.encode(imgs)
         txt = self.text_encoder(prompts)
         img_rope = self.model.make_img_rope(*latents.shape[1:3])
         txt_rope = self.model.make_txt_rope(txt.shape[1])

@@ -82,7 +82,7 @@ class ZImagePipeline:
     # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs)
     @torch.no_grad()
     def prepare_train_inputs(self, imgs: Tensor, prompts: list[str]) -> tuple[Tensor, dict]:
-        latents = self.ae.encode(imgs, sample=True)
+        latents = self.ae.encode(imgs)
         txt = self.embed_text(prompts)
         return latents, dict(txt=txt)
 
