@@ -191,14 +191,14 @@ if __name__ == "__main__":
         if "model" in ckpt:  # training checkpoint
             ckpt_model = ckpt.get("model_name", args.model)  # older checkpoints don't store model_name
             assert ckpt_model == args.model, f"Checkpoint is for {ckpt_model}, not {args.model}"
-            logger.info("Load model: ", model.load_state_dict(ckpt["model"], strict=False))
+            logger.info("Load model: %s", model.load_state_dict(ckpt["model"], strict=False))
             if ema is not None:
                 ema.load_state_dict(ckpt["ema"])
             optim.load_state_dict(ckpt["optim"])
             step = ckpt["step"]
 
         else:  # model only
-            logger.info("Load model: ", model.load_state_dict(ckpt, strict=False))
+            logger.info("Load model: %s", model.load_state_dict(ckpt, strict=False))
 
     # inference before any training
     if step == 0 and not args.profile:
