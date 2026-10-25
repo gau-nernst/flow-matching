@@ -159,16 +159,17 @@ def moss_image_generate(
     # pack, since prompts have different lengths
     imgs = list(latents)
     sizes = [x.shape[:2] for x in imgs]
-    latents, pos_kwargs = moss.prepare(imgs, txt)
+    img, pos_kwargs = moss.prepare(imgs, txt)  # img: VarlenTensor
+    latents = img.data
     neg_kwargs = moss.prepare(imgs, neg_txt)[1] if cfg_scale != 1.0 else None
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
         t = torch.tensor([timesteps[i]], device=latents.device)
-        v = moss(latents, t, **pos_kwargs).float()
+        v = moss(img._replace(data=latents), t, **pos_kwargs).float()
 
         # classifier-free guidance
         if cfg_scale != 1.0:
-            neg_v = moss(latents, t, **neg_kwargs, skip_layers=uncond_skip_layers).float()
+            neg_v = moss(img._replace(data=latents), t, **neg_kwargs, skip_layers=uncond_skip_layers).float()
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
