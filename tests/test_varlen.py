@@ -75,7 +75,8 @@ def test_varlen_attn():
     lens = [5, 17, 300]
     varlen = Varlen.from_lens(lens, "cuda")
     q, k, v = torch.randn(3, 1, sum(lens), 2, 64, device="cuda", dtype=torch.bfloat16).unbind(0)
-    torch.testing.assert_close(varlen_attn(q, k, v, varlen), masked_varlen_attn(q, k, v, varlen))
+    expected = masked_varlen_attn(q.float(), k.float(), v.float(), varlen)
+    torch.testing.assert_close(varlen_attn(q, k, v, varlen).float(), expected, atol=1e-2, rtol=1e-2)
 
 
 @torch.enable_grad()  # use the eager paths of custom ops
