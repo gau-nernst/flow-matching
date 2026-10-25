@@ -43,6 +43,7 @@ def _modulate_kernel(
     x = x.to(tl.float32)
     if not RMS:
         x -= tl.sum(x) * (1.0 / D)
+        x = tl.where(mask, x, 0.0)  # padding lanes must not contribute to the variance
     var = tl.sum(x * x) * (1.0 / D)
     x = x * tl.rsqrt(var + eps)
     if norm_ptr is not None:
@@ -74,12 +75,14 @@ def modulate(
         return out, x
 
     B, L, D = x.shape
-    assert x.is_contiguous() and shift[0].is_contiguous() and scale[0].is_contiguous()
+    x = x.contiguous()  # e.g. the image part of a [B, L, D] joint sequence
+    assert shift[0].is_contiguous() and scale[0].is_contiguous()
     assert shift.shape in ((B, 1, D), (1, 1, D))
     assert scale.shape in ((B, 1, D), (1, 1, D))
     if res is not None:
         assert gate is not None
-        assert res.is_contiguous() and gate[0].is_contiguous()
+        res = res.contiguous()
+        assert gate[0].is_contiguous()
         assert gate.shape in ((B, 1, D), (1, 1, D))
     if norm_weight is not None:
         assert norm_weight.shape == (D,) and norm_weight.is_contiguous()
