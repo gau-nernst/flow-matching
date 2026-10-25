@@ -46,7 +46,8 @@ class ZImagePipeline:
         spec = MODELS[name]
         return cls(load_zimage(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
-    def embed_text(self, prompts: str | list[str]) -> Tensor:
+    # returns one [L_i, D] tensor per prompt, without padding
+    def embed_text(self, prompts: str | list[str]) -> list[Tensor]:
         if isinstance(prompts, str):
             prompts = [prompts]
 
@@ -72,12 +73,7 @@ class ZImagePipeline:
         input_ids = inputs.input_ids.to(device)
         mask = inputs.attention_mask.to(device).bool()
         txt_embeds = self.qwen3(input_ids, attention_mask=mask, output_hidden_states=True).last_hidden_state
-
-        return txt_embeds
-
-        # remove padding
-        # TODO: use varlen attention instead
-        # return [txt_embeds[i, mask[i]] for i in range(len(formatted_prompts))]
+        return [txt_embeds[i, mask[i]] for i in range(len(formatted_prompts))]
 
     # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs)
     @torch.no_grad()
@@ -107,9 +103,10 @@ class ZImagePipeline:
         num_steps = self.sample_defaults["num_steps"] if num_steps is None else num_steps
         time_shift = self.sample_defaults["time_shift"] if time_shift is None else time_shift
         txt_embeds = self.embed_text(prompt)
+        bsize = len(txt_embeds)
         neg_txt_embeds = self.embed_text(neg_prompt) if cfg_scale != 1.0 else None
-
-        bsize = txt_embeds.shape[0]
+        if neg_txt_embeds is not None and len(neg_txt_embeds) == 1:
+            neg_txt_embeds = neg_txt_embeds * bsize
         if isinstance(img_size, int):
             height = width = img_size
         else:
@@ -150,8 +147,8 @@ def zimage_generate(
     zimage: ZImage,
     latents: Tensor,
     timesteps: list[float],
-    txt: Tensor,
-    neg_txt: Tensor | None = None,
+    txt: list[Tensor],
+    neg_txt: list[Tensor] | None = None,
     cfg_scale: float = 1.0,
     solver: str = "euler",
     pbar: bool = False,

@@ -2,8 +2,16 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from .varlen import Varlen, varlen_attn
 
-def dispatch_attn(q: Tensor, k: Tensor, v: Tensor, impl: str = "pt") -> Tensor:
+
+def dispatch_attn(q: Tensor, k: Tensor, v: Tensor, impl: str = "pt", varlen: Varlen | None = None) -> Tensor:
+    # q, k, v: [B, L, H, D]. with varlen, B=1 and samples are packed along L
+    if varlen is not None and len(varlen.lens) > 1:
+        if impl != "pt":
+            raise NotImplementedError(f"varlen attention is not supported for {impl=}")
+        return varlen_attn(q, k, v, varlen)
+
     if impl == "pt":
         q, k, v = [x.transpose(1, 2) for x in (q, k, v)]
         return F.scaled_dot_product_attention(q, k, v).transpose(1, 2)

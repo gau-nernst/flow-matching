@@ -14,7 +14,10 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_weight_merge_hook, load_hf_state_dict
+from ..varlen import Varlen, interleave
 from .gated_norm import gated_norm
+
+SEQ_MULTIPLE = 32  # each sample's image and text tokens are padded to a multiple of this
 
 
 class FinalLayer(nn.Module):
@@ -23,8 +26,9 @@ class FinalLayer(nn.Module):
         self.linear = Linear(hidden_size, out_channels)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), Linear(256, hidden_size))
 
-    def forward(self, x: Tensor, c: Tensor) -> Tensor:
-        scale = self.adaLN_modulation(c).unsqueeze(1)
+    def forward(self, x: Tensor, c: Tensor, varlen: Varlen | None = None) -> Tensor:
+        scale = self.adaLN_modulation(c)  # [B, D]
+        scale = scale[varlen.seq_ids.long()].unsqueeze(0) if varlen is not None else scale.unsqueeze(1)
         x = (1.0 + scale) * F.layer_norm(x, x.shape[-1:], eps=1e-6)
         return self.linear(x)
 
@@ -42,12 +46,12 @@ class Attention(nn.Module):
 
         self.register_load_state_dict_pre_hook(create_weight_merge_hook(["to_q", "to_k", "to_v"], "qkv"))
 
-    def forward(self, x: Tensor, pe: Tensor):
+    def forward(self, x: Tensor, pe: Tensor, varlen: Varlen | None = None):
         q, k, v = self.qkv(x).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
         qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else x.dtype
         q = apply_rope(q, pe, self.norm_q.weight, self.eps, out=torch.empty_like(q, dtype=qk_dtype))
         k = apply_rope(k, pe, self.norm_k.weight, self.eps, out=torch.empty_like(k, dtype=qk_dtype))
-        out = dispatch_attn(q, k, v, self.attn_impl).flatten(2)
+        out = dispatch_attn(q, k, v, self.attn_impl, varlen).flatten(2)
         return self.to_out(out)
 
 
@@ -96,18 +100,22 @@ class Block(nn.Module):
         self.ffn_norm2 = nn.RMSNorm(dim, eps=eps)
         self.eps = eps
 
-    def forward(self, x: Tensor, adaln_input: Tensor | None, pe: Tensor) -> Tensor:
+    # x: [1, T, D] packed (varlen) or [B, L, D]. adaln_input: [N, mod_dim] per sample
+    def forward(self, x: Tensor, adaln_input: Tensor | None, pe: Tensor, varlen: Varlen | None = None) -> Tensor:
+        idx = varlen.seq_ids if varlen is not None else None
+
         if self.adaLN_modulation is not None:
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).unsqueeze(1).chunk(4, dim=2)
 
-            attn = self.attention(gated_norm(x, self.attention_norm1.weight, gate=scale_msa, eps=self.eps), pe)
-            x = gated_norm(attn, self.attention_norm2.weight, gate=gate_msa, add=x, gate_type="tanh", eps=self.eps)
+            y = gated_norm(x, self.attention_norm1.weight, gate=scale_msa, eps=self.eps, gate_idx=idx)
+            attn = self.attention(y, pe, varlen)
+            x = gated_norm(attn, self.attention_norm2.weight, gate_msa, x, "tanh", self.eps, gate_idx=idx)
 
-            ffn = self.feed_forward(gated_norm(x, self.ffn_norm1.weight, gate=scale_mlp, eps=self.eps))
-            x = gated_norm(ffn, self.ffn_norm2.weight, gate=gate_mlp, add=x, gate_type="tanh", eps=self.eps)
+            ffn = self.feed_forward(gated_norm(x, self.ffn_norm1.weight, gate=scale_mlp, eps=self.eps, gate_idx=idx))
+            x = gated_norm(ffn, self.ffn_norm2.weight, gate_mlp, x, "tanh", self.eps, gate_idx=idx)
 
         else:
-            attn = self.attention(self.attention_norm1(x), pe)
+            attn = self.attention(self.attention_norm1(x), pe, varlen)
             x = gated_norm(attn, self.attention_norm2.weight, add=x, eps=self.eps)
 
             ffn = self.feed_forward(self.ffn_norm1(x))
@@ -163,61 +171,87 @@ class ZImage(nn.Module):
         return list(self.layers)
 
     @staticmethod
-    def _pad_tokens(x: Tensor, pad_token: Tensor):
-        """Pad to a multiple of 32"""
-        pad_len = (-x.shape[1]) % 32
-        pad_tokens = pad_token.view(1, 1, -1).expand(x.shape[0], pad_len, -1)
-        return torch.cat([x, pad_tokens], dim=1)
+    def _pad(xs: list[Tensor], pad_token: Tensor) -> list[Tensor]:
+        # pad each [L, D] to a multiple of SEQ_MULTIPLE
+        return [torch.cat([x, pad_token.expand((-x.shape[0]) % SEQ_MULTIPLE, -1)]) for x in xs]
 
-    def forward(self, img: Tensor, timesteps: Tensor, txt: Tensor) -> Tensor:
+    def forward(
+        self, img: Tensor | list[Tensor], timesteps: Tensor, txt: Tensor | list[Tensor]
+    ) -> Tensor | list[Tensor]:
         # inputs/outputs follow the repo convention: t=1 is noise, predict velocity (noise - data).
         # the original Z-Image uses t=0 as noise and predicts (data - noise), so flip both t and v.
-        B, H, W, C = img.shape
-        t_embeds = timestep_embedding(1 - timesteps, 256)
-        t_embeds = self.t_embedder(t_embeds.to(self.t_embedder[0][0].weight.dtype))
+        #
+        # img: [B, H, W, C] or a list of [H_i, W_i, C]. txt: [B, L, txt_dim] or a list of [L_i, txt_dim] (no padding).
+        # timesteps: [B] or [1]. returns the same type as img.
+        # all samples are packed into one sequence (varlen), so images and texts can have different sizes.
+        is_batched = isinstance(img, Tensor)
+        imgs = list(img.unbind(0)) if is_batched else img
+        txts = list(txt.unbind(0)) if isinstance(txt, Tensor) else txt
+        assert len(imgs) == len(txts), (len(imgs), len(txts))
+        device = imgs[0].device
+        p = self.cfg.patch_size
+
+        t_embeds = timestep_embedding(1 - timesteps.expand(len(imgs)), 256)
+        t_embeds = self.t_embedder(t_embeds.to(self.t_embedder[0][0].weight.dtype))  # [N, mod_dim]
 
         # patchify
-        patch_size = self.cfg.patch_size
-        nH = H // patch_size
-        nW = W // patch_size
-        img = img.view(B, nH, patch_size, nW, patch_size, C)
-        img = img.transpose(2, 3)  # (B, nH, nW, 2, 2, C)
-        img = img.reshape(B, nH * nW, patch_size * patch_size * C)
+        img_sizes = []
+        img_patches = []
+        for x in imgs:
+            H, W, C = x.shape
+            nH, nW = H // p, W // p
+            img_sizes.append((nH, nW))
+            img_patches.append(x.reshape(nH, p, nW, p, C).transpose(1, 2).reshape(nH * nW, p * p * C))
 
         # RoPE embedding has 3 components:
-        # - time: text embeds stay at pos=[1,L+1), img embeds stay at pos=L+1
+        # - time: text embeds stay at pos=[1,L+1), img embeds stay at pos=L+1, where L is the padded text length
         # - height: all text embeds stay at pos=0
         # - width: all text embeds stay at pos=0
+        # padding image tokens are at pos=(0,0,0)
 
         # text-only processing
-        txt = self.cap_embedder(txt)
-        txt = self._pad_tokens(txt, self.cap_pad_token)
-        txt_rope = self.pos_embed.create((1, 0, 0), (txt.shape[1], 1, 1))
+        txt_embeds = self.cap_embedder(torch.cat(txts)[None])[0].split([x.shape[0] for x in txts])
+        txt_list = self._pad(list(txt_embeds), self.cap_pad_token)
+        txt_varlen = Varlen.from_lens([x.shape[0] for x in txt_list], device)
+        txt = torch.cat(txt_list)[None]
+        txt_rope = torch.cat([self.pos_embed.create((1, 0, 0), (L, 1, 1)) for L in txt_varlen.lens])
         for layer in self.context_refiner:
-            txt = layer(txt, None, txt_rope)
+            txt = layer(txt, None, txt_rope, txt_varlen)
 
         # image-only processing
-        img = img.to(self.all_x_embedder["2-1"].weight.dtype)
-        img = self.all_x_embedder["2-1"](img)
-        img = self._pad_tokens(img, self.x_pad_token)
-        img_rope = self.pos_embed.create((txt.shape[1] + 1, 0, 0), (1, nH, nW))
+        img_dtype = self.all_x_embedder["2-1"].weight.dtype
+        img_embeds = self.all_x_embedder["2-1"](torch.cat(img_patches)[None].to(img_dtype))[0]
+        img_list = self._pad(list(img_embeds.split([x.shape[0] for x in img_patches])), self.x_pad_token)
+        img_varlen = Varlen.from_lens([x.shape[0] for x in img_list], device)
+        img = torch.cat(img_list)[None]
+        pad_rope = self.pos_embed.create((0, 0, 0), (1, 1, 1))
+        img_rope = []
+        for (nH, nW), L_txt, L_img in zip(img_sizes, txt_varlen.lens, img_varlen.lens):
+            img_rope.append(self.pos_embed.create((L_txt + 1, 0, 0), (1, nH, nW)))
+            img_rope.append(pad_rope.expand(L_img - nH * nW, -1))
+        img_rope = torch.cat(img_rope)
         for layer in self.noise_refiner:
-            img = layer(img, t_embeds, img_rope)
+            img = layer(img, t_embeds, img_rope, img_varlen)
 
-        # joint processing
-        unified = torch.cat([img, txt], dim=1)
-        unified_rope = torch.cat([img_rope, txt_rope], dim=0)
+        # joint processing. each sample is [img, txt]
+        unified = interleave(img, img_varlen, txt, txt_varlen)
+        unified_rope = interleave(img_rope, img_varlen, txt_rope, txt_varlen, dim=0)
+        unified_varlen = Varlen.from_lens([a + b for a, b in zip(img_varlen.lens, txt_varlen.lens)], device)
         for layer in self.layers:
-            unified = layer(unified, t_embeds, unified_rope)
-        unified = unified[:, : nH * nW]
+            unified = layer(unified, t_embeds, unified_rope, unified_varlen)
 
-        unified = self.all_final_layer["2-1"](unified, t_embeds)
+        # keep image tokens without padding
+        out_lens = [nH * nW for nH, nW in img_sizes]
+        out_varlen = Varlen.from_lens(out_lens, device)
+        unified = torch.cat([x[:, :L] for x, L in zip(unified_varlen.split(unified), out_lens)], dim=1)
+        unified = self.all_final_layer["2-1"](unified, t_embeds, out_varlen)
 
         # unpatchify
-        img = unified.view(B, nH, nW, patch_size, patch_size, C)
-        img = img.transpose(2, 3)  # (B, nH, 2, nW, 2, C)
-        img = img.reshape(B, H, W, C)
-        return -img
+        outs = []
+        for x, (nH, nW) in zip(out_varlen.split(unified[0], dim=0), img_sizes):
+            C = x.shape[-1] // (p * p)
+            outs.append(-x.view(nH, nW, p, p, C).transpose(1, 2).reshape(nH * p, nW * p, C))
+        return torch.stack(outs) if is_batched else outs
 
 
 def load_zimage(name: str = "z-image-turbo"):
