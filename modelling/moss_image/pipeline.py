@@ -46,17 +46,17 @@ class MOSSImageTextEncoder:
 
 class MOSSImagePipeline:
     def __init__(self, moss: MOSSImage | None = None) -> None:
-        self.moss = moss or load_moss_image()
+        self.model = moss or load_moss_image()
         self.ae = load_vae("flux2_small").bfloat16()  # reference runs the VAE in FP32
         self.text_encoder = MOSSImageTextEncoder()
 
     def cpu(self):
-        for m in (self.moss, self.ae, self.text_encoder):
+        for m in (self.model, self.ae, self.text_encoder):
             m.cpu()
         return self
 
     def cuda(self):
-        for m in (self.moss, self.ae, self.text_encoder):
+        for m in (self.model, self.ae, self.text_encoder):
             m.cuda()
         return self
 
@@ -91,7 +91,7 @@ class MOSSImagePipeline:
             noise = torch.randn(1, H, W, ae.cfg.z_dim * 4, device=device, generator=rng)
             cb = (lambda step, n, i=i: progress_cb(i * n + step, len(txts) * n)) if progress_cb else None
             latents = moss_image_generate(
-                moss=self.moss,
+                moss=self.model,
                 latents=noise,
                 timesteps=moss_image_timesteps(num_steps, shift),
                 txt=txt[None],

@@ -5,7 +5,7 @@ from collections.abc import Callable
 import torch
 from torch import Tensor, nn
 from tqdm import tqdm
-from transformers import AutoTokenizer, PreTrainedTokenizer, Qwen3Model
+from transformers import AutoTokenizer, Qwen3Model
 
 from ..registry import MODELS
 from ..solvers import get_solver
@@ -20,7 +20,7 @@ class ZImagePipeline:
         text_encoder_id: str = "Qwen/Qwen3-4B",
         sample_defaults: dict | None = None,  # used by generate(). default: z-image-turbo
     ) -> None:
-        self.zimage = zimage or load_zimage().bfloat16()
+        self.model = zimage or load_zimage()
         self.sample_defaults = sample_defaults or MODELS["z-image-turbo"].sample_defaults
         self.ae = load_vae("flux1").bfloat16()
 
@@ -32,34 +32,26 @@ class ZImagePipeline:
         self.qwen3.norm = nn.Identity()
 
     def cpu(self):
-        for m in (self.ae, self.qwen3, self.zimage):
+        for m in (self.ae, self.qwen3, self.model):
             m.cpu()
         return self
 
     def cuda(self):
-        for m in (self.ae, self.qwen3, self.zimage):
+        for m in (self.ae, self.qwen3, self.model):
             m.cuda()
         return self
 
-    @property
-    def model(self) -> ZImage:
-        return self.zimage
-
     @classmethod
     def load(cls, name: str):
-        zimage = load_zimage(name)
-        if "nvfp4" not in name:  # HF checkpoints are FP32
-            zimage.bfloat16()
         spec = MODELS[name]
-        return cls(zimage, spec.text_encoder_id, sample_defaults=spec.sample_defaults)
+        return cls(load_zimage(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
-    @staticmethod
-    def embed_text(tokenizer: PreTrainedTokenizer, qwen3: Qwen3Model, prompts: str | list[str]):
+    def embed_text(self, prompts: str | list[str]) -> Tensor:
         if isinstance(prompts, str):
             prompts = [prompts]
 
         formatted_prompts = [
-            tokenizer.apply_chat_template(
+            self.tokenizer.apply_chat_template(
                 [dict(role="user", content=prompt)],
                 tokenize=False,
                 add_generation_prompt=True,
@@ -67,7 +59,7 @@ class ZImagePipeline:
             )
             for prompt in prompts
         ]
-        inputs = tokenizer(
+        inputs = self.tokenizer(
             formatted_prompts,
             # padding="max_length",
             padding="longest",
@@ -76,10 +68,10 @@ class ZImagePipeline:
             return_tensors="pt",
         )
 
-        device = next(qwen3.parameters()).device
+        device = next(self.qwen3.parameters()).device
         input_ids = inputs.input_ids.to(device)
         mask = inputs.attention_mask.to(device).bool()
-        txt_embeds = qwen3(input_ids, attention_mask=mask, output_hidden_states=True).last_hidden_state
+        txt_embeds = self.qwen3(input_ids, attention_mask=mask, output_hidden_states=True).last_hidden_state
 
         return txt_embeds
 
@@ -91,7 +83,7 @@ class ZImagePipeline:
     @torch.no_grad()
     def prepare_train_inputs(self, imgs: Tensor, prompts: list[str]) -> tuple[Tensor, dict]:
         latents = self.ae.encode(imgs, sample=True)
-        txt = self.embed_text(self.tokenizer, self.qwen3, prompts)
+        txt = self.embed_text(prompts)
         return latents, dict(txt=txt)
 
     # cfg_scale, num_steps and time_shift default to self.sample_defaults
@@ -114,8 +106,8 @@ class ZImagePipeline:
         cfg_scale = self.sample_defaults["cfg_scale"] if cfg_scale is None else cfg_scale
         num_steps = self.sample_defaults["num_steps"] if num_steps is None else num_steps
         time_shift = self.sample_defaults["time_shift"] if time_shift is None else time_shift
-        txt_embeds = self.embed_text(self.tokenizer, self.qwen3, prompt)
-        neg_txt_embeds = self.embed_text(self.tokenizer, self.qwen3, neg_prompt) if cfg_scale != 1.0 else None
+        txt_embeds = self.embed_text(prompt)
+        neg_txt_embeds = self.embed_text(neg_prompt) if cfg_scale != 1.0 else None
 
         bsize = txt_embeds.shape[0]
         if isinstance(img_size, int):
@@ -140,7 +132,7 @@ class ZImagePipeline:
         timesteps = timesteps.tolist()
 
         latents = zimage_generate(
-            self.zimage,
+            self.model,
             latents,
             timesteps,
             txt=txt_embeds,

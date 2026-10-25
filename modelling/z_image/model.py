@@ -240,4 +240,6 @@ def load_zimage(name: str = "z-image-turbo"):
         model = ZImage()
 
     model.load_state_dict(state_dict, assign=True)
+    if not repo_id.startswith("Comfy-Org/"):  # HF checkpoints are FP32. keep quantized checkpoints as-is
+        model.bfloat16()
     return model
