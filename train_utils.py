@@ -9,13 +9,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 from torchvision.transforms import v2
 
-from modelling import (
-    Flux2,
-    Flux2Qwen3TextEncoder,
-    load_flux2,
-    load_vae,
-    load_zimage,
-)
+from modelling import MODELS, load_pipeline
 from modelling.linear import Linear
 from time_sampler import TimeSampler
 
@@ -23,34 +17,12 @@ from time_sampler import TimeSampler
 def setup_model(
     model_name: str, lora: int, fp8: bool, use_compile: bool, mem_budget: float = 0.7, ckpt_ratio: float = 0.5
 ):
-    if model_name.startswith("flux2-"):
-        model = load_flux2(model_name.removeprefix("flux2-"))
-        layers = list(model.double_blocks) + list(model.single_blocks)
-
-        ae = load_vae("flux2")
-
-        if model_name.startswith("flux2-klein-4B"):
-            text_id = "Qwen/Qwen3-4B-FP8"
-        elif model_name.startswith("flux2-klein-9B"):
-            text_id = "Qwen/Qwen3-8B-FP8"
-        else:
-            raise ValueError
-        text_embedder = Flux2Qwen3TextEncoder(text_id)
-
-    elif model_name.startswith("z-image-"):
-        model = load_zimage(model_name.removeprefix("z-image-"))
-        layers = list(model.layers)
-
-        ae = load_vae("flux1")
-        # TODO: text encoder
-        raise ValueError
-
-    else:
-        raise ValueError(f"Unsupported {model_name=}")
-
-    model.cuda().train().requires_grad_(False)
-    ae.bfloat16().eval().cuda()
-    text_embedder.cuda()
+    if not hasattr(MODELS[model_name].pipeline_cls, "prepare_train_inputs"):
+        raise ValueError(f"Training is not supported for {model_name} yet")
+    pipeline = load_pipeline(model_name).cuda()
+    model = pipeline.model
+    model.train().requires_grad_(False)
+    layers = model.lora_blocks()
 
     for i, layer in enumerate(layers):
         with torch.device("cuda"):
@@ -72,10 +44,10 @@ def setup_model(
     torch._functorch.config.activation_memory_budget = mem_budget
     torch._functorch.config.is_non_builtin_to_include = True  # without this, mem budget ignores custom ops' cost
 
-    return model, ae, text_embedder
+    return pipeline
 
 
-def compute_loss(model: Flux2, latents: Tensor, time_sampler: TimeSampler, model_kwargs: dict) -> Tensor:
+def compute_loss(model: nn.Module, latents: Tensor, time_sampler: TimeSampler, model_kwargs: dict) -> Tensor:
     bsize = latents.shape[0]
     t_vec = time_sampler(bsize, device=latents.device)
     noise = torch.randn_like(latents)

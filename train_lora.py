@@ -21,8 +21,7 @@ from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, IterableDataset, default_collate, get_worker_info
 from tqdm import tqdm
 
-from modelling import AutoEncoder, Flux2
-from modelling.flux2.pipeline import Flux2Qwen3TextEncoder, flux2_generate, flux2_time_shift
+from modelling import MODELS
 from time_sampler import LogitNormal, Uniform
 from train_utils import EMA, compute_loss, parse_img_size, random_resize, setup_model
 
@@ -38,13 +37,11 @@ class ImageDataset(IterableDataset):
         min_size: int,
         max_size: int,
         batch_size: int,
-        drop_tag_rate: float = 0.0,
     ) -> None:
         self.img_dir = Path(img_dir)
         self.min_size = min_size
         self.max_size = max_size
         self.batch_size = batch_size
-        self.drop_tag_rate = drop_tag_rate
 
         if str(meta_path).endswith(".tsv"):
             meta = pd.read_csv(meta_path, sep="\t")
@@ -84,13 +81,6 @@ class ImageDataset(IterableDataset):
                 img_pt = random_resize(img_pil, self.min_size, self.max_size)
 
                 prompt = self.prompts[idx]
-                if self.drop_tag_rate > 0.0 and torch.rand(()).item() < self.drop_tag_rate:
-                    SEPARATOR = ", "
-                    tags = prompt.split(SEPARATOR)
-                    if len(tags) > 5:
-                        tags.pop(torch.randint(len(tags), size=()).item())
-                        prompt = SEPARATOR.join(tags)
-
                 img_size = tuple(img_pt.shape[:2])
                 if img_size not in buckets:
                     buckets[img_size] = []
@@ -104,38 +94,20 @@ class ImageDataset(IterableDataset):
 @torch.no_grad()
 @torch.compiler.set_stance("force_eager")
 def save_images(
-    model: Flux2,
-    ae: AutoEncoder,
-    text_embedder: Flux2Qwen3TextEncoder,
+    pipeline,
     prompt_path: str,
     save_dir: Path,
     img_size: tuple[int, int],
     batch_size: int = 4,
+    **sample_kwargs,
 ):
-    model.eval()
+    pipeline.model.eval()
     prompts = [line.rstrip() for line in open(prompt_path, encoding="utf-8")]
     save_dir.mkdir(parents=True, exist_ok=True)
-    rng = torch.Generator("cuda").manual_seed(2024)
 
     for offset in tqdm(range(0, len(prompts), batch_size), "Generating images", dynamic_ncols=True):
         curr_prompts = prompts[offset : offset + batch_size]
-        conds = text_embedder(curr_prompts)
-
-        shape = (
-            len(curr_prompts),
-            img_size[0] // ae.downsample // 2,
-            img_size[1] // ae.downsample // 2,
-            ae.cfg.z_dim * 4,
-        )
-        noise = torch.randn(shape, device="cuda", generator=rng)
-
-        num_steps = 4
-        timesteps = torch.linspace(1.0, 0.0, num_steps + 1)
-        timesteps = flux2_time_shift(timesteps, num_steps, shape[1] * shape[2])
-        timesteps = timesteps.tolist()
-
-        latents = flux2_generate(model, noise, timesteps, conds)
-        imgs = ae.decode(latents, uint8=True).cpu()
+        imgs = pipeline.generate(curr_prompts, img_size=img_size, seed=2024 + offset, **sample_kwargs).cpu()
         for img_idx in range(imgs.shape[0]):
             save_path = save_dir / f"{offset + img_idx:04d}.webp"
             Image.fromarray(imgs[img_idx].numpy()).save(save_path, lossless=True)
@@ -158,7 +130,6 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--train_ds", type=json.loads, required=True)
     parser.add_argument("--distill_ds", type=json.loads)
-    parser.add_argument("--drop_tag_rate", type=float, default=0.0)
 
     parser.add_argument("--num_steps", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -169,6 +140,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval_interval", type=int, default=100)
     parser.add_argument("--test_img_size", type=parse_img_size, default=(512, 512))
     parser.add_argument("--test_prompt_path", required=True)
+    # pipeline.generate() kwargs, overriding the model's defaults in the registry e.g. '{"num_steps": 8}'
+    parser.add_argument("--test_sample_kwargs", type=json.loads, default={})
     parser.add_argument("--log_dir", type=Path, required=True)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--run_name", default="Debug")
@@ -176,6 +149,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     assert args.batch_size % args.gradient_accumulation == 0
+    sample_kwargs = {**MODELS[args.model].sample_defaults, **args.test_sample_kwargs}
     batch_size = args.batch_size // args.gradient_accumulation
     torch._dynamo.config.cache_size_limit = 1000
     torch._dynamo.config.accumulated_cache_size_limit = 1000
@@ -183,9 +157,7 @@ if __name__ == "__main__":
     wandb.init(project="T2I finetune", name=args.run_name, dir="/tmp", mode="disabled" if args.profile else None)
 
     def create_dloader(ds_config: dict, batch_size: int):
-        ds = ImageDataset(
-            ds_config["meta_path"], ds_config["img_dir"], args.min_size, args.max_size, batch_size, args.drop_tag_rate
-        )
+        ds = ImageDataset(ds_config["meta_path"], ds_config["img_dir"], args.min_size, args.max_size, batch_size)
         dloader = DataLoader(ds, batch_size=None, num_workers=args.num_workers, pin_memory=True)
         return iter(dloader)
 
@@ -197,9 +169,8 @@ if __name__ == "__main__":
         train_dloader = create_dloader(args.train_ds, batch_size)
         distill_dloader = None
 
-    model, ae, text_embedder = setup_model(
-        args.model, args.lora, args.fp8, args.compile, args.mem_budget, args.ckpt_ratio
-    )
+    pipeline = setup_model(args.model, args.lora, args.fp8, args.compile, args.mem_budget, args.ckpt_ratio)
+    model = pipeline.model
     ema = EMA(model) if args.ema else None
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
     logger.info(model)
@@ -218,18 +189,26 @@ if __name__ == "__main__":
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=True, mmap=True)
 
         if "model" in ckpt:  # training checkpoint
-            logger.info("Load model: ", model.load_state_dict(ckpt["model"], strict=False))
+            ckpt_model = ckpt.get("model_name", args.model)  # older checkpoints don't store model_name
+            assert ckpt_model == args.model, f"Checkpoint is for {ckpt_model}, not {args.model}"
+            logger.info("Load model: %s", model.load_state_dict(ckpt["model"], strict=False))
             if ema is not None:
                 ema.load_state_dict(ckpt["ema"])
             optim.load_state_dict(ckpt["optim"])
             step = ckpt["step"]
 
         else:  # model only
-            logger.info("Load model: ", model.load_state_dict(ckpt, strict=False))
+            logger.info("Load model: %s", model.load_state_dict(ckpt, strict=False))
 
     # inference before any training
     if step == 0 and not args.profile:
-        save_images(model, ae, text_embedder, args.test_prompt_path, img_dir / f"step{step:06d}", args.test_img_size)
+        save_images(
+            pipeline,
+            args.test_prompt_path,
+            img_dir / f"step{step:06d}",
+            args.test_img_size,
+            **sample_kwargs,
+        )
 
     pbar = tqdm(initial=step, total=args.num_steps, dynamic_ncols=True)
     torch.cuda.reset_peak_memory_stats()
@@ -253,16 +232,7 @@ if __name__ == "__main__":
                 imgs = torch.cat([imgs, distill_imgs], dim=0)
                 prompts = prompts + distill_prompts
 
-            with torch.no_grad():
-                latents = ae.encode(imgs.cuda(), sample=True)
-
-            txt = text_embedder(prompts)
-            img_rope = model.make_img_rope(*latents.shape[1:3])
-            txt_rope = model.make_txt_rope(txt.shape[1])
-            rope = torch.cat([txt_rope, img_rope], dim=0)
-            model_kwargs = dict(txt=txt, rope=rope)
-            latents = latents.flatten(1, 2)
-
+            latents, model_kwargs = pipeline.prepare_train_inputs(imgs.cuda(), prompts)
             loss = compute_loss(model, latents, time_sampler, model_kwargs)
             loss.div(args.gradient_accumulation).backward()
 
@@ -294,33 +264,32 @@ if __name__ == "__main__":
             time0 = time1
 
         if step % args.eval_interval == 0:
-            # only save LoRA weights. Flux doesn't have buffers.
+            # only save LoRA weights (the only trainable params)
             ckpt = dict(
                 model={name: p.detach().bfloat16() for name, p in model.named_parameters() if p.requires_grad},
                 optim=optim.state_dict(),
                 step=step,
+                model_name=args.model,
             )
             if ema is not None:
                 ckpt["ema"] = ema.state_dict()
             torch.save(ckpt, ckpt_dir / f"step{step:06d}.pth")
 
             save_images(
-                model,
-                ae,
-                text_embedder,
+                pipeline,
                 args.test_prompt_path,
                 img_dir / f"step{step:06d}",
                 args.test_img_size,
+                **sample_kwargs,
             )
             if ema is not None:
                 ema.swap_params()
                 save_images(
-                    model,
-                    ae,
-                    text_embedder,
+                    pipeline,
                     args.test_prompt_path,
                     img_dir / f"step{step:06d}_ema",
                     args.test_img_size,
+                    **sample_kwargs,
                 )
                 ema.swap_params()
             model.train()

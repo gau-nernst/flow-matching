@@ -243,6 +243,7 @@ class AutoEncoder(nn.Module):
         if cfg.use_bn:
             self.bn = BatchNorm2d(4 * cfg.z_dim, eps=1e-4, affine=False)
 
+    # sample=True draws from the posterior, which is only meant for VAE training. use the mean (default) otherwise.
     def encode(self, x: Tensor, sample: bool = False) -> Tensor:
         if x.dtype == torch.uint8:
             x = x.float() / 127.5 - 1

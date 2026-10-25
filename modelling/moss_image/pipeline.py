@@ -8,6 +8,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from ..qwen3_5 import Qwen3_5Model
+from ..registry import MODELS
 from ..solvers import get_solver
 from ..vae import load_vae
 from .model import MOSSImage, load_moss_image
@@ -45,36 +46,53 @@ class MOSSImageTextEncoder:
 
 
 class MOSSImagePipeline:
-    def __init__(self, moss: MOSSImage | None = None) -> None:
-        self.moss = moss or load_moss_image()
+    def __init__(
+        self,
+        moss: MOSSImage | None = None,
+        text_encoder_id: str = "Qwen/Qwen3.5-9B",
+        sample_defaults: dict | None = None,  # used by generate(). default: moss-image-sft
+    ) -> None:
+        self.model = moss or load_moss_image()
+        self.sample_defaults = sample_defaults or MODELS["moss-image-sft"].sample_defaults
         self.ae = load_vae("flux2_small").bfloat16()  # reference runs the VAE in FP32
-        self.text_encoder = MOSSImageTextEncoder()
+        self.text_encoder = MOSSImageTextEncoder(text_encoder_id)
 
     def cpu(self):
-        for m in (self.moss, self.ae, self.text_encoder):
+        for m in (self.model, self.ae, self.text_encoder):
             m.cpu()
         return self
 
     def cuda(self):
-        for m in (self.moss, self.ae, self.text_encoder):
+        for m in (self.model, self.ae, self.text_encoder):
             m.cuda()
         return self
 
+    @classmethod
+    def load(cls, name: str):
+        spec = MODELS[name]
+        return cls(load_moss_image(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
+
+    # cfg_scale, num_steps, shift and uncond_skip_layers default to self.sample_defaults
     @torch.no_grad()
     def generate(
         self,
         prompt: str | list[str],
         neg_prompt: str = "",
         img_size: int | tuple[int, int] = 1024,
-        cfg_scale: float = 3.0,
-        num_steps: int = 50,
-        shift: float = 5.0,
-        uncond_skip_layers: tuple[int, ...] = (22,),
+        cfg_scale: float | None = None,
+        num_steps: int | None = None,
+        shift: float | None = None,
+        uncond_skip_layers: tuple[int, ...] | None = None,
         seed: int | None = None,
         solver: str = "euler",
         pbar: bool = False,
         progress_cb: Callable[[int, int], None] | None = None,
     ) -> Tensor:
+        cfg_scale = self.sample_defaults["cfg_scale"] if cfg_scale is None else cfg_scale
+        num_steps = self.sample_defaults["num_steps"] if num_steps is None else num_steps
+        shift = self.sample_defaults["shift"] if shift is None else shift
+        if uncond_skip_layers is None:
+            uncond_skip_layers = self.sample_defaults["uncond_skip_layers"]
         txts = self.text_encoder(prompt)
         neg_txt = self.text_encoder(neg_prompt)[0][None] if cfg_scale != 1.0 else None
 
@@ -91,7 +109,7 @@ class MOSSImagePipeline:
             noise = torch.randn(1, H, W, ae.cfg.z_dim * 4, device=device, generator=rng)
             cb = (lambda step, n, i=i: progress_cb(i * n + step, len(txts) * n)) if progress_cb else None
             latents = moss_image_generate(
-                moss=self.moss,
+                moss=self.model,
                 latents=noise,
                 timesteps=moss_image_timesteps(num_steps, shift),
                 txt=txt[None],

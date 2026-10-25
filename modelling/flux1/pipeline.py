@@ -64,12 +64,12 @@ def prepare_inputs(
 
 class Flux1Pipeline:
     def __init__(self, flux: Flux1 | None = None, offload_flux: bool = False, offload_t5: bool = False) -> None:
-        self.flux = flux or load_flux1()  # 23.8 GB in BF16
+        self.model = flux or load_flux1()  # 23.8 GB in BF16
         self.ae = load_vae("flux1").bfloat16()  # 168 MB in BF16
         self.text_embedder = Flux1TextEmbedder(offload_t5)
 
         # autoencoder and clip are small, don't need to offload
-        self.flux_offloader = PerLayerOffloadCUDAStream(self.flux, enable=offload_flux)
+        self.flux_offloader = PerLayerOffloadCUDAStream(self.model, enable=offload_flux)
 
     def cpu(self):
         for m in (self.ae, self.text_embedder, self.flux_offloader):
@@ -113,7 +113,7 @@ class Flux1Pipeline:
         timesteps = flux1_timesteps(denoise, 0.0, num_steps, height * width // 4)
 
         latents = flux1_generate(
-            flux=self.flux,
+            flux=self.model,
             latents=latents,
             timesteps=timesteps,
             txt=embeds,

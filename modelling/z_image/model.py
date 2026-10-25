@@ -11,6 +11,7 @@ from torch import Tensor, nn
 from ..attn import dispatch_attn
 from ..flux1.model import timestep_embedding
 from ..linear import Linear, nvfp4_mm
+from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_weight_merge_hook, load_hf_state_dict
 from .gated_norm import gated_norm
@@ -157,6 +158,10 @@ class ZImage(nn.Module):
         self.all_final_layer = nn.ModuleDict()
         self.all_final_layer["2-1"] = FinalLayer(cfg.dim, patchified_dim)
 
+    # blocks to add LoRA to
+    def lora_blocks(self) -> list[nn.Module]:
+        return list(self.layers)
+
     @staticmethod
     def _pad_tokens(x: Tensor, pad_token: Tensor):
         """Pad to a multiple of 32"""
@@ -165,8 +170,10 @@ class ZImage(nn.Module):
         return torch.cat([x, pad_tokens], dim=1)
 
     def forward(self, img: Tensor, timesteps: Tensor, txt: Tensor) -> Tensor:
+        # inputs/outputs follow the repo convention: t=1 is noise, predict velocity (noise - data).
+        # the original Z-Image uses t=0 as noise and predicts (data - noise), so flip both t and v.
         B, H, W, C = img.shape
-        t_embeds = timestep_embedding(timesteps, 256)
+        t_embeds = timestep_embedding(1 - timesteps, 256)
         t_embeds = self.t_embedder(t_embeds.to(self.t_embedder[0][0].weight.dtype))
 
         # patchify
@@ -210,28 +217,13 @@ class ZImage(nn.Module):
         img = unified.view(B, nH, nW, patch_size, patch_size, C)
         img = img.transpose(2, 3)  # (B, nH, 2, nW, 2, C)
         img = img.reshape(B, H, W, C)
-        return img
+        return -img
 
 
-def load_zimage(name: str = "turbo"):
-    (
-        repo_id,
-        filename,
-    ) = {
-        "turbo": (
-            "Tongyi-MAI/Z-Image-Turbo",
-            "transformer/diffusion_pytorch_model.safetensors.index.json",
-        ),
-        "base": (
-            "Tongyi-MAI/Z-Image",
-            "transformer/diffusion_pytorch_model.safetensors.index.json",
-        ),
-        "turbo-nvfp4": (
-            "Comfy-Org/z_image_turbo",
-            "split_files/diffusion_models/z_image_turbo_nvfp4.safetensors",
-        ),
-    }[name]
-    state_dict = load_hf_state_dict(repo_id, filename)
+def load_zimage(name: str = "z-image-turbo"):
+    spec = MODELS[name]
+    repo_id = spec.repo_id
+    state_dict = load_hf_state_dict(repo_id, spec.filename)
 
     # remap comfy ckpt
     if repo_id.startswith("Comfy-Org/"):
@@ -248,4 +240,6 @@ def load_zimage(name: str = "turbo"):
         model = ZImage()
 
     model.load_state_dict(state_dict, assign=True)
+    if not repo_id.startswith("Comfy-Org/"):  # HF checkpoints are FP32. keep quantized checkpoints as-is
+        model.bfloat16()
     return model

@@ -12,6 +12,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from ..offload import PerLayerOffloadCUDAStream
 from ..qwen3 import Qwen3ForCausalLM
+from ..registry import MODELS
 from ..solvers import get_solver
 from ..vae import load_vae
 from .model import Flux2, load_flux2
@@ -61,21 +62,19 @@ class Flux2Qwen3TextEncoder(nn.Module):
 
 
 class Flux2Pipeline:
-    DEV_DEFAULTS = dict(guidance=4.0, cfg_scale=1.0, num_steps=50)
-    KLEIN_DEFAULTS = dict(guidance=None, cfg_scale=1.0, num_steps=4)
-    KLEIN_BASE_DEFAULTS = dict(guidance=None, cfg_scale=4.0, num_steps=50)
-
     def __init__(
         self,
         flux: Flux2 | None = None,
         text_encoder_id: str = "Qwen/Qwen3-4B-FP8",
         offload_flux: bool = False,
+        sample_defaults: dict | None = None,  # used by generate(). default: flux2-klein-4B
     ) -> None:
-        self.flux = flux or load_flux2()
+        self.model = flux or load_flux2()
+        self.sample_defaults = sample_defaults or MODELS["flux2-klein-4B"].sample_defaults
         self.ae = load_vae("flux2").bfloat16()
         self.text_encoder = Flux2Qwen3TextEncoder(text_encoder_id)
 
-        self.flux_offloader = PerLayerOffloadCUDAStream(self.flux, enable=offload_flux)
+        self.flux_offloader = PerLayerOffloadCUDAStream(self.model, enable=offload_flux)
 
     def cpu(self):
         for m in (self.ae, self.text_encoder, self.flux_offloader):
@@ -87,17 +86,22 @@ class Flux2Pipeline:
             m.cuda()
         return self
 
-    @staticmethod
-    def load(name: str):
-        if "4B" in name:
-            text_id = "Qwen/Qwen3-4B-FP8"
-        elif "9B" in name:
-            text_id = "Qwen/Qwen3-8B-FP8"
-        else:
-            raise ValueError
-        return Flux2Pipeline(load_flux2(name), text_id)
+    @classmethod
+    def load(cls, name: str):
+        spec = MODELS[name]
+        return cls(load_flux2(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
-    # default is for klein
+    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs)
+    def prepare_train_inputs(self, imgs: Tensor, prompts: list[str]) -> tuple[Tensor, dict]:
+        with torch.no_grad():
+            latents = self.ae.encode(imgs)
+        txt = self.text_encoder(prompts)
+        img_rope = self.model.make_img_rope(*latents.shape[1:3])
+        txt_rope = self.model.make_txt_rope(txt.shape[1])
+        rope = torch.cat([txt_rope, img_rope], dim=0)
+        return latents.flatten(1, 2), dict(txt=txt, rope=rope)
+
+    # cfg_scale and num_steps default to self.sample_defaults
     @torch.no_grad()
     def generate(
         self,
@@ -106,13 +110,15 @@ class Flux2Pipeline:
         ref_imgs: list[Image.Image] | None = None,
         img_size: int | tuple[int, int] = 512,
         guidance: Tensor | float | None = None,
-        cfg_scale: float = 1.0,
-        num_steps: int = 4,
+        cfg_scale: float | None = None,
+        num_steps: int | None = None,
         seed: int | None = None,
         solver: str = "euler",
         pbar: bool = False,
         progress_cb: Callable[[int, int], None] | None = None,
     ) -> Tensor:
+        cfg_scale = self.sample_defaults["cfg_scale"] if cfg_scale is None else cfg_scale
+        num_steps = self.sample_defaults["num_steps"] if num_steps is None else num_steps
         txt = self.text_encoder(prompt)
 
         if cfg_scale != 1.0:
@@ -150,7 +156,7 @@ class Flux2Pipeline:
             ref_latents = None
 
         latents = flux2_generate(
-            flux=self.flux,
+            flux=self.model,
             latents=noise,
             ref_latents=ref_latents,
             timesteps=timesteps,

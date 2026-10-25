@@ -11,6 +11,7 @@ from ..attn import dispatch_attn
 from ..flux1.model import timestep_embedding
 from ..flux1.modulate import modulate
 from ..linear import Linear
+from ..registry import MODELS
 from ..rope import apply_rope, compute_rope
 from ..utils import create_remap_hook, load_hf_state_dict
 
@@ -181,12 +182,9 @@ class MOSSImage(nn.Module):
         return self.final_linear_video(y[:, :L_img]).unflatten(1, (H, W))
 
 
-def load_moss_image(name: str = "sft"):
-    repo_id = {
-        "base": "OpenMOSS-Team/MOSS-Image-Base",
-        "sft": "OpenMOSS-Team/MOSS-Image-SFT",
-    }[name]
-    state_dict = load_hf_state_dict(repo_id, "transformer/diffusion_pytorch_model.safetensors.index.json")
+def load_moss_image(name: str = "moss-image-sft"):
+    spec = MODELS[name]
+    state_dict = load_hf_state_dict(spec.repo_id, spec.filename)
     state_dict.pop("rope.bands")  # recomputed in make_rope()
 
     with torch.device("meta"):
