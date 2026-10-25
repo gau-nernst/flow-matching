@@ -99,6 +99,16 @@ class Flux2Pipeline:
             raise ValueError(f"Text encoder for {name} is not supported")
         return cls(load_flux2(name), text_encoder_id)
 
+    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs)
+    def prepare_train_inputs(self, imgs: Tensor, prompts: list[str]) -> tuple[Tensor, dict]:
+        with torch.no_grad():
+            latents = self.ae.encode(imgs, sample=True)
+        txt = self.text_encoder(prompts)
+        img_rope = self.flux.make_img_rope(*latents.shape[1:3])
+        txt_rope = self.flux.make_txt_rope(txt.shape[1])
+        rope = torch.cat([txt_rope, img_rope], dim=0)
+        return latents.flatten(1, 2), dict(txt=txt, rope=rope)
+
     # default is for klein
     @torch.no_grad()
     def generate(

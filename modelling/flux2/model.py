@@ -217,6 +217,10 @@ class Flux2(nn.Module):
         )
         self.final_layer = LastLayer(cfg.dim, 1, cfg.img_dim, bias=False)
 
+    # blocks to add LoRA to
+    def lora_blocks(self) -> list[nn.Module]:
+        return [*self.double_blocks, *self.single_blocks]
+
     # 4D RoPE used in Flux.2
     # main image:         https://github.com/black-forest-labs/flux2/blob/b56ac614/src/flux2/sampling.py#L93
     # conditioned images: https://github.com/black-forest-labs/flux2/blob/b56ac614/src/flux2/sampling.py#L52

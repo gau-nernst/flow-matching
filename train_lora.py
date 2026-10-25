@@ -21,8 +21,7 @@ from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, IterableDataset, default_collate, get_worker_info
 from tqdm import tqdm
 
-from modelling import MODELS, AutoEncoder, Flux2
-from modelling.flux2.pipeline import Flux2Qwen3TextEncoder, flux2_generate, flux2_time_shift
+from modelling import MODELS
 from time_sampler import LogitNormal, Uniform
 from train_utils import EMA, compute_loss, parse_img_size, random_resize, setup_model
 
@@ -95,40 +94,20 @@ class ImageDataset(IterableDataset):
 @torch.no_grad()
 @torch.compiler.set_stance("force_eager")
 def save_images(
-    model: Flux2,
-    ae: AutoEncoder,
-    text_embedder: Flux2Qwen3TextEncoder,
+    pipeline,
     prompt_path: str,
     save_dir: Path,
     img_size: tuple[int, int],
     batch_size: int = 4,
-    num_steps: int = 4,
-    cfg_scale: float = 1.0,
+    **sample_kwargs,
 ):
-    model.eval()
+    pipeline.model.eval()
     prompts = [line.rstrip() for line in open(prompt_path, encoding="utf-8")]
     save_dir.mkdir(parents=True, exist_ok=True)
-    rng = torch.Generator("cuda").manual_seed(2024)
 
     for offset in tqdm(range(0, len(prompts), batch_size), "Generating images", dynamic_ncols=True):
         curr_prompts = prompts[offset : offset + batch_size]
-        conds = text_embedder(curr_prompts)
-        neg_conds = text_embedder([""] * len(curr_prompts)) if cfg_scale != 1.0 else None
-
-        shape = (
-            len(curr_prompts),
-            img_size[0] // ae.downsample // 2,
-            img_size[1] // ae.downsample // 2,
-            ae.cfg.z_dim * 4,
-        )
-        noise = torch.randn(shape, device="cuda", generator=rng)
-
-        timesteps = torch.linspace(1.0, 0.0, num_steps + 1)
-        timesteps = flux2_time_shift(timesteps, num_steps, shape[1] * shape[2])
-        timesteps = timesteps.tolist()
-
-        latents = flux2_generate(model, noise, timesteps, conds, neg_conds, cfg_scale=cfg_scale)
-        imgs = ae.decode(latents, uint8=True).cpu()
+        imgs = pipeline.generate(curr_prompts, img_size=img_size, seed=2024 + offset, **sample_kwargs).cpu()
         for img_idx in range(imgs.shape[0]):
             save_path = save_dir / f"{offset + img_idx:04d}.webp"
             Image.fromarray(imgs[img_idx].numpy()).save(save_path, lossless=True)
@@ -194,9 +173,8 @@ if __name__ == "__main__":
         train_dloader = create_dloader(args.train_ds, batch_size)
         distill_dloader = None
 
-    model, ae, text_embedder = setup_model(
-        args.model, args.lora, args.fp8, args.compile, args.mem_budget, args.ckpt_ratio
-    )
+    pipeline = setup_model(args.model, args.lora, args.fp8, args.compile, args.mem_budget, args.ckpt_ratio)
+    model = pipeline.model
     ema = EMA(model) if args.ema else None
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
     logger.info(model)
@@ -227,9 +205,7 @@ if __name__ == "__main__":
     # inference before any training
     if step == 0 and not args.profile:
         save_images(
-            model,
-            ae,
-            text_embedder,
+            pipeline,
             args.test_prompt_path,
             img_dir / f"step{step:06d}",
             args.test_img_size,
@@ -258,16 +234,7 @@ if __name__ == "__main__":
                 imgs = torch.cat([imgs, distill_imgs], dim=0)
                 prompts = prompts + distill_prompts
 
-            with torch.no_grad():
-                latents = ae.encode(imgs.cuda(), sample=True)
-
-            txt = text_embedder(prompts)
-            img_rope = model.make_img_rope(*latents.shape[1:3])
-            txt_rope = model.make_txt_rope(txt.shape[1])
-            rope = torch.cat([txt_rope, img_rope], dim=0)
-            model_kwargs = dict(txt=txt, rope=rope)
-            latents = latents.flatten(1, 2)
-
+            latents, model_kwargs = pipeline.prepare_train_inputs(imgs.cuda(), prompts)
             loss = compute_loss(model, latents, time_sampler, model_kwargs)
             loss.div(args.gradient_accumulation).backward()
 
@@ -310,9 +277,7 @@ if __name__ == "__main__":
             torch.save(ckpt, ckpt_dir / f"step{step:06d}.pth")
 
             save_images(
-                model,
-                ae,
-                text_embedder,
+                pipeline,
                 args.test_prompt_path,
                 img_dir / f"step{step:06d}",
                 args.test_img_size,
@@ -321,9 +286,7 @@ if __name__ == "__main__":
             if ema is not None:
                 ema.swap_params()
                 save_images(
-                    model,
-                    ae,
-                    text_embedder,
+                    pipeline,
                     args.test_prompt_path,
                     img_dir / f"step{step:06d}_ema",
                     args.test_img_size,

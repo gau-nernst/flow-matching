@@ -158,6 +158,10 @@ class ZImage(nn.Module):
         self.all_final_layer = nn.ModuleDict()
         self.all_final_layer["2-1"] = FinalLayer(cfg.dim, patchified_dim)
 
+    # blocks to add LoRA to
+    def lora_blocks(self) -> list[nn.Module]:
+        return list(self.layers)
+
     @staticmethod
     def _pad_tokens(x: Tensor, pad_token: Tensor):
         """Pad to a multiple of 32"""

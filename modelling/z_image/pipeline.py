@@ -83,6 +83,13 @@ class ZImagePipeline:
         # TODO: use varlen attention instead
         # return [txt_embeds[i, mask[i]] for i in range(len(formatted_prompts))]
 
+    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs)
+    @torch.no_grad()
+    def prepare_train_inputs(self, imgs: Tensor, prompts: list[str]) -> tuple[Tensor, dict]:
+        latents = self.ae.encode(imgs, sample=True)
+        txt = self.embed_text(self.tokenizer, self.qwen3, prompts)
+        return latents, dict(txt=txt)
+
     @torch.no_grad()
     def generate(
         self,
