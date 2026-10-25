@@ -229,8 +229,8 @@ if __name__ == "__main__":
                 imgs = imgs + distill_imgs
                 prompts = prompts + distill_prompts
 
-            latents, model_kwargs = pipeline.prepare_train_inputs([x.cuda() for x in imgs], prompts)
-            loss = compute_loss(model, latents, time_sampler, model_kwargs)
+            latents, cond = pipeline.prepare_train_inputs([x.cuda() for x in imgs], prompts)
+            loss = compute_loss(model, latents, time_sampler, cond)
             loss.div(args.gradient_accumulation).backward()
 
         if step % args.log_interval == 0:

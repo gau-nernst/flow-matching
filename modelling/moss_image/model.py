@@ -1,5 +1,6 @@
 # https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT/blob/f972bd4/transformer/pipeline_moss_image.py
 
+from functools import partial
 from typing import NamedTuple
 
 import torch
@@ -14,7 +15,7 @@ from ..linear import Linear
 from ..registry import MODELS
 from ..rope import apply_rope, compute_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-from ..varlen import Joint, Varlen, merge, seq_ids, split
+from ..varlen import Varlen, VarlenInfo, merge, prepare_inputs, seq_ids, split, unpatchify_outputs
 
 HEAD_DIM = 128
 
@@ -162,28 +163,36 @@ class MOSSImage(nn.Module):
         ids = torch.cat([img_ids, txt_ids])
         return torch.cat([compute_rope(ids[:, i], HEAD_DIM // 4, 10_000.0) for i in range(4)], dim=-1)
 
+    # latents: [B, H, W, C] (dense) or a list of [H_i, W_i, C] (packed). txt: unpadded
+    def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
+        device = latents[0].device
+        return prepare_inputs(latents, txt, partial(self.make_rope, device=device), 1, txt_first=False)
+
+    def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
+        return unpatchify_outputs(out, sizes, 1)
+
     def forward(
         self,
         img: Tensor,
-        time: Tensor,
+        t: Tensor,
         txt: Tensor,
         rope: Tensor,
-        varlen: Joint | None = None,
+        varlen: VarlenInfo | None = None,
         skip_layers: tuple[int, ...] = (),
     ) -> Tensor:
-        # img: [B, L, C], or [T, C] packed with varlen. txt: unpadded. rope: [img, txt]
+        # img: [B, L_img, C], or [L_img, C] packed. inputs are from prepare()
         # skip_layers: blocks to skip, for the negative branch of CFG
         packed = varlen is not None
         if packed:
             img, txt = img[None], txt[None]
-            N = varlen.varlen.num_seqs
-            txt_varlen, joint_varlen = varlen.b, varlen.varlen
+            N = varlen.joint.num_seqs
+            txt_varlen, joint_varlen = varlen.txt, varlen.joint
         else:
             N = -1  # keep t's shape
             txt_varlen = joint_varlen = None
         dtype = self.video_embedder.weight.dtype
 
-        vec = self.time_embedding(timestep_embedding(time.expand(N), 256).to(dtype))
+        vec = self.time_embedding(timestep_embedding(t.expand(N), 256).to(dtype))
         mod = self.shared_block_modulation(vec).unflatten(1, (6, -1))  # [N, 6, D]
         shift, scale = self.video_head_modulation(vec).unflatten(1, (2, -1)).unbind(1)  # [N, D] each
 

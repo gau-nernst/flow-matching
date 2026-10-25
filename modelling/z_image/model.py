@@ -14,7 +14,7 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_weight_merge_hook, load_hf_state_dict
-from ..varlen import Joint, Varlen, merge, per_token, seq_ids, split
+from ..varlen import Varlen, VarlenInfo, merge, per_token, prepare_inputs, seq_ids, split, unpatchify_outputs
 from .gated_norm import gated_norm
 
 SEQ_MULTIPLE = 32  # pad each sample's image and text to a multiple of this
@@ -182,72 +182,66 @@ class ZImage(nn.Module):
         txt_rope = self.pos_embed.create((1, 0, 0), (L_txt, 1, 1))
         return torch.cat([img_rope, pad_rope, txt_rope])
 
-    def forward(self, img: Tensor, timesteps: Tensor, txt: Tensor, rope: Tensor, varlen: Joint | None = None) -> Tensor:
+    # latents: [B, H, W, C] (dense) or a list of [H_i, W_i, C] (packed). txt: unpadded
+    def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
+        p = self.cfg.patch_size
+        return prepare_inputs(latents, txt, self.make_rope, p, txt_first=False, pad_multiple=SEQ_MULTIPLE)
+
+    def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
+        return unpatchify_outputs(out, sizes, self.cfg.patch_size)
+
+    def forward(self, img: Tensor, t: Tensor, txt: Tensor, rope: Tensor, varlen: VarlenInfo | None = None) -> Tensor:
         # inputs/outputs follow the repo convention: t=1 is noise, predict velocity (noise - data).
         # the original Z-Image uses t=0 as noise and predicts (data - noise), so flip both t and v.
-        #
-        # img: [B, L, p*p*C], or [T, p*p*C] packed with varlen. txt: unpadded. rope: from make_rope()
+        # img: [B, L_img, p*p*C], or [L_img, p*p*C] packed. inputs are from prepare()
         packed = varlen is not None
         if packed:
             img, txt = img[None], txt[None]
-            N = varlen.varlen.num_seqs
+            N = varlen.joint.num_seqs
+            txt_varlen, img_varlen, joint_varlen = varlen.txt, varlen.img, varlen.joint
         else:
             N = -1  # keep t's shape
+            txt_varlen = img_varlen = joint_varlen = None
+        L_img = img.shape[1]
 
-        t_embeds = timestep_embedding(1 - timesteps.expand(N), 256)
+        t_embeds = timestep_embedding(1 - t.expand(N), 256)
         t_embeds = self.t_embedder(t_embeds.to(self.t_embedder[0][0].weight.dtype))  # [N, mod_dim]
 
-        # pad with learned tokens, so it must happen after embedding
-        if packed:
-            img_lens, txt_lens = varlen.a.lens, varlen.b.lens
-            pad_img_lens, pad_txt_lens = [_round_up(L) for L in img_lens], [_round_up(L) for L in txt_lens]
-            joint = Joint.from_lens(pad_img_lens, pad_txt_lens, img.device)
-            img_varlen, txt_varlen = joint.a, joint.b
-        else:
-            img_lens, txt_lens = [img.shape[1]], [txt.shape[1]]
-            img_varlen = txt_varlen = joint = None
-        img_rope, txt_rope = split(rope, _round_up(img_lens[0]), joint, dim=0)
-
         # text-only processing
-        txt = _pad(self.cap_embedder(txt), txt_lens, self.cap_pad_token)
+        txt = _pad(self.cap_embedder(txt), self.cap_pad_token, varlen.txt_unpad if packed else None, txt_varlen)
+        img_rope, txt_rope = split(rope, rope.shape[0] - txt.shape[1], varlen, dim=0)
         for layer in self.context_refiner:
             txt = layer(txt, None, txt_rope, txt_varlen)
 
         # image-only processing
         img = self.all_x_embedder["2-1"](img.to(self.all_x_embedder["2-1"].weight.dtype))
-        img = _pad(img, img_lens, self.x_pad_token)
+        img = _pad(img, self.x_pad_token, varlen.img_unpad if packed else None, img_varlen)
         for layer in self.noise_refiner:
             img = layer(img, t_embeds, img_rope, img_varlen)
 
         # joint processing. each sample is [img, txt]
-        unified = merge(img, txt, joint)
-        joint_varlen = joint.varlen if joint is not None else None
+        unified = merge(img, txt, varlen)
         for layer in self.layers:
             unified = layer(unified, t_embeds, rope, joint_varlen)
+        img = split(unified, img.shape[1], varlen)[0]
 
-        # keep image tokens without padding
-        img = split(unified, img.shape[1], joint)[0]
         if packed:
-            img = torch.cat([x[:, :L] for x, L in zip(img.split(pad_img_lens, dim=1), img_lens)], dim=1)
-            out_varlen = varlen.a
+            img = self.all_final_layer["2-1"](img, t_embeds, img_varlen).index_select(1, varlen.img_unpad)[0]
         else:
-            img = img[:, : img_lens[0]]
-            out_varlen = None
-        img = self.all_final_layer["2-1"](img, t_embeds, out_varlen)
-        return -img[0] if packed else -img
+            img = self.all_final_layer["2-1"](img[:, :L_img], t_embeds)
+        return -img
 
 
 def _round_up(L: int) -> int:
     return -(-L // SEQ_MULTIPLE) * SEQ_MULTIPLE
 
 
-def _pad(x: Tensor, lens: list[int], pad_token: Tensor) -> Tensor:
-    B = x.shape[0]
-    xs = x.split(lens, dim=1) if len(lens) > 1 else [x]
-    out = []
-    for x_, L in zip(xs, lens):
-        out += [x_, pad_token.expand(B, _round_up(L) - L, -1).to(x_.dtype)]
-    return torch.cat(out, dim=1)
+# unpad: positions of real tokens, for packed input
+def _pad(x: Tensor, pad_token: Tensor, unpad: Tensor | None, varlen: Varlen | None) -> Tensor:
+    if unpad is None:
+        pad = pad_token.expand(x.shape[0], _round_up(x.shape[1]) - x.shape[1], -1)
+        return torch.cat([x, pad.to(x.dtype)], dim=1)
+    return pad_token.to(x.dtype).expand(1, varlen.seq_ids.shape[0], -1).index_copy(1, unpad, x)
 
 
 def load_zimage(name: str = "z-image-turbo"):

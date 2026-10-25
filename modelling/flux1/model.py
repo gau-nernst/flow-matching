@@ -12,7 +12,7 @@ from ..attn import dispatch_attn
 from ..linear import Linear
 from ..rope import RopeND, apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-from ..varlen import Joint, Varlen, merge, per_token, seq_ids, split
+from ..varlen import Varlen, VarlenInfo, merge, per_token, prepare_inputs, seq_ids, split, unpatchify_outputs
 from .modulate import modulate
 
 
@@ -89,9 +89,10 @@ class DoubleStreamBlock(nn.Module):
         self.img_mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(approximate="tanh"), nn.Linear(mlp_dim, dim))
         self.txt_mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(approximate="tanh"), nn.Linear(mlp_dim, dim))
 
-    # joint: [txt, img] per sample
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, joint: Joint | None) -> tuple[Tensor, Tensor]:
-        txt_varlen, img_varlen = (joint.a, joint.b) if joint is not None else (None, None)
+    def forward(
+        self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, varlen: VarlenInfo | None
+    ) -> tuple[Tensor, Tensor]:
+        txt_varlen, img_varlen = (varlen.txt, varlen.img) if varlen is not None else (None, None)
         img_idx, txt_idx = seq_ids(img_varlen), seq_ids(txt_varlen)
         img_shift1, img_scale1, img_gate1, img_shift2, img_scale2, img_gate2 = self.img_mod(vec)
         txt_shift1, txt_scale1, txt_gate1, txt_shift2, txt_scale2, txt_gate2 = self.txt_mod(vec)
@@ -101,11 +102,11 @@ class DoubleStreamBlock(nn.Module):
         img_q, img_k, img_v = self.img_attn.forward_qkv(img_mod1)
         txt_q, txt_k, txt_v = self.txt_attn.forward_qkv(txt_mod1)
 
-        q = apply_rope(merge(txt_q, img_q, joint), pe)
-        k = apply_rope(merge(txt_k, img_k, joint), pe)
-        v = merge(txt_v, img_v, joint)
-        attn = dispatch_attn(q, k, v, self.attn_impl, joint.varlen if joint is not None else None).flatten(2)
-        txt_attn, img_attn = split(attn, txt.shape[1], joint)
+        q = apply_rope(merge(txt_q, img_q, varlen), pe)
+        k = apply_rope(merge(txt_k, img_k, varlen), pe)
+        v = merge(txt_v, img_v, varlen)
+        attn = dispatch_attn(q, k, v, self.attn_impl, varlen.joint if varlen is not None else None).flatten(2)
+        txt_attn, img_attn = split(attn, txt.shape[1], varlen)
 
         img = torch.addcmul(img, per_token(img_gate1, img_varlen), self.img_attn.proj(img_attn))
         img_mod2 = modulate(img, img_shift2, img_scale2, idx=img_idx)[0]
@@ -220,6 +221,15 @@ class Flux1(nn.Module):
         txt_rope = self.pos_embed.create((0, 0, 0), (1, 1, 1)).expand(L, -1)
         return torch.cat([txt_rope, img_rope], dim=0)
 
+    # latents: [B, H, W, C] (dense) or a list of [H_i, W_i, C] (packed)
+    def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor], vec: Tensor) -> tuple[Tensor, dict]:
+        p = self.cfg.patch_size
+        img, kwargs = prepare_inputs(latents, txt, self.make_rope, p, txt_first=True, channels_first=True)
+        return img, dict(kwargs, vec=vec)
+
+    def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
+        return unpatchify_outputs(out, sizes, self.cfg.patch_size, channels_first=True)
+
     def forward(
         self,
         img: Tensor,
@@ -228,14 +238,14 @@ class Flux1(nn.Module):
         rope: Tensor,
         vec: Tensor,
         guidance: Tensor | None = None,
-        varlen: Joint | None = None,
+        varlen: VarlenInfo | None = None,
     ) -> Tensor:
-        # img: [B, L, C*p*p] from patchify(channels_first=True), or [T, C*p*p] packed with varlen
+        # img: [B, L_img, C*p*p], or [L_img, C*p*p] packed. inputs are from prepare()
         packed = varlen is not None
         if packed:
             img, txt = img[None], txt[None]
-            N = varlen.varlen.num_seqs
-            img_varlen, joint_varlen = varlen.b, varlen.varlen
+            N = varlen.joint.num_seqs
+            img_varlen, joint_varlen = varlen.img, varlen.joint
         else:
             N = -1  # keep t's shape
             img_varlen = joint_varlen = None

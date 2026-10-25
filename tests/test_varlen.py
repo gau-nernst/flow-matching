@@ -8,7 +8,7 @@ from torch import Tensor, nn
 
 import modelling.attn
 from modelling.flux1.model import timestep_embedding
-from modelling.varlen import Varlen, pack, patchify, unpatchify, varlen_attn
+from modelling.varlen import Varlen, patchify, unpatchify, varlen_attn
 from modelling.z_image.gated_norm import gated_norm
 from modelling.z_image.model import ZImage, ZImageConfig
 
@@ -104,34 +104,32 @@ def test_patchify():
     torch.testing.assert_close(patchify(x, 2, channels_first=True), flux1)
 
 
-# extra: per-sample [N, ...] inputs
-def assert_packed_matches_single(model, imgs, txts, ropes, t, txt_first, extra=None, **kwargs):
+def run(model, latents, t, txt, extra, **kwargs):
+    img, model_kwargs = model.prepare(latents, txt, **extra)
+    sizes = latents.shape[1:3] if isinstance(latents, Tensor) else [x.shape[:2] for x in latents]
+    return model.unpatchify(model(img, t, **model_kwargs, **kwargs), sizes)
+
+
+# packed forward == dense forward of each sample. extra: per-sample [N, ...] prepare() inputs
+def assert_packed_matches_single(model, latents, txts, t, extra=None, **kwargs):
     extra = extra or {}
-    img, model_kwargs = pack(imgs, txts, ropes, txt_first)
-    out = model(img, t, **model_kwargs, **extra, **kwargs)
-    assert out.shape == img.shape, (out.shape, img.shape)
-    outs = out.split([x.shape[0] for x in imgs])
-    for i in range(len(imgs)):
+    outs = run(model, latents, t, txts, extra, **kwargs)
+    for i, x in enumerate(latents):
         extra_i = {k: v[i : i + 1] for k, v in extra.items()}
-        (expected,) = model(imgs[i][None], t[i : i + 1], txts[i][None], ropes[i], **extra_i, **kwargs)
+        (expected,) = run(model, x[None], t[i : i + 1], txts[i][None], extra_i, **kwargs)
+        assert outs[i].shape == x.shape, (outs[i].shape, x.shape)
         torch.testing.assert_close(outs[i], expected, atol=1e-5, rtol=1e-5)
 
 
-def assert_dense_matches_single(model, img, t, txt, rope, **kwargs):
-    out = model(img, t, txt, rope, **kwargs)
-    assert out.shape == img.shape, (out.shape, img.shape)
-    for i in range(img.shape[0]):
-        kwargs_i = {k: v[i : i + 1] if isinstance(v, Tensor) and v.shape[0] > 1 else v for k, v in kwargs.items()}
+def assert_dense_matches_single(model, latents, t, txt, extra=None, **kwargs):
+    extra = extra or {}
+    out = run(model, latents, t, txt, extra, **kwargs)
+    assert out.shape == latents.shape, (out.shape, latents.shape)
+    for i in range(latents.shape[0]):
+        extra_i = {k: v[i : i + 1] for k, v in extra.items()}
         t_i = t[i : i + 1] if t.shape[0] > 1 else t
-        (expected,) = model(img[i : i + 1], t_i, txt[i : i + 1], rope, **kwargs_i)
+        (expected,) = run(model, latents[i : i + 1], t_i, txt[i : i + 1], extra_i, **kwargs)
         torch.testing.assert_close(out[i], expected, atol=1e-5, rtol=1e-5)
-
-
-def zimage_inputs(model: ZImage, sizes, txt_lens):
-    imgs = [patchify(torch.randn(H, W, 16), 2) for H, W in sizes]
-    txts = [torch.randn(L, 64) for L in txt_lens]
-    ropes = [model.make_rope(H // 2, W // 2, L) for (H, W), L in zip(sizes, txt_lens)]
-    return imgs, txts, ropes
 
 
 @torch.enable_grad()  # use the eager paths of custom ops
@@ -142,39 +140,37 @@ def test_zimage_matches_main():
         img = torch.randn(1, H, W, 16)
         txt = torch.randn(1, L, 64)
         t = torch.tensor([0.3])
-        out = model(patchify(img, 2), t, txt, model.make_rope(H // 2, W // 2, L))
-        torch.testing.assert_close(unpatchify(out, H // 2, W // 2, 2), dense_reference(model, img, t, txt))
+        torch.testing.assert_close(run(model, img, t, txt, {}), dense_reference(model, img, t, txt))
 
 
 @torch.enable_grad()
 def test_zimage_packed():
     # 6x6 = 36 image tokens need padding
     model = tiny_zimage()
-    imgs, txts, ropes = zimage_inputs(model, [(12, 12), (16, 24), (8, 40)], [3, 33, 64])
-    assert_packed_matches_single(model, imgs, txts, ropes, torch.tensor([0.1, 0.5, 1.0]), txt_first=False)
+    latents = [torch.randn(H, W, 16) for H, W in [(12, 12), (16, 24), (8, 40)]]
+    txts = [torch.randn(L, 64) for L in (3, 33, 64)]
+    assert_packed_matches_single(model, latents, txts, torch.tensor([0.1, 0.5, 1.0]))
 
 
 @torch.enable_grad()
 def test_zimage_dense_batch():
     model = tiny_zimage()
-    imgs, txts, ropes = zimage_inputs(model, [(12, 12)] * 2, [7, 7])
     for t in (torch.tensor([0.5]), torch.tensor([0.2, 0.7])):
-        assert_dense_matches_single(model, torch.stack(imgs), t, torch.stack(txts), ropes[0])
+        assert_dense_matches_single(model, torch.randn(2, 12, 12, 16), t, torch.randn(2, 7, 64))
 
 
 def test_zimage_packed_grads():
     model = tiny_zimage()
-    imgs, txts, ropes = zimage_inputs(model, [(16, 16), (12, 20)], [9, 45])
+    latents = [torch.randn(H, W, 16) for H, W in [(16, 16), (12, 20)]]
+    txts = [torch.randn(L, 64) for L in (9, 45)]
     t = torch.tensor([0.2, 0.7])
 
-    img, model_kwargs = pack(imgs, txts, ropes, txt_first=False)
-    out = model(img, t, **model_kwargs).split([x.shape[0] for x in imgs])
-    sum(x.square().mean() for x in out).backward()
+    sum(x.square().mean() for x in run(model, latents, t, txts, {})).backward()
     grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
 
     model.zero_grad()
     for i in range(2):
-        model(imgs[i][None], t[i : i + 1], txts[i][None], ropes[i]).square().mean().backward()
+        run(model, latents[i][None], t[i : i + 1], txts[i][None], {}).square().mean().backward()
     for n, p in model.named_parameters():
         if n in grads:
             torch.testing.assert_close(grads[n], p.grad, atol=1e-5, rtol=1e-4, msg=n)
@@ -255,21 +251,19 @@ def tiny_flux2():
     return init_random(Flux2(cfg))
 
 
-def flux2_inputs(model, sizes, txt_lens):
-    imgs = [torch.randn(h * w, 32) for h, w in sizes]
-    txts = [torch.randn(L, 64) for L in txt_lens]
-    ropes = [torch.cat([model.make_txt_rope(L), model.make_img_rope(h, w)]) for (h, w), L in zip(sizes, txt_lens)]
-    return imgs, txts, ropes
-
-
 @torch.enable_grad()
 def test_flux2():
     model = tiny_flux2()
-    imgs, txts, ropes = flux2_inputs(model, [(8, 8), (6, 10), (12, 4)], [16, 16, 16])
-    t = torch.tensor([0.2, 0.5, 0.8])
-    assert_packed_matches_single(model, imgs, txts, ropes, t, txt_first=True)
-    img = torch.stack([imgs[0], imgs[0] * 0.5])
-    assert_dense_matches_single(model, img, torch.tensor([0.3]), torch.stack(txts[:2]), ropes[0])
+    latents = [torch.randn(h, w, 32) for h, w in [(8, 8), (6, 10), (12, 4)]]
+    txts = [torch.randn(16, 64) for _ in latents]
+    assert_packed_matches_single(model, latents, txts, torch.tensor([0.2, 0.5, 0.8]))
+    assert_dense_matches_single(model, torch.randn(2, 8, 8, 32), torch.tensor([0.3]), torch.randn(2, 16, 64))
+
+    # reference images, dense only
+    ref = [torch.randn(4, 6, 32), torch.randn(8, 2, 32)]
+    img, kwargs = model.prepare(torch.randn(2, 8, 8, 32), torch.randn(2, 16, 64), ref=ref)
+    assert kwargs["rope"].shape[0] == 16 + 64 + 24 + 16
+    assert model(img, torch.tensor([0.3]), **kwargs).shape == img.shape
 
 
 def tiny_flux1():
@@ -282,16 +276,14 @@ def tiny_flux1():
 @torch.enable_grad()
 def test_flux1():
     model = tiny_flux1()
-    sizes = [(8, 8), (6, 10), (4, 12)]
-    imgs = [torch.randn(h * w, 16) for h, w in sizes]
-    txts = [torch.randn(10, 64) for _ in sizes]
-    ropes = [model.make_rope(h, w, 10) for h, w in sizes]
+    latents = [torch.randn(H, W, 4) for H, W in [(16, 16), (12, 20), (8, 24)]]
+    txts = [torch.randn(10, 64) for _ in latents]
     vec = torch.randn(3, 32)
     t = torch.tensor([0.2, 0.5, 0.8])
     guidance = torch.tensor([3.5])
-    assert_packed_matches_single(model, imgs, txts, ropes, t, txt_first=True, extra=dict(vec=vec), guidance=guidance)
-    img = torch.stack([imgs[0], imgs[0]])
-    assert_dense_matches_single(model, img, t[:2], torch.stack(txts[:2]), ropes[0], vec=vec[:2], guidance=guidance)
+    assert_packed_matches_single(model, latents, txts, t, extra=dict(vec=vec), guidance=guidance)
+    latents = torch.randn(2, 16, 12, 4)
+    assert_dense_matches_single(model, latents, t[:2], torch.randn(2, 10, 64), dict(vec=vec[:2]), guidance=guidance)
 
 
 def tiny_moss():
@@ -304,16 +296,12 @@ def tiny_moss():
 @torch.enable_grad()
 def test_moss():
     model = tiny_moss()
-    sizes = [(8, 8), (6, 10), (4, 12)]
-    txt_lens = [5, 23, 12]
-    imgs = [torch.randn(h * w, 32) for h, w in sizes]
-    txts = [torch.randn(L, 64) for L in txt_lens]
-    ropes = [model.make_rope(h, w, L) for (h, w), L in zip(sizes, txt_lens)]
+    latents = [torch.randn(h, w, 32) for h, w in [(8, 8), (6, 10), (4, 12)]]
+    txts = [torch.randn(L, 64) for L in (5, 23, 12)]
     t = torch.tensor([0.2, 0.5, 0.8])
     for skip_layers in ((), (1,)):
-        assert_packed_matches_single(model, imgs, txts, ropes, t, txt_first=False, skip_layers=skip_layers)
-    txt = torch.stack([txts[0], txts[0] * 0.5])
-    assert_dense_matches_single(model, torch.stack([imgs[0], imgs[0]]), torch.tensor([0.4]), txt, ropes[0])
+        assert_packed_matches_single(model, latents, txts, t, skip_layers=skip_layers)
+    assert_dense_matches_single(model, torch.randn(2, 6, 8, 32), torch.tensor([0.4]), torch.randn(2, 7, 64))
 
 
 @torch.enable_grad()
@@ -322,10 +310,11 @@ def test_compute_loss_multires():
     from train_utils import compute_loss
 
     model = tiny_zimage()
-    latents, txts, ropes = zimage_inputs(model, [(16, 16), (12, 20)], [9, 45])
+    latents = [torch.randn(H, W, 16) for H, W in [(16, 16), (12, 20)]]
+    txts = [torch.randn(L, 64) for L in (9, 45)]
 
     torch.manual_seed(1)
-    loss = compute_loss(model, latents, Uniform(), pack(latents, txts, ropes, txt_first=False)[1])
+    loss = compute_loss(model, latents, Uniform(), dict(txt=txts))
     loss.backward()
     grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
 
@@ -336,7 +325,7 @@ def test_compute_loss_multires():
     noise = [torch.randn_like(x) for x in latents]
     losses = []
     for i in range(2):
-        (v,) = model(latents[i].lerp(noise[i], t[i])[None], t[i : i + 1], txts[i][None], ropes[i])
+        (v,) = run(model, latents[i].lerp(noise[i], t[i])[None], t[i : i + 1], txts[i][None], {})
         losses.append(F.mse_loss(noise[i] - latents[i], v))
     expected = torch.stack(losses).mean()
     expected.backward()

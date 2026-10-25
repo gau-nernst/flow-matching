@@ -47,13 +47,14 @@ def setup_model(
     return pipeline
 
 
-# latents, model_kwargs: from pipeline.prepare_train_inputs()
-def compute_loss(model: nn.Module, latents: list[Tensor], time_sampler: TimeSampler, model_kwargs: dict) -> Tensor:
-    t_vec = time_sampler(len(latents), device=latents[0].device)
+# latents, cond: from pipeline.prepare_train_inputs()
+def compute_loss(model: nn.Module, latents: list[Tensor], time_sampler: TimeSampler, cond: dict) -> Tensor:
+    t = time_sampler(len(latents), device=latents[0].device)
     noise = [torch.randn_like(x) for x in latents]
-    interpolate = [x.lerp(n, t) for x, n, t in zip(latents, noise, t_vec)]
+    noisy = [x.lerp(n, t_) for x, n, t_ in zip(latents, noise, t)]
 
-    v = model(torch.cat(interpolate), t_vec, **model_kwargs).split([x.shape[0] for x in latents])
+    img, kwargs = model.prepare(noisy, **cond)
+    v = model.unpatchify(model(img, t, **kwargs), [x.shape[:2] for x in latents])
 
     # rectified flow loss. predict velocity from latents (t=0) to noise (t=1).
     # each sample has the same weight regardless of resolution

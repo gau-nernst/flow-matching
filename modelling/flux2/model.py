@@ -15,7 +15,18 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-from ..varlen import Joint, Varlen, is_packed, merge, per_token, seq_ids, split
+from ..varlen import (
+    Varlen,
+    VarlenInfo,
+    is_packed,
+    merge,
+    patchify,
+    per_token,
+    prepare_inputs,
+    seq_ids,
+    split,
+    unpatchify_outputs,
+)
 
 
 class MLP(nn.ModuleList):
@@ -88,13 +99,13 @@ class DoubleStreamBlock(nn.Module):
         img_x: Tensor,
         pe: tuple[Tensor, Tensor],
         norms: tuple[Tensor, Tensor],
-        joint: Joint | None,
+        varlen: VarlenInfo | None,
     ) -> Tensor:
         qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else txt_x.dtype
         txt_pe, img_pe = pe
         txt_norm, img_norm = norms
 
-        if not is_packed(joint):
+        if not is_packed(varlen):
             # write into a pre-allocated buffer to avoid torch.cat()
             Ltxt = txt_x.shape[1]
             out = txt_x.new_empty(txt_x.shape[0], Ltxt + img_x.shape[1], *txt_x.shape[2:], dtype=qk_dtype)
@@ -104,9 +115,9 @@ class DoubleStreamBlock(nn.Module):
 
         txt_x = apply_rope(txt_x, txt_pe, txt_norm, self.eps)
         img_x = apply_rope(img_x, img_pe, img_norm, self.eps)
-        return merge(txt_x, img_x, joint).to(qk_dtype)
+        return merge(txt_x, img_x, varlen).to(qk_dtype)
 
-    # pe: (txt_pe, img_pe). joint: [txt, img] per sample
+    # pe: (txt_pe, img_pe)
     def forward(
         self,
         img: Tensor,
@@ -116,9 +127,9 @@ class DoubleStreamBlock(nn.Module):
         pe: tuple[Tensor, Tensor],
         mod_img: tuple[Tensor, ...],
         mod_txt: tuple[Tensor, ...],
-        joint: Joint | None,
+        varlen: VarlenInfo | None,
     ) -> tuple[Tensor, Tensor]:
-        txt_idx, img_idx = (seq_ids(joint.a), seq_ids(joint.b)) if joint is not None else (None, None)
+        txt_idx, img_idx = (seq_ids(varlen.txt), seq_ids(varlen.img)) if varlen is not None else (None, None)
         img_shift1, img_scale1, img_gate1, img_shift2, img_scale2, img_gate2 = mod_img
         txt_shift1, txt_scale1, txt_gate1, txt_shift2, txt_scale2, txt_gate2 = mod_txt
 
@@ -127,11 +138,11 @@ class DoubleStreamBlock(nn.Module):
         img_q, img_k, img_v = self.img_attn.qkv(img_res).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
         txt_q, txt_k, txt_v = self.txt_attn.qkv(txt_res).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
 
-        q = self._rope_joint(txt_q, img_q, pe, (self.txt_attn.q_norm, self.img_attn.q_norm), joint)
-        k = self._rope_joint(txt_k, img_k, pe, (self.txt_attn.k_norm, self.img_attn.k_norm), joint)
-        v = merge(txt_v, img_v, joint)
-        attn = dispatch_attn(q, k, v, self.attn_impl, joint.varlen if joint is not None else None).flatten(2)
-        txt_attn, img_attn = split(attn, txt.shape[1], joint)
+        q = self._rope_joint(txt_q, img_q, pe, (self.txt_attn.q_norm, self.img_attn.q_norm), varlen)
+        k = self._rope_joint(txt_k, img_k, pe, (self.txt_attn.k_norm, self.img_attn.k_norm), varlen)
+        v = merge(txt_v, img_v, varlen)
+        attn = dispatch_attn(q, k, v, self.attn_impl, varlen.joint if varlen is not None else None).flatten(2)
+        txt_attn, img_attn = split(attn, txt.shape[1], varlen)
 
         img_res, img = modulate(img, img_shift2, img_scale2, self.img_attn.proj(img_attn), img_gate1, idx=img_idx)
         txt_res, txt = modulate(txt, txt_shift2, txt_scale2, self.txt_attn.proj(txt_attn), txt_gate1, idx=txt_idx)
@@ -253,30 +264,52 @@ class Flux2(nn.Module):
     def make_txt_rope(self, L: int):
         return self.pos_embed.create((0, 0, 0, 0), (1, 1, 1, L))
 
+    def make_rope(self, H: int, W: int, L_txt: int) -> Tensor:
+        return torch.cat([self.make_txt_rope(L_txt), self.make_img_rope(H, W)])
+
+    # latents: [B, H, W, C] (dense) or a list of [H_i, W_i, C] (packed). ref: dense only
+    def prepare(
+        self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor], ref: list[Tensor] | None = None
+    ) -> tuple[Tensor, dict]:
+        img, kwargs = prepare_inputs(latents, txt, self.make_rope, 1, txt_first=True)
+        if ref:
+            assert isinstance(latents, Tensor), "ref is only supported for a dense batch"
+            ref_rope = [self.make_img_rope(*x.shape[:2], t=10 * (i + 1)) for i, x in enumerate(ref)]
+            kwargs["rope"] = torch.cat([kwargs["rope"], *ref_rope])
+            kwargs["ref"] = torch.cat([patchify(x, 1) for x in ref]).expand(img.shape[0], -1, -1)
+        return img, kwargs
+
+    def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
+        return unpatchify_outputs(out, sizes, 1)
+
     def forward(
         self,
         img: Tensor,
-        time: Tensor,
+        t: Tensor,
         txt: Tensor,
         rope: Tensor,
         guidance: Tensor | None = None,
-        varlen: Joint | None = None,
+        ref: Tensor | None = None,
+        varlen: VarlenInfo | None = None,
     ) -> Tensor:
-        # img: [B, L, C], or [T, C] packed with varlen. rope: [txt, img]
+        # img: [B, L_img, C], or [L_img, C] packed. inputs are from prepare()
         packed = varlen is not None
         if packed:
             img, txt = img[None], txt[None]
-            N = varlen.varlen.num_seqs
-            txt_varlen, img_varlen, joint_varlen = varlen.a, varlen.b, varlen.varlen
+            N = varlen.joint.num_seqs
+            txt_varlen, img_varlen, joint_varlen = varlen.txt, varlen.img, varlen.joint
         else:
             N = -1  # keep t's shape
             txt_varlen = img_varlen = joint_varlen = None
+        L_img = img.shape[1]
+        if ref is not None:
+            img = torch.cat([img, ref], dim=1)
         L_txt = txt.shape[1]
         pe = split(rope, L_txt, varlen, dim=0)  # (txt_pe, img_pe)
 
         img = self.img_in(img.to(self.img_in.weight.dtype))
         txt = self.txt_in(txt)
-        vec = self.time_in(timestep_embedding(time.expand(N), 256).to(img.dtype))  # [N, D]
+        vec = self.time_in(timestep_embedding(t.expand(N), 256).to(img.dtype))  # [N, D]
 
         if guidance is not None:  # allow no guidance_embed
             vec = vec + self.guidance_in(timestep_embedding(guidance.expand(N), 256).to(img.dtype))
@@ -298,7 +331,7 @@ class Flux2(nn.Module):
         img = torch.addcmul(split(x, L_txt, varlen)[1], per_token(mod[-1], img_varlen), split(res, L_txt, varlen)[1])
 
         img = self.final_layer(img, vec, img_varlen)
-        return img[0] if packed else img
+        return img[0] if packed else img[:, :L_img]
 
 
 def _load_flux2(repo_id: str, filename: str):

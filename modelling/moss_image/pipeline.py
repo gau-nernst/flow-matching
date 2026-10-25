@@ -11,7 +11,6 @@ from ..qwen3_5 import Qwen3_5Model
 from ..registry import MODELS
 from ..solvers import get_solver
 from ..vae import load_vae
-from ..varlen import pack
 from .model import MOSSImage, load_moss_image
 
 
@@ -73,14 +72,11 @@ class MOSSImagePipeline:
         spec = MODELS[name]
         return cls(load_moss_image(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
-    # imgs: uint8 [H_i, W_i, 3]. returns per-sample [L_i, C] latents and packed model kwargs
+    # imgs: uint8 [H_i, W_i, 3]. returns per-sample latents and kwargs for model.prepare()
     @torch.no_grad()
     def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
         latents = [self.ae.encode(x[None])[0] for x in imgs]
-        txts = self.text_encoder(prompts)
-        ropes = [self.model.make_rope(*x.shape[:2], y.shape[0], x.device) for x, y in zip(latents, txts)]
-        tokens = [x.flatten(0, 1) for x in latents]
-        return tokens, pack(tokens, txts, ropes, txt_first=False)[1]
+        return latents, dict(txt=self.text_encoder(prompts))
 
     # cfg_scale, num_steps, shift and uncond_skip_layers default to self.sample_defaults
     @torch.no_grad()
@@ -161,16 +157,10 @@ def moss_image_generate(
     solver_ = get_solver(solver, timesteps)
 
     # pack, since prompts have different lengths
-    B, H, W, C = latents.shape
-    imgs = list(latents.flatten(1, 2).unbind(0))
-
-    def model_kwargs(txts: list[Tensor]) -> dict:
-        ropes = [moss.make_rope(H, W, x.shape[0], latents.device) for x in txts]
-        return pack(imgs, txts, ropes, txt_first=False)[1]
-
-    pos_kwargs = model_kwargs(txt)
-    neg_kwargs = model_kwargs(neg_txt) if cfg_scale != 1.0 else None
-    latents = torch.cat(imgs)
+    imgs = list(latents)
+    sizes = [x.shape[:2] for x in imgs]
+    latents, pos_kwargs = moss.prepare(imgs, txt)
+    neg_kwargs = moss.prepare(imgs, neg_txt)[1] if cfg_scale != 1.0 else None
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
         t = torch.tensor([timesteps[i]], device=latents.device)
@@ -185,4 +175,4 @@ def moss_image_generate(
         if progress_cb is not None:
             progress_cb(i + 1, num_steps)
 
-    return latents.view(B, H, W, C)
+    return torch.stack(moss.unpatchify(latents, sizes))
