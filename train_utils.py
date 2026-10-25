@@ -29,9 +29,9 @@ def setup_model(
 
         ae = load_vae("flux2")
 
-        if model_name.startswith("flux2-klein-4B"):
+        if model_name.startswith(("flux2-klein-4B", "flux2-klein-base-4B")):
             text_id = "Qwen/Qwen3-4B-FP8"
-        elif model_name.startswith("flux2-klein-9B"):
+        elif model_name.startswith(("flux2-klein-9B", "flux2-klein-base-9B")):
             text_id = "Qwen/Qwen3-8B-FP8"
         else:
             raise ValueError

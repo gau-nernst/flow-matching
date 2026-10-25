@@ -38,13 +38,11 @@ class ImageDataset(IterableDataset):
         min_size: int,
         max_size: int,
         batch_size: int,
-        drop_tag_rate: float = 0.0,
     ) -> None:
         self.img_dir = Path(img_dir)
         self.min_size = min_size
         self.max_size = max_size
         self.batch_size = batch_size
-        self.drop_tag_rate = drop_tag_rate
 
         if str(meta_path).endswith(".tsv"):
             meta = pd.read_csv(meta_path, sep="\t")
@@ -84,13 +82,6 @@ class ImageDataset(IterableDataset):
                 img_pt = random_resize(img_pil, self.min_size, self.max_size)
 
                 prompt = self.prompts[idx]
-                if self.drop_tag_rate > 0.0 and torch.rand(()).item() < self.drop_tag_rate:
-                    SEPARATOR = ", "
-                    tags = prompt.split(SEPARATOR)
-                    if len(tags) > 5:
-                        tags.pop(torch.randint(len(tags), size=()).item())
-                        prompt = SEPARATOR.join(tags)
-
                 img_size = tuple(img_pt.shape[:2])
                 if img_size not in buckets:
                     buckets[img_size] = []
@@ -111,6 +102,8 @@ def save_images(
     save_dir: Path,
     img_size: tuple[int, int],
     batch_size: int = 4,
+    num_steps: int = 4,
+    cfg_scale: float = 1.0,
 ):
     model.eval()
     prompts = [line.rstrip() for line in open(prompt_path, encoding="utf-8")]
@@ -120,6 +113,7 @@ def save_images(
     for offset in tqdm(range(0, len(prompts), batch_size), "Generating images", dynamic_ncols=True):
         curr_prompts = prompts[offset : offset + batch_size]
         conds = text_embedder(curr_prompts)
+        neg_conds = text_embedder([""] * len(curr_prompts)) if cfg_scale != 1.0 else None
 
         shape = (
             len(curr_prompts),
@@ -129,12 +123,11 @@ def save_images(
         )
         noise = torch.randn(shape, device="cuda", generator=rng)
 
-        num_steps = 4
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1)
         timesteps = flux2_time_shift(timesteps, num_steps, shape[1] * shape[2])
         timesteps = timesteps.tolist()
 
-        latents = flux2_generate(model, noise, timesteps, conds)
+        latents = flux2_generate(model, noise, timesteps, conds, neg_conds, cfg_scale=cfg_scale)
         imgs = ae.decode(latents, uint8=True).cpu()
         for img_idx in range(imgs.shape[0]):
             save_path = save_dir / f"{offset + img_idx:04d}.webp"
@@ -158,7 +151,6 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--train_ds", type=json.loads, required=True)
     parser.add_argument("--distill_ds", type=json.loads)
-    parser.add_argument("--drop_tag_rate", type=float, default=0.0)
 
     parser.add_argument("--num_steps", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -169,6 +161,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval_interval", type=int, default=100)
     parser.add_argument("--test_img_size", type=parse_img_size, default=(512, 512))
     parser.add_argument("--test_prompt_path", required=True)
+    parser.add_argument("--test_num_steps", type=int)  # default: 50 for base models, 4 otherwise
+    parser.add_argument("--test_cfg_scale", type=float)  # default: 4.0 for base models, 1.0 otherwise
     parser.add_argument("--log_dir", type=Path, required=True)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--run_name", default="Debug")
@@ -176,6 +170,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     assert args.batch_size % args.gradient_accumulation == 0
+    is_base = "base" in args.model
+    sample_kwargs = dict(
+        num_steps=args.test_num_steps if args.test_num_steps is not None else (50 if is_base else 4),
+        cfg_scale=args.test_cfg_scale if args.test_cfg_scale is not None else (4.0 if is_base else 1.0),
+    )
     batch_size = args.batch_size // args.gradient_accumulation
     torch._dynamo.config.cache_size_limit = 1000
     torch._dynamo.config.accumulated_cache_size_limit = 1000
@@ -183,9 +182,7 @@ if __name__ == "__main__":
     wandb.init(project="T2I finetune", name=args.run_name, dir="/tmp", mode="disabled" if args.profile else None)
 
     def create_dloader(ds_config: dict, batch_size: int):
-        ds = ImageDataset(
-            ds_config["meta_path"], ds_config["img_dir"], args.min_size, args.max_size, batch_size, args.drop_tag_rate
-        )
+        ds = ImageDataset(ds_config["meta_path"], ds_config["img_dir"], args.min_size, args.max_size, batch_size)
         dloader = DataLoader(ds, batch_size=None, num_workers=args.num_workers, pin_memory=True)
         return iter(dloader)
 
@@ -229,7 +226,15 @@ if __name__ == "__main__":
 
     # inference before any training
     if step == 0 and not args.profile:
-        save_images(model, ae, text_embedder, args.test_prompt_path, img_dir / f"step{step:06d}", args.test_img_size)
+        save_images(
+            model,
+            ae,
+            text_embedder,
+            args.test_prompt_path,
+            img_dir / f"step{step:06d}",
+            args.test_img_size,
+            **sample_kwargs,
+        )
 
     pbar = tqdm(initial=step, total=args.num_steps, dynamic_ncols=True)
     torch.cuda.reset_peak_memory_stats()
@@ -311,6 +316,7 @@ if __name__ == "__main__":
                 args.test_prompt_path,
                 img_dir / f"step{step:06d}",
                 args.test_img_size,
+                **sample_kwargs,
             )
             if ema is not None:
                 ema.swap_params()
@@ -321,6 +327,7 @@ if __name__ == "__main__":
                     args.test_prompt_path,
                     img_dir / f"step{step:06d}_ema",
                     args.test_img_size,
+                    **sample_kwargs,
                 )
                 ema.swap_params()
             model.train()

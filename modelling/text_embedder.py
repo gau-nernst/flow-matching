@@ -2,7 +2,7 @@
 
 import torch
 from torch import Tensor, nn
-from transformers import AutoTokenizer, CLIPTextModel, T5EncoderModel, UMT5EncoderModel
+from transformers import AutoTokenizer, CLIPTextModel, T5EncoderModel
 from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils import PreTrainedTokenizer
 
