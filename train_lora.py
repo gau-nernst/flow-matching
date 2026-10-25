@@ -264,7 +264,7 @@ if __name__ == "__main__":
             time0 = time1
 
         if step % args.eval_interval == 0:
-            # only save LoRA weights. buffers (RoPE tables) are not trained.
+            # only save LoRA weights (the only trainable params)
             ckpt = dict(
                 model={name: p.detach().bfloat16() for name, p in model.named_parameters() if p.requires_grad},
                 optim=optim.state_dict(),
