@@ -7,7 +7,7 @@ from torch import Tensor
 
 @triton.jit
 def _modulate_kernel(
-    x_ptr,  # [B, L, D]
+    x_ptr,  # [B, L, D], strided
     shift_ptr,  # [B or N, D]
     scale_ptr,  # [B or N, D]
     res_ptr,  # [B, L, D]
@@ -89,7 +89,7 @@ def modulate(
         return out, x
 
     B, L, D = x.shape
-    x = x.contiguous()
+    assert x.stride(-1) == 1
 
     def check(t: Tensor) -> int:  # row stride
         assert t.ndim == 3 and t.shape[1:] == (1, D) and t.stride(-1) == 1, (x.shape, t.shape, t.stride())
@@ -103,7 +103,7 @@ def modulate(
     gate_stride = 0
     if res is not None:
         assert gate is not None
-        res = res.contiguous()
+        assert res.is_contiguous()
         gate_stride = check(gate)
     if norm_weight is not None:
         assert norm_weight.shape == (D,) and norm_weight.is_contiguous()
@@ -119,6 +119,8 @@ def modulate(
         idx,
         gated,
         out,
+        x.stride(0),
+        x.stride(1),
         shift_stride,
         scale_stride,
         gate_stride,
