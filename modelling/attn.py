@@ -2,10 +2,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .varlen import VarlenTensor, is_packed, varlen_attn
+from .varlen import Varlen, is_packed, varlen_attn
 
 
-def dispatch_attn(q: Tensor, k: Tensor, v: Tensor, impl: str = "pt", varlen: VarlenTensor | None = None) -> Tensor:
+def dispatch_attn(q: Tensor, k: Tensor, v: Tensor, impl: str = "pt", varlen: Varlen | None = None) -> Tensor:
     # q, k, v: [B, L, H, D], or [1, T, H, D] packed
     if is_packed(varlen):
         if impl != "pt":

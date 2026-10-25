@@ -14,7 +14,7 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_weight_merge_hook, load_hf_state_dict
-from ..varlen import VarlenTensor, merge, per_token, prepare_inputs, seq_ids, split, unpatchify_outputs, zip_varlen
+from ..varlen import Varlen, cat_varlen, per_token, prepare_inputs, seq_ids, unpatchify_outputs
 from .gated_norm import gated_norm
 
 
@@ -24,8 +24,8 @@ class FinalLayer(nn.Module):
         self.linear = Linear(hidden_size, out_channels)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), Linear(256, hidden_size))
 
-    def forward(self, x: Tensor, c: Tensor, varlen: VarlenTensor | None = None) -> Tensor:
-        scale = per_token(self.adaLN_modulation(c).unsqueeze(1), varlen)
+    def forward(self, x: Tensor, c: Tensor, varlen: Varlen | None = None) -> Tensor:
+        scale = per_token(self.adaLN_modulation(c).unsqueeze(1), seq_ids(varlen))
         x = (1.0 + scale) * F.layer_norm(x, x.shape[-1:], eps=1e-6)
         return self.linear(x)
 
@@ -43,7 +43,7 @@ class Attention(nn.Module):
 
         self.register_load_state_dict_pre_hook(create_weight_merge_hook(["to_q", "to_k", "to_v"], "qkv"))
 
-    def forward(self, x: Tensor, pe: Tensor, varlen: VarlenTensor | None = None):
+    def forward(self, x: Tensor, pe: Tensor, varlen: Varlen | None = None):
         q, k, v = self.qkv(x).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
         qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else x.dtype
         q = apply_rope(q, pe, self.norm_q.weight, self.eps, out=torch.empty_like(q, dtype=qk_dtype))
@@ -97,7 +97,7 @@ class Block(nn.Module):
         self.ffn_norm2 = nn.RMSNorm(dim, eps=eps)
         self.eps = eps
 
-    def forward(self, x: Tensor, adaln_input: Tensor | None, pe: Tensor, varlen: VarlenTensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, adaln_input: Tensor | None, pe: Tensor, varlen: Varlen | None = None) -> Tensor:
         idx = seq_ids(varlen)
 
         if self.adaLN_modulation is not None:
@@ -179,27 +179,33 @@ class ZImage(nn.Module):
 
     # latents: [B, H, W, C] (dense) or a list of [H_i, W_i, C] (packed)
     def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
-        return prepare_inputs(latents, txt, self.make_rope, self.cfg.patch_size)
+        return prepare_inputs(latents, txt, self.make_rope, self.cfg.patch_size, txt_first=False)
 
     def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
         return unpatchify_outputs(out, sizes, self.cfg.patch_size)
 
-    def forward(self, img: Tensor | VarlenTensor, t: Tensor, txt: Tensor | VarlenTensor, rope: Tensor) -> Tensor:
+    def forward(
+        self,
+        img: Tensor,
+        t: Tensor,
+        txt: Tensor,
+        rope: Tensor,
+        txt_varlen: Varlen | None = None,
+        img_varlen: Varlen | None = None,
+    ) -> Tensor:
         # inputs/outputs follow the repo convention: t=1 is noise, predict velocity (noise - data).
         # the original Z-Image uses t=0 as noise and predicts (data - noise), so flip both t and v.
-        # inputs are from prepare(). returns [B, L_img, p*p*C], or [L_img, p*p*C] if packed
-        packed = isinstance(img, VarlenTensor)
+        # inputs are from prepare(). img: [B, L_img, p*p*C], or [L_img, p*p*C] if packed
+        packed = img_varlen is not None
         if packed:
-            img_varlen, txt_varlen = img.meta(), txt.meta()
-            zipped = zip_varlen(img_varlen, txt_varlen)  # [img, txt] per sample
-            joint_varlen = zipped[0]
-            img, txt = img.data[None], txt.data[None]
+            img, txt = img[None], txt[None]
             N = img_varlen.cu_seqlens.shape[0] - 1
+            joint_varlen = cat_varlen(img_varlen, txt_varlen)
         else:
-            img_varlen = txt_varlen = joint_varlen = zipped = None
             N = -1  # keep t's shape
+            joint_varlen = None
         L_img = img.shape[1]
-        img_rope, txt_rope = split(rope, L_img, zipped, dim=0)
+        img_rope, txt_rope = rope[:L_img], rope[L_img:]
 
         t_embeds = timestep_embedding(1 - t.expand(N), 256)
         t_embeds = self.t_embedder(t_embeds.to(self.t_embedder[0][0].weight.dtype))  # [N, mod_dim]
@@ -214,11 +220,11 @@ class ZImage(nn.Module):
         for layer in self.noise_refiner:
             img = layer(img, t_embeds, img_rope, img_varlen)
 
-        # joint processing. each sample is [img, txt]
-        unified = merge(img, txt, zipped)
+        # joint processing
+        unified = torch.cat([img, txt], dim=1)
         for layer in self.layers:
             unified = layer(unified, t_embeds, rope, joint_varlen)
-        img = split(unified, L_img, zipped)[0]
+        img = unified[:, :L_img]
 
         img = self.all_final_layer["2-1"](img, t_embeds, img_varlen)
         return -img[0] if packed else -img

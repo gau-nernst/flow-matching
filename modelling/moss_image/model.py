@@ -15,7 +15,7 @@ from ..linear import Linear
 from ..registry import MODELS
 from ..rope import apply_rope, compute_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-from ..varlen import VarlenTensor, merge, prepare_inputs, seq_ids, split, unpatchify_outputs, zip_varlen
+from ..varlen import Varlen, cat_varlen, prepare_inputs, seq_ids, unpatchify_outputs
 
 HEAD_DIM = 128
 
@@ -70,7 +70,7 @@ class TextBlock(nn.Module):
         self.ffn_gate = Linear(dim, ffn_dim)
         self.ffn_down = Linear(ffn_dim, dim)
 
-    def forward(self, x: Tensor, rope: Tensor, varlen: VarlenTensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, rope: Tensor, varlen: Varlen | None = None) -> Tensor:
         # attention
         q, k, v = self.qkv(self.norm1(x)).unflatten(-1, (3, -1, HEAD_DIM)).unbind(2)
         q = apply_rope(q, rope, self.q_norm.weight, interleaved=False)
@@ -102,7 +102,7 @@ class Block(nn.Module):
 
     # FFN residual is deferred to the next block's modulate(). modulation is shared, so gate_f is the same.
     def forward(
-        self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor, varlen: VarlenTensor | None = None
+        self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor, varlen: Varlen | None = None
     ) -> tuple[Tensor, Tensor]:
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.split(1, dim=1)  # [N, 1, D] each
         idx = seq_ids(varlen)
@@ -166,31 +166,31 @@ class MOSSImage(nn.Module):
     # latents: [B, H, W, C] (dense) or a list of [H_i, W_i, C] (packed). txt: unpadded
     def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
         device = latents[0].device
-        return prepare_inputs(latents, txt, partial(self.make_rope, device=device), 1)
+        return prepare_inputs(latents, txt, partial(self.make_rope, device=device), 1, txt_first=False)
 
     def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
         return unpatchify_outputs(out, sizes, 1)
 
     def forward(
         self,
-        img: Tensor | VarlenTensor,
+        img: Tensor,
         t: Tensor,
-        txt: Tensor | VarlenTensor,
+        txt: Tensor,
         rope: Tensor,
+        txt_varlen: Varlen | None = None,
+        img_varlen: Varlen | None = None,
         skip_layers: tuple[int, ...] = (),
     ) -> Tensor:
         # inputs are from prepare(). returns [B, L_img, C], or [L_img, C] if packed
         # skip_layers: blocks to skip, for the negative branch of CFG
-        packed = isinstance(img, VarlenTensor)
+        packed = img_varlen is not None
         if packed:
-            txt_varlen = txt.meta()
-            zipped = zip_varlen(img.meta(), txt_varlen)  # [img, txt] per sample
-            joint_varlen = zipped[0]
-            N = txt_varlen.cu_seqlens.shape[0] - 1
-            img, txt = img.data[None], txt.data[None]
+            img, txt = img[None], txt[None]
+            N = img_varlen.cu_seqlens.shape[0] - 1
+            joint_varlen = cat_varlen(img_varlen, txt_varlen)
         else:
-            txt_varlen = joint_varlen = zipped = None
             N = -1  # keep t's shape
+            joint_varlen = None
         dtype = self.video_embedder.weight.dtype
 
         vec = self.time_embedding(timestep_embedding(t.expand(N), 256).to(dtype))
@@ -198,13 +198,12 @@ class MOSSImage(nn.Module):
         shift, scale = self.video_head_modulation(vec).unflatten(1, (2, -1)).unbind(1)  # [N, D] each
 
         L_img = img.shape[1]
-        txt_rope = split(rope, L_img, zipped, dim=0)[1]
         x_img = self.video_embedder(img.to(dtype))
         x_txt = self.text_embedder.proj(txt.to(dtype))
         for block in self.text_embedder.blocks:
-            x_txt = block(x_txt, txt_rope, txt_varlen)
+            x_txt = block(x_txt, rope[L_img:], txt_varlen)
 
-        x = merge(x_img, x_txt, zipped)
+        x = torch.cat([x_img, x_txt], dim=1)
         ffn_out = None
         for i, block in enumerate(self.layers):
             if i not in skip_layers:
@@ -213,7 +212,7 @@ class MOSSImage(nn.Module):
         gate_f = mod[:, 5:6]
         norm = self.final_norm_video.weight
         y, _ = modulate(x, shift[:, None], scale[:, None], ffn_out, gate_f, 1e-6, norm, True, seq_ids(joint_varlen))
-        out = self.final_linear_video(split(y, L_img, zipped)[0])
+        out = self.final_linear_video(y[:, :L_img])
         return out[0] if packed else out
 
 

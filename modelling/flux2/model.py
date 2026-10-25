@@ -15,19 +15,7 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-from ..varlen import (
-    VarlenTensor,
-    Zipped,
-    is_packed,
-    merge,
-    patchify,
-    per_token,
-    prepare_inputs,
-    seq_ids,
-    split,
-    unpatchify_outputs,
-    zip_varlen,
-)
+from ..varlen import Varlen, cat_varlen, patchify, per_token, prepare_inputs, seq_ids, unpatchify_outputs
 
 
 class MLP(nn.ModuleList):
@@ -94,45 +82,23 @@ class DoubleStreamBlock(nn.Module):
         ]
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
-    def _rope_joint(
-        self,
-        txt_x: Tensor,
-        img_x: Tensor,
-        pe: tuple[Tensor, Tensor],
-        norms: tuple[Tensor, Tensor],
-        zipped: Zipped | None,
-    ) -> Tensor:
-        qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else txt_x.dtype
-        txt_pe, img_pe = pe
-        txt_norm, img_norm = norms
-
-        if zipped is None or not is_packed(zipped[0]):
-            # write into a pre-allocated buffer to avoid torch.cat()
-            Ltxt = txt_x.shape[1]
-            out = txt_x.new_empty(txt_x.shape[0], Ltxt + img_x.shape[1], *txt_x.shape[2:], dtype=qk_dtype)
-            apply_rope(txt_x, txt_pe, txt_norm, self.eps, out=out[:, :Ltxt])
-            apply_rope(img_x, img_pe, img_norm, self.eps, out=out[:, Ltxt:])
-            return out
-
-        txt_x = apply_rope(txt_x, txt_pe, txt_norm, self.eps)
-        img_x = apply_rope(img_x, img_pe, img_norm, self.eps)
-        return merge(txt_x, img_x, zipped).to(qk_dtype)
-
-    # pe: (txt_pe, img_pe)
     def forward(
         self,
         img: Tensor,
         img_res: Tensor | None,
         txt: Tensor,
         txt_res: Tensor | None,
-        pe: tuple[Tensor, Tensor],
+        pe: Tensor,
         mod_img: tuple[Tensor, ...],
         mod_txt: tuple[Tensor, ...],
-        txt_varlen: VarlenTensor | None = None,
-        img_varlen: VarlenTensor | None = None,
-        zipped: Zipped | None = None,
+        varlen: Varlen | None = None,
     ) -> tuple[Tensor, Tensor]:
-        txt_idx, img_idx = seq_ids(txt_varlen), seq_ids(img_varlen)
+        # varlen: of the joint sequence [txt, img]
+        B, Limg, _ = img.shape
+        _, Ltxt, _ = txt.shape
+        idx = seq_ids(varlen)
+        txt_idx, img_idx = (idx[:Ltxt], idx[Ltxt:]) if idx is not None else (None, None)
+
         img_shift1, img_scale1, img_gate1, img_shift2, img_scale2, img_gate2 = mod_img
         txt_shift1, txt_scale1, txt_gate1, txt_shift2, txt_scale2, txt_gate2 = mod_txt
 
@@ -141,11 +107,20 @@ class DoubleStreamBlock(nn.Module):
         img_q, img_k, img_v = self.img_attn.qkv(img_res).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
         txt_q, txt_k, txt_v = self.txt_attn.qkv(txt_res).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
 
-        q = self._rope_joint(txt_q, img_q, pe, (self.txt_attn.q_norm, self.img_attn.q_norm), zipped)
-        k = self._rope_joint(txt_k, img_k, pe, (self.txt_attn.k_norm, self.img_attn.k_norm), zipped)
-        v = merge(txt_v, img_v, zipped)
-        attn = dispatch_attn(q, k, v, self.attn_impl, zipped[0] if zipped is not None else None).flatten(2)
-        txt_attn, img_attn = split(attn, txt.shape[1], zipped)
+        # pre-allocate buffer to avoid torch.cat()
+        qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else img.dtype
+        q = img.new_empty(B, Ltxt + Limg, *img_q.shape[2:], dtype=qk_dtype)
+        apply_rope(txt_q, pe[:Ltxt], self.txt_attn.q_norm, self.eps, out=q[:, :Ltxt])
+        apply_rope(img_q, pe[Ltxt:], self.img_attn.q_norm, self.eps, out=q[:, Ltxt:])
+
+        k = torch.empty_like(q)
+        apply_rope(txt_k, pe[:Ltxt], self.txt_attn.k_norm, self.eps, out=k[:, :Ltxt])
+        apply_rope(img_k, pe[Ltxt:], self.img_attn.k_norm, self.eps, out=k[:, Ltxt:])
+
+        # TODO: remove cat?
+        v = torch.cat((txt_v, img_v), dim=1)
+        attn = dispatch_attn(q, k, v, self.attn_impl, varlen).flatten(2)
+        txt_attn, img_attn = attn.split([txt.shape[1], img.shape[1]], dim=1)
 
         img_res, img = modulate(img, img_shift2, img_scale2, self.img_attn.proj(img_attn), img_gate1, idx=img_idx)
         txt_res, txt = modulate(txt, txt_shift2, txt_scale2, self.txt_attn.proj(txt_attn), txt_gate1, idx=txt_idx)
@@ -176,7 +151,7 @@ class SingleStreamBlock(nn.Module):
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     def forward(
-        self, x: Tensor, res: Tensor | None, pe: Tensor, mod: tuple[Tensor, ...], varlen: VarlenTensor | None = None
+        self, x: Tensor, res: Tensor | None, pe: Tensor, mod: tuple[Tensor, ...], varlen: Varlen | None = None
     ) -> Tensor:
         # TODO: fuse quantize with modulate
         shift, scale, gate = mod
@@ -274,7 +249,7 @@ class Flux2(nn.Module):
     def prepare(
         self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor], ref: list[Tensor] | None = None
     ) -> tuple[Tensor, dict]:
-        img, kwargs = prepare_inputs(latents, txt, self.make_rope, 1)
+        img, kwargs = prepare_inputs(latents, txt, self.make_rope, 1, txt_first=True)
         if ref:
             assert isinstance(latents, Tensor), "ref is only supported for a dense batch"
             ref_rope = [self.make_img_rope(*x.shape[:2], t=10 * (i + 1)) for i, x in enumerate(ref)]
@@ -287,29 +262,28 @@ class Flux2(nn.Module):
 
     def forward(
         self,
-        img: Tensor | VarlenTensor,
+        img: Tensor,
         t: Tensor,
-        txt: Tensor | VarlenTensor,
+        txt: Tensor,
         rope: Tensor,
         guidance: Tensor | None = None,
         ref: Tensor | None = None,
+        txt_varlen: Varlen | None = None,
+        img_varlen: Varlen | None = None,
     ) -> Tensor:
         # inputs are from prepare(). returns [B, L_img, C], or [L_img, C] if packed
-        packed = isinstance(img, VarlenTensor)
+        packed = img_varlen is not None
         if packed:
-            txt_varlen, img_varlen = txt.meta(), img.meta()
-            zipped = zip_varlen(txt_varlen, img_varlen)  # [txt, img] per sample
-            joint_varlen = zipped[0]
-            img, txt = img.data[None], txt.data[None]
+            img, txt = img[None], txt[None]
             N = img_varlen.cu_seqlens.shape[0] - 1
+            joint_varlen = cat_varlen(txt_varlen, img_varlen)
         else:
-            txt_varlen = img_varlen = joint_varlen = zipped = None
             N = -1  # keep t's shape
+            joint_varlen = None
         L_img = img.shape[1]
         if ref is not None:
             img = torch.cat([img, ref], dim=1)
         L_txt = txt.shape[1]
-        pe = split(rope, L_txt, zipped, dim=0)  # (txt_pe, img_pe)
 
         img = self.img_in(img.to(self.img_in.weight.dtype))
         txt = self.txt_in(txt)
@@ -322,19 +296,18 @@ class Flux2(nn.Module):
         mod_txt = self.double_stream_modulation_txt(vec)
         img_res = txt_res = None
         for block in self.double_blocks:
-            img_res, img, txt_res, txt = block(
-                img, img_res, txt, txt_res, pe, mod_img, mod_txt, txt_varlen, img_varlen, zipped
-            )
+            img_res, img, txt_res, txt = block(img, img_res, txt, txt_res, rope, mod_img, mod_txt, joint_varlen)
 
-        img = torch.addcmul(img, per_token(mod_img[-1], img_varlen), img_res)
-        txt = torch.addcmul(txt, per_token(mod_txt[-1], txt_varlen), txt_res)
-        x = merge(txt, img, zipped)
+        img_idx, txt_idx = seq_ids(img_varlen), seq_ids(txt_varlen)
+        img = torch.addcmul(img, per_token(mod_img[-1], img_idx), img_res)
+        txt = torch.addcmul(txt, per_token(mod_txt[-1], txt_idx), txt_res)
+        x = torch.cat((txt, img), dim=1)
 
         mod = self.single_stream_modulation(vec)
         res = None
         for block in self.single_blocks:
             res, x = block(x, res, rope, mod, joint_varlen)
-        img = torch.addcmul(split(x, L_txt, zipped)[1], per_token(mod[-1], img_varlen), split(res, L_txt, zipped)[1])
+        img = torch.addcmul(x[:, L_txt:], per_token(mod[-1], img_idx), res[:, L_txt:])
 
         img = self.final_layer(img, vec, img_varlen)
         return img[0] if packed else img[:, :L_img]

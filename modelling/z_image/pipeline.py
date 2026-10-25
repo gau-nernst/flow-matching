@@ -159,18 +159,17 @@ def zimage_generate(
     # pack, since prompts have different lengths
     imgs = list(latents)
     sizes = [x.shape[:2] for x in imgs]
-    img, pos_kwargs = zimage.prepare(imgs, txt)  # img: VarlenTensor
-    latents = img.data
+    latents, pos_kwargs = zimage.prepare(imgs, txt)
     neg_kwargs = zimage.prepare(imgs, neg_txt)[1] if cfg_scale != 1.0 else None
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
         t = torch.tensor([timesteps[i]], device="cuda")
-        v = zimage(img._replace(data=latents), t, **pos_kwargs).float()
+        v = zimage(latents, t, **pos_kwargs).float()
 
         # classifier-free guidance
         if cfg_scale != 1.0:
             assert neg_kwargs is not None
-            neg_v = zimage(img._replace(data=latents), t, **neg_kwargs).float()
+            neg_v = zimage(latents, t, **neg_kwargs).float()
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
