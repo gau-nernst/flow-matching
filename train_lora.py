@@ -140,8 +140,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval_interval", type=int, default=100)
     parser.add_argument("--test_img_size", type=parse_img_size, default=(512, 512))
     parser.add_argument("--test_prompt_path", required=True)
-    parser.add_argument("--test_num_steps", type=int)  # default: from model registry
-    parser.add_argument("--test_cfg_scale", type=float)  # default: from model registry
+    # pipeline.generate() kwargs, overriding the model's defaults in the registry e.g. '{"num_steps": 8}'
+    parser.add_argument("--test_sample_kwargs", type=json.loads, default={})
     parser.add_argument("--log_dir", type=Path, required=True)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--run_name", default="Debug")
@@ -149,11 +149,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     assert args.batch_size % args.gradient_accumulation == 0
-    defaults = MODELS[args.model].sample_defaults
-    sample_kwargs = dict(
-        num_steps=args.test_num_steps if args.test_num_steps is not None else defaults["num_steps"],
-        cfg_scale=args.test_cfg_scale if args.test_cfg_scale is not None else defaults["cfg_scale"],
-    )
+    sample_kwargs = {**MODELS[args.model].sample_defaults, **args.test_sample_kwargs}
     batch_size = args.batch_size // args.gradient_accumulation
     torch._dynamo.config.cache_size_limit = 1000
     torch._dynamo.config.accumulated_cache_size_limit = 1000
@@ -193,6 +189,8 @@ if __name__ == "__main__":
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=True, mmap=True)
 
         if "model" in ckpt:  # training checkpoint
+            ckpt_model = ckpt.get("model_name", args.model)  # older checkpoints don't store model_name
+            assert ckpt_model == args.model, f"Checkpoint is for {ckpt_model}, not {args.model}"
             logger.info("Load model: ", model.load_state_dict(ckpt["model"], strict=False))
             if ema is not None:
                 ema.load_state_dict(ckpt["ema"])
@@ -266,11 +264,12 @@ if __name__ == "__main__":
             time0 = time1
 
         if step % args.eval_interval == 0:
-            # only save LoRA weights. Flux doesn't have buffers.
+            # only save LoRA weights. buffers (RoPE tables) are not trained.
             ckpt = dict(
                 model={name: p.detach().bfloat16() for name, p in model.named_parameters() if p.requires_grad},
                 optim=optim.state_dict(),
                 step=step,
+                model_name=args.model,
             )
             if ema is not None:
                 ckpt["ema"] = ema.state_dict()
