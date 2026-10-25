@@ -17,8 +17,6 @@ from ..utils import create_weight_merge_hook, load_hf_state_dict
 from ..varlen import Varlen, VarlenInfo, merge, per_token, prepare_inputs, seq_ids, split, unpatchify_outputs
 from .gated_norm import gated_norm
 
-SEQ_MULTIPLE = 32  # pad each sample's image and text to a multiple of this
-
 
 class FinalLayer(nn.Module):
     def __init__(self, hidden_size: int, out_channels):
@@ -144,6 +142,7 @@ class ZImage(nn.Module):
         self.t_embedder = nn.Sequential()
         self.t_embedder.mlp = nn.Sequential(Linear(256, 1024), nn.SiLU(), Linear(1024, cfg.mod_dim))
         self.pos_embed = RopeND(cfg.rope_dims, (1536, 512, 512), theta=256.0)
+        # upstream pads image and text to a multiple of 32 with these. we don't pad. kept for checkpoint loading
         self.x_pad_token = nn.Parameter(torch.zeros(1, cfg.dim))
         self.cap_pad_token = nn.Parameter(torch.zeros(1, cfg.dim))
 
@@ -169,23 +168,18 @@ class ZImage(nn.Module):
         return list(self.layers)
 
     def make_rope(self, nH: int, nW: int, L_txt: int) -> Tensor:
-        # one sample's [img, txt] rope, both padded.
+        # one sample's [img, txt] rope.
         # RoPE embedding has 3 components:
-        # - time: text embeds stay at pos=[1,L+1), img embeds stay at pos=L+1, where L is the padded text length
+        # - time: text embeds stay at pos=[1,L+1), img embeds stay at pos=L+1
         # - height: all text embeds stay at pos=0
         # - width: all text embeds stay at pos=0
-        # padding image tokens are at pos=(0,0,0)
-        L_txt = _round_up(L_txt)
-        img_pad = _round_up(nH * nW) - nH * nW
         img_rope = self.pos_embed.create((L_txt + 1, 0, 0), (1, nH, nW))
-        pad_rope = self.pos_embed.create((0, 0, 0), (1, 1, 1)).expand(img_pad, -1)
         txt_rope = self.pos_embed.create((1, 0, 0), (L_txt, 1, 1))
-        return torch.cat([img_rope, pad_rope, txt_rope])
+        return torch.cat([img_rope, txt_rope])
 
-    # latents: [B, H, W, C] (dense) or a list of [H_i, W_i, C] (packed). txt: unpadded
+    # latents: [B, H, W, C] (dense) or a list of [H_i, W_i, C] (packed)
     def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
-        p = self.cfg.patch_size
-        return prepare_inputs(latents, txt, self.make_rope, p, txt_first=False, pad_multiple=SEQ_MULTIPLE)
+        return prepare_inputs(latents, txt, self.make_rope, self.cfg.patch_size, txt_first=False)
 
     def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
         return unpatchify_outputs(out, sizes, self.cfg.patch_size)
@@ -203,19 +197,18 @@ class ZImage(nn.Module):
             N = -1  # keep t's shape
             txt_varlen = img_varlen = joint_varlen = None
         L_img = img.shape[1]
+        img_rope, txt_rope = split(rope, L_img, varlen, dim=0)
 
         t_embeds = timestep_embedding(1 - t.expand(N), 256)
         t_embeds = self.t_embedder(t_embeds.to(self.t_embedder[0][0].weight.dtype))  # [N, mod_dim]
 
         # text-only processing
-        txt = _pad(self.cap_embedder(txt), self.cap_pad_token, varlen.txt_unpad if packed else None, txt_varlen)
-        img_rope, txt_rope = split(rope, rope.shape[0] - txt.shape[1], varlen, dim=0)
+        txt = self.cap_embedder(txt)
         for layer in self.context_refiner:
             txt = layer(txt, None, txt_rope, txt_varlen)
 
         # image-only processing
         img = self.all_x_embedder["2-1"](img.to(self.all_x_embedder["2-1"].weight.dtype))
-        img = _pad(img, self.x_pad_token, varlen.img_unpad if packed else None, img_varlen)
         for layer in self.noise_refiner:
             img = layer(img, t_embeds, img_rope, img_varlen)
 
@@ -223,25 +216,10 @@ class ZImage(nn.Module):
         unified = merge(img, txt, varlen)
         for layer in self.layers:
             unified = layer(unified, t_embeds, rope, joint_varlen)
-        img = split(unified, img.shape[1], varlen)[0]
+        img = split(unified, L_img, varlen)[0]
 
-        if packed:
-            img = self.all_final_layer["2-1"](img, t_embeds, img_varlen).index_select(1, varlen.img_unpad)[0]
-        else:
-            img = self.all_final_layer["2-1"](img[:, :L_img], t_embeds)
-        return -img
-
-
-def _round_up(L: int) -> int:
-    return -(-L // SEQ_MULTIPLE) * SEQ_MULTIPLE
-
-
-# unpad: positions of real tokens, for packed input
-def _pad(x: Tensor, pad_token: Tensor, unpad: Tensor | None, varlen: Varlen | None) -> Tensor:
-    if unpad is None:
-        pad = pad_token.expand(x.shape[0], _round_up(x.shape[1]) - x.shape[1], -1)
-        return torch.cat([x, pad.to(x.dtype)], dim=1)
-    return pad_token.to(x.dtype).expand(1, varlen.seq_ids.shape[0], -1).index_copy(1, unpad, x)
+        img = self.all_final_layer["2-1"](img, t_embeds, img_varlen)
+        return -img[0] if packed else -img
 
 
 def load_zimage(name: str = "z-image-turbo"):
