@@ -73,12 +73,10 @@ class MOSSImagePipeline:
         spec = MODELS[name]
         return cls(load_moss_image(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
-    # imgs: list of uint8 [H_i, W_i, 3], can have different sizes.
-    # returns (latents, model_kwargs) for training: model(torch.cat(noisy_latents), t, **model_kwargs).
-    # latents: per-sample [L_i, C] tokens. model_kwargs: packed inputs
+    # imgs: uint8 [H_i, W_i, 3]. returns per-sample [L_i, C] latents and packed model kwargs
     @torch.no_grad()
     def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
-        latents = [self.ae.encode(x[None])[0] for x in imgs]  # [h, w, C] each
+        latents = [self.ae.encode(x[None])[0] for x in imgs]
         txts = self.text_encoder(prompts)
         ropes = [self.model.make_rope(*x.shape[:2], y.shape[0], x.device) for x, y in zip(latents, txts)]
         tokens = [x.flatten(0, 1) for x in latents]
@@ -162,7 +160,7 @@ def moss_image_generate(
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
 
-    # prompts have different lengths, so samples are packed
+    # pack, since prompts have different lengths
     B, H, W, C = latents.shape
     imgs = list(latents.flatten(1, 2).unbind(0))
 

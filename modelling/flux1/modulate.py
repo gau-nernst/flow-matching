@@ -13,7 +13,7 @@ def _modulate_kernel(
     res_ptr,  # [B, L, D]
     gate_ptr,  # [B or N, D]
     norm_ptr,  # [D]
-    idx_ptr,  # [L] row of shift/scale/gate for each token, for packed varlen input (B=1)
+    idx_ptr,  # [L] sample of each token, for packed input
     gated_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
     x_stride_b,
@@ -51,7 +51,7 @@ def _modulate_kernel(
     x = x.to(tl.float32)
     if not RMS:
         x -= tl.sum(x) * (1.0 / D)
-        x = tl.where(mask, x, 0.0)  # padding lanes must not contribute to the variance
+        x = tl.where(mask, x, 0.0)  # exclude padding from variance
     var = tl.sum(x * x) * (1.0 / D)
     x = x * tl.rsqrt(var + eps)
     if norm_ptr is not None:
@@ -73,9 +73,7 @@ def modulate(
     idx: Tensor | None = None,
 ) -> Tensor:
     # norm is LayerNorm (default) or RMSNorm, with optional weight
-    # x: [B, L, D]. shift, scale, gate: [B, 1, D] or [1, 1, D].
-    # for packed varlen input, x is [1, L, D], shift/scale/gate are [N, 1, D] (per sample)
-    # and idx is [L] (sample of each token)
+    # x: [B, L, D]. shift, scale, gate: [B, 1, D] or [1, 1, D]. packed: [N, 1, D] with idx [L]
     if torch.is_grad_enabled():
         if idx is not None:
             shift, scale = [t[:, 0].index_select(0, idx).unsqueeze(0) for t in (shift, scale)]
@@ -91,9 +89,9 @@ def modulate(
         return out, x
 
     B, L, D = x.shape
-    x = x.contiguous()  # e.g. the image part of a dense [B, L, D] joint sequence
+    x = x.contiguous()
 
-    def check(t: Tensor) -> int:  # returns row stride
+    def check(t: Tensor) -> int:  # row stride
         assert t.ndim == 3 and t.shape[1:] == (1, D) and t.stride(-1) == 1, (x.shape, t.shape, t.stride())
         if idx is None:
             assert t.shape[0] in (1, B), (x.shape, t.shape)

@@ -47,8 +47,7 @@ def setup_model(
     return pipeline
 
 
-# latents: per-sample [L_i, C] tokens, can have different lengths. model_kwargs: packed inputs from
-# pipeline.prepare_train_inputs()
+# latents, model_kwargs: from pipeline.prepare_train_inputs()
 def compute_loss(model: nn.Module, latents: list[Tensor], time_sampler: TimeSampler, model_kwargs: dict) -> Tensor:
     t_vec = time_sampler(len(latents), device=latents[0].device)
     noise = [torch.randn_like(x) for x in latents]
@@ -57,7 +56,7 @@ def compute_loss(model: nn.Module, latents: list[Tensor], time_sampler: TimeSamp
     v = model(torch.cat(interpolate), t_vec, **model_kwargs).split([x.shape[0] for x in latents])
 
     # rectified flow loss. predict velocity from latents (t=0) to noise (t=1).
-    # each sample has the same weight regardless of its resolution, like a batch of same-size images
+    # each sample has the same weight regardless of resolution
     losses = [F.mse_loss(n.float() - x.float(), v_.float()) for x, n, v_ in zip(latents, noise, v)]
     return torch.stack(losses).mean()
 

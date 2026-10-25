@@ -172,7 +172,7 @@ def flux1_generate(
     p = flux.cfg.patch_size
     nH, nW = H // p, W // p
     rope = flux.make_rope(nH, nW, txt.shape[1])
-    latents = patchify(latents.permute(0, 2, 3, 1), p, channels_first=True)  # NCHW -> [B, L, C*p*p]
+    latents = patchify(latents.permute(0, 2, 3, 1), p, channels_first=True)
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
         t = torch.tensor([timesteps[i]], device="cuda")

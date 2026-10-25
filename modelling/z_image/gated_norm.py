@@ -9,11 +9,11 @@ from torch import Tensor
 def _gated_norm_kernel(
     x_ptr,  # [B, L, D]
     w_ptr,  # [D]
-    gate_ptr,  # [B or 1 or N, D], last dim contiguous
-    gate_idx_ptr,  # [L] row of gate for each token, for packed varlen input (B=1)
+    gate_ptr,  # [B or 1 or N, D], strided
+    gate_idx_ptr,  # [L] sample of each token, for packed input
     add_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
-    gate_stride,  # 0 to broadcast gate across batch
+    gate_stride,  # 0 to broadcast
     L: tl.constexpr,
     D: tl.constexpr,
     gate_type: tl.constexpr,
@@ -63,8 +63,7 @@ def gated_norm(
     eps: float = 1e-6,
     gate_idx: Tensor | None = None,
 ) -> Tensor:
-    # x: [B, L, D]. gate: [B, 1, D] or [1, 1, D].
-    # for packed varlen input, x is [1, L, D], gate is [N, 1, D] (per sample) and gate_idx is [L] (sample of each token)
+    # x: [B, L, D]. gate: [B, 1, D] or [1, 1, D]. packed: [N, 1, D] with gate_idx [L]
     if torch.is_grad_enabled():
         # if True:
         if gate is not None and gate_idx is not None:
@@ -85,7 +84,7 @@ def gated_norm(
     B, L, D = x.shape
     gate_stride = 0
     if gate is not None:
-        gate = gate.flatten(0, -2)  # [B or 1 or N, D]
+        gate = gate.flatten(0, -2)
         assert gate.shape[-1] == D and gate.stride(-1) == 1, (gate.shape, gate.stride())
         if gate_idx is not None:
             assert B == 1 and gate_idx.shape == (L,), (x.shape, gate_idx.shape)

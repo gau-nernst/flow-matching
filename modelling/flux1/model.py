@@ -89,7 +89,7 @@ class DoubleStreamBlock(nn.Module):
         self.img_mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(approximate="tanh"), nn.Linear(mlp_dim, dim))
         self.txt_mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(approximate="tanh"), nn.Linear(mlp_dim, dim))
 
-    # img, txt: [B, L, D], or [1, T, D] packed. vec: [B or N, D]. joint: [txt, img] per sample, or None
+    # joint: [txt, img] per sample
     def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, joint: Joint | None) -> tuple[Tensor, Tensor]:
         txt_varlen, img_varlen = (joint.a, joint.b) if joint is not None else (None, None)
         img_idx, txt_idx = seq_ids(img_varlen), seq_ids(txt_varlen)
@@ -147,7 +147,6 @@ class SingleStreamBlock(nn.Module):
         ]
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
-    # x: [B, L, D], or [1, T, D] packed. vec: [B or N, D]
     def forward(self, x: Tensor, vec: Tensor, pe: Tensor, varlen: Varlen | None) -> Tensor:
         shift, scale, gate = self.modulation(vec)
         x_mod, _ = modulate(x, shift, scale, eps=self.eps, idx=seq_ids(varlen))
@@ -169,7 +168,6 @@ class LastLayer(nn.Module):
         self.linear = nn.Linear(dim, patch_size * patch_size * out_channels, bias=bias)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim, bias=bias))
 
-    # x: [B, L, D], or [1, T, D] packed with varlen. vec: [B or N, D]
     def forward(self, x: Tensor, vec: Tensor, varlen: Varlen | None = None) -> Tensor:
         shift, scale = self.adaLN_modulation(vec)[:, None, :].chunk(2, dim=-1)
         return self.linear(modulate(x, shift, scale, idx=seq_ids(varlen))[0])
@@ -213,7 +211,7 @@ class Flux1(nn.Module):
         self.final_layer = LastLayer(cfg.dim, 1, cfg.img_dim)
 
     def make_rope(self, H: int, W: int, L: int):
-        # rope of one sample's joint sequence [txt, img]. H, W: patchified image size. L: text length
+        # one sample's [txt, img] rope. H, W: patchified size
         # RoPE embedding has 3 components:
         # - time: text embeds stay at pos=0, img embeds stay at pos=0
         # - height: all text embeds stay at pos=0
@@ -232,17 +230,14 @@ class Flux1(nn.Module):
         guidance: Tensor | None = None,
         varlen: Joint | None = None,
     ) -> Tensor:
-        # img: [B, L_img, C*p*p] patchified with channels_first=True. txt: [B, L_txt, D]. vec: [B, vec_dim].
-        # t, guidance: [B] or [1]. rope: [L_txt + L_img, D] from make_rope(). returns [B, L_img, C*p*p].
-        # packed (varlen=Joint of [txt, img]): img [T_img, C*p*p], txt [T_txt, D], vec [N, vec_dim],
-        # rope: cat of per-sample make_rope(). returns [T_img, C*p*p].
+        # img: [B, L, C*p*p] from patchify(channels_first=True), or [T, C*p*p] packed with varlen
         packed = varlen is not None
         if packed:
             img, txt = img[None], txt[None]
             N = varlen.varlen.num_seqs
             img_varlen, joint_varlen = varlen.b, varlen.varlen
         else:
-            N = -1  # keep t as is: [B], or [1] broadcast to the batch
+            N = -1  # keep t's shape
             img_varlen = joint_varlen = None
 
         img = self.img_in(img.to(self.img_in.weight.dtype))

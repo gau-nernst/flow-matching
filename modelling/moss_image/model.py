@@ -69,7 +69,6 @@ class TextBlock(nn.Module):
         self.ffn_gate = Linear(dim, ffn_dim)
         self.ffn_down = Linear(ffn_dim, dim)
 
-    # x: [B, L, D], or [1, T, D] packed
     def forward(self, x: Tensor, rope: Tensor, varlen: Varlen | None) -> Tensor:
         # attention
         q, k, v = self.qkv(self.norm1(x)).unflatten(-1, (3, -1, HEAD_DIM)).unbind(2)
@@ -101,7 +100,6 @@ class Block(nn.Module):
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     # FFN residual is deferred to the next block's modulate(). modulation is shared, so gate_f is the same.
-    # x: [B, L, D], or [1, T, D] packed. mod: [B or N, 6, D]
     def forward(
         self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor, varlen: Varlen | None
     ) -> tuple[Tensor, Tensor]:
@@ -173,10 +171,7 @@ class MOSSImage(nn.Module):
         varlen: Joint | None = None,
         skip_layers: tuple[int, ...] = (),
     ) -> Tensor:
-        # img: [B, L_img, C] flattened latents. txt: [B, L_txt, text_dim] without padding.
-        # time: [B] or [1] in [0, 1] (1 is noise). rope: [L_img + L_txt, D] from make_rope(). returns [B, L_img, C].
-        # packed (varlen=Joint of [img, txt]): img [T_img, C], txt [T_txt, text_dim], time [N],
-        # rope: cat of per-sample make_rope(). returns [T_img, C].
+        # img: [B, L, C], or [T, C] packed with varlen. txt: unpadded. rope: [img, txt]
         # skip_layers: blocks to skip, for the negative branch of CFG
         packed = varlen is not None
         if packed:
@@ -184,7 +179,7 @@ class MOSSImage(nn.Module):
             N = varlen.varlen.num_seqs
             txt_varlen, joint_varlen = varlen.b, varlen.varlen
         else:
-            N = -1  # keep t as is: [B], or [1] broadcast to the batch
+            N = -1  # keep t's shape
             txt_varlen = joint_varlen = None
         dtype = self.video_embedder.weight.dtype
 

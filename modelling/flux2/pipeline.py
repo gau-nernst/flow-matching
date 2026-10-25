@@ -92,12 +92,10 @@ class Flux2Pipeline:
         spec = MODELS[name]
         return cls(load_flux2(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
-    # imgs: list of uint8 [H_i, W_i, 3], can have different sizes.
-    # returns (latents, model_kwargs) for training: model(torch.cat(noisy_latents), t, **model_kwargs).
-    # latents: per-sample [L_i, C] tokens. model_kwargs: packed inputs
+    # imgs: uint8 [H_i, W_i, 3]. returns per-sample [L_i, C] latents and packed model kwargs
     def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
         with torch.no_grad():
-            latents = [self.ae.encode(x[None])[0] for x in imgs]  # [h, w, C] each
+            latents = [self.ae.encode(x[None])[0] for x in imgs]
         txts = list(self.text_encoder(prompts).unbind(0))
         txt_rope = self.model.make_txt_rope(txts[0].shape[0])
         ropes = [torch.cat([txt_rope, self.model.make_img_rope(*x.shape[:2])]) for x in latents]

@@ -47,7 +47,7 @@ class ZImagePipeline:
         spec = MODELS[name]
         return cls(load_zimage(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
-    # returns one [L_i, D] tensor per prompt, without padding
+    # one unpadded [L_i, D] per prompt
     def embed_text(self, prompts: str | list[str]) -> list[Tensor]:
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -76,13 +76,11 @@ class ZImagePipeline:
         txt_embeds = self.qwen3(input_ids, attention_mask=mask, output_hidden_states=True).last_hidden_state
         return [txt_embeds[i, mask[i]] for i in range(len(formatted_prompts))]
 
-    # imgs: list of uint8 [H_i, W_i, 3], can have different sizes.
-    # returns (latents, model_kwargs) for training: model(torch.cat(noisy_latents), t, **model_kwargs).
-    # latents: per-sample [L_i, C] tokens. model_kwargs: packed inputs
+    # imgs: uint8 [H_i, W_i, 3]. returns per-sample [L_i, C] latents and packed model kwargs
     @torch.no_grad()
     def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
         p = self.model.cfg.patch_size
-        latents = [self.ae.encode(x[None])[0] for x in imgs]  # [h, w, C] each
+        latents = [self.ae.encode(x[None])[0] for x in imgs]
         txts = self.embed_text(prompts)
         ropes = [self.model.make_rope(x.shape[0] // p, x.shape[1] // p, y.shape[0]) for x, y in zip(latents, txts)]
         tokens = [patchify(x, p) for x in latents]
@@ -163,7 +161,7 @@ def zimage_generate(
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
 
-    # prompts have different lengths, so samples are packed
+    # pack, since prompts have different lengths
     B, H, W, _ = latents.shape
     p = zimage.cfg.patch_size
     nH, nW = H // p, W // p

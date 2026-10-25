@@ -1,7 +1,5 @@
-# tests for varlen (packed) batching. run directly:
-#   PYTHONPATH=. python tests/test_varlen.py [name filter]
-# model tests run on CPU. Triton kernel tests and varlen_attn run on CUDA. without a GPU, run the kernel tests
-# with the interpreter: CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 PYTHONPATH=. python tests/test_varlen.py kernel
+# PYTHONPATH=. python tests/test_varlen.py [name filter]
+# without a GPU: CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 PYTHONPATH=. python tests/test_varlen.py kernel
 import os
 
 import torch
@@ -17,7 +15,6 @@ from modelling.z_image.model import ZImage, ZImageConfig
 TRITON_INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
 
 
-# Triton kernels run on CUDA, or on CPU with the interpreter
 def kernel_test(fn):
     def wrapper():
         if not (TRITON_INTERPRET or torch.cuda.is_available()):
@@ -37,7 +34,7 @@ def tiny_zimage() -> ZImage:
     return model
 
 
-# dense forward from main (before varlen), for one sample at a time
+# dense forward from main
 def dense_reference(model: ZImage, img: Tensor, timesteps: Tensor, txt: Tensor) -> Tensor:
     def pad_tokens(x, pad_token):
         pad_len = (-x.shape[1]) % 32
@@ -68,13 +65,12 @@ def dense_reference(model: ZImage, img: Tensor, timesteps: Tensor, txt: Tensor) 
 
 
 def masked_varlen_attn(q: Tensor, k: Tensor, v: Tensor, varlen: Varlen) -> Tensor:
-    # reference: block-diagonal mask, so tokens only attend within their sample
     mask = varlen.seq_ids[:, None] == varlen.seq_ids[None, :]
     q, k, v = [x.transpose(1, 2) for x in (q, k, v)]
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask).transpose(1, 2)
 
 
-# varlen_attn is CUDA only. model tests run on CPU and use the masked reference instead
+# model tests run on CPU
 _cuda_varlen_attn = modelling.attn.varlen_attn
 modelling.attn.varlen_attn = lambda q, k, v, varlen: (_cuda_varlen_attn if q.is_cuda else masked_varlen_attn)(
     q, k, v, varlen
@@ -101,14 +97,14 @@ def test_patchify():
         torch.testing.assert_close(unpatchify(y, 4, 6, 2, channels_first), x)
         torch.testing.assert_close(patchify(x[1], 2, channels_first), y[1])  # no batch dim
 
-    # layouts from main: Z-Image (p, p, C), Flux.1 (C, p, p) from NCHW
+    # layouts from main
     torch.testing.assert_close(patchify(x, 2), x.view(2, 4, 2, 6, 2, 4).transpose(2, 3).reshape(2, 24, 16))
     nchw = x.permute(0, 3, 1, 2)
     flux1 = nchw.reshape(2, 4, 4, 2, 6, 2).permute(0, 2, 4, 1, 3, 5).reshape(2, 24, 16)
     torch.testing.assert_close(patchify(x, 2, channels_first=True), flux1)
 
 
-# packed forward of several samples == dense forward of each sample. extra: per-sample [N, ...] model inputs
+# extra: per-sample [N, ...] inputs
 def assert_packed_matches_single(model, imgs, txts, ropes, t, txt_first, extra=None, **kwargs):
     extra = extra or {}
     img, model_kwargs = pack(imgs, txts, ropes, txt_first)
@@ -121,7 +117,6 @@ def assert_packed_matches_single(model, imgs, txts, ropes, t, txt_first, extra=N
         torch.testing.assert_close(outs[i], expected, atol=1e-5, rtol=1e-5)
 
 
-# dense [B, ...] forward == dense forward of each sample. inputs are stacked
 def assert_dense_matches_single(model, img, t, txt, rope, **kwargs):
     out = model(img, t, txt, rope, **kwargs)
     assert out.shape == img.shape, (out.shape, img.shape)
@@ -142,7 +137,7 @@ def zimage_inputs(model: ZImage, sizes, txt_lens):
 @torch.enable_grad()  # use the eager paths of custom ops
 def test_zimage_matches_main():
     model = tiny_zimage()
-    # image token counts are multiples of 32, since dense padding of image RoPE was broken on main
+    # image token counts are multiples of 32, since main's image padding is broken
     for (H, W), L in zip([(16, 16), (16, 32), (32, 16)], [5, 40, 17]):
         img = torch.randn(1, H, W, 16)
         txt = torch.randn(1, L, 64)
@@ -153,7 +148,7 @@ def test_zimage_matches_main():
 
 @torch.enable_grad()
 def test_zimage_packed():
-    # includes image token counts that need padding (6x6 = 36 tokens)
+    # 6x6 = 36 image tokens need padding
     model = tiny_zimage()
     imgs, txts, ropes = zimage_inputs(model, [(12, 12), (16, 24), (8, 40)], [3, 33, 64])
     assert_packed_matches_single(model, imgs, txts, ropes, torch.tensor([0.1, 0.5, 1.0]), txt_first=False)
@@ -168,7 +163,6 @@ def test_zimage_dense_batch():
 
 
 def test_zimage_packed_grads():
-    # grads of a packed batch == sum of per-sample grads
     model = tiny_zimage()
     imgs, txts, ropes = zimage_inputs(model, [(16, 16), (12, 20)], [9, 45])
     t = torch.tensor([0.2, 0.7])
@@ -194,9 +188,9 @@ def test_gated_norm_kernel_varlen():
     x = torch.randn(1, 10, D)
     w = torch.randn(D)
     add = torch.randn(1, 10, D)
-    gate = torch.randn(3, 1, 4 * D).chunk(4, dim=2)[1]  # non-contiguous, like the modulation chunks
+    gate = torch.randn(3, 1, 4 * D).chunk(4, dim=2)[1]  # non-contiguous
 
-    # the Triton interpreter doesn't support libdevice.tanh
+    # interpreter doesn't support libdevice.tanh
     for gate_type in ("plus_one",) if TRITON_INTERPRET else ("plus_one", "tanh"):
         with torch.no_grad():
             out = gated_norm(x, w, gate, add, gate_type, gate_idx=varlen.seq_ids)
@@ -207,7 +201,6 @@ def test_gated_norm_kernel_varlen():
 
 @kernel_test
 def test_gated_norm_kernel_batched():
-    # existing [B, L, D] usage, with per-batch and broadcast gates
     torch.manual_seed(0)
     x = torch.randn(2, 4, 64)
     w = torch.randn(64)
@@ -228,7 +221,7 @@ def test_modulate_kernel():
     x = torch.randn(1, 10, D)
     res = torch.randn(1, 10, D)
     norm = torch.randn(D)
-    shift, scale, gate = torch.randn(3, 1, 3 * D).chunk(3, dim=2)  # non-contiguous, like Modulation chunks
+    shift, scale, gate = torch.randn(3, 1, 3 * D).chunk(3, dim=2)  # non-contiguous
     idx = Varlen.from_lens([3, 5, 2]).seq_ids
     for kwargs in (dict(idx=idx), dict(idx=idx, res=res, gate=gate, norm_weight=norm, rms=True)):
         with torch.no_grad():
@@ -238,7 +231,6 @@ def test_modulate_kernel():
         for a, b in zip(out, expected):
             torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
 
-    # existing [B, L, D] usage
     x = torch.randn(3, 4, D)
     res = torch.randn_like(x)
     with torch.no_grad():
@@ -326,7 +318,6 @@ def test_moss():
 
 @torch.enable_grad()
 def test_compute_loss_multires():
-    # loss and grads on a mixed-resolution batch == mean of per-sample losses
     from time_sampler import Uniform
     from train_utils import compute_loss
 
@@ -338,7 +329,7 @@ def test_compute_loss_multires():
     loss.backward()
     grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
 
-    # replay the same random draws one sample at a time
+    # same random draws, one sample at a time
     model.zero_grad()
     torch.manual_seed(1)
     t = Uniform()(2, device="cpu")

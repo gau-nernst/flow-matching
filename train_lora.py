@@ -54,7 +54,7 @@ class ImageDataset(IterableDataset):
         self.shuffle_rng = torch.Generator()
         self.shuffle_rng.seed()
 
-    # yields (list of uint8 [H, W, 3], list of prompts). images in a batch can have different sizes (varlen)
+    # yields (list of uint8 [H, W, 3], list of prompts). sizes can differ
     def __iter__(self):
         batch = []
         counter = -1

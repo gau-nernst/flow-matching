@@ -6,7 +6,7 @@ from .varlen import Varlen, is_packed, varlen_attn
 
 
 def dispatch_attn(q: Tensor, k: Tensor, v: Tensor, impl: str = "pt", varlen: Varlen | None = None) -> Tensor:
-    # q, k, v: [B, L, H, D]. with varlen, B=1 and samples are packed along L
+    # q, k, v: [B, L, H, D], or [1, T, H, D] packed
     if is_packed(varlen):
         if impl != "pt":
             raise NotImplementedError(f"varlen attention is not supported for {impl=}")

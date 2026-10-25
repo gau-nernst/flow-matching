@@ -90,7 +90,6 @@ class DoubleStreamBlock(nn.Module):
         norms: tuple[Tensor, Tensor],
         joint: Joint | None,
     ) -> Tensor:
-        # apply RoPE + QK-norm to each stream, then merge into the joint [txt, img] sequence
         qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else txt_x.dtype
         txt_pe, img_pe = pe
         txt_norm, img_norm = norms
@@ -107,8 +106,7 @@ class DoubleStreamBlock(nn.Module):
         img_x = apply_rope(img_x, img_pe, img_norm, self.eps)
         return merge(txt_x, img_x, joint).to(qk_dtype)
 
-    # img, txt: [B, L, D], or [1, T, D] packed. pe: (txt_pe, img_pe). mod_*: [B or N, 1, D].
-    # joint: [txt, img] per sample, or None
+    # pe: (txt_pe, img_pe). joint: [txt, img] per sample
     def forward(
         self,
         img: Tensor,
@@ -163,7 +161,6 @@ class SingleStreamBlock(nn.Module):
         ]
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
-    # x: [B, L, D], or [1, T, D] packed. mod: [B or N, 1, D]
     def forward(
         self, x: Tensor, res: Tensor | None, pe: Tensor, mod: tuple[Tensor, ...], varlen: Varlen | None
     ) -> Tensor:
@@ -265,17 +262,14 @@ class Flux2(nn.Module):
         guidance: Tensor | None = None,
         varlen: Joint | None = None,
     ) -> Tensor:
-        # img: [B, L_img, C]. txt: [B, L_txt, D]. time, guidance: [B] or [1].
-        # rope: [L_txt + L_img, D/2] from make_txt_rope() and make_img_rope(). returns [B, L_img, C].
-        # packed (varlen=Joint of [txt, img]): img [T_img, C], txt [T_txt, D], time [N],
-        # rope: cat of per-sample ropes. returns [T_img, C].
+        # img: [B, L, C], or [T, C] packed with varlen. rope: [txt, img]
         packed = varlen is not None
         if packed:
             img, txt = img[None], txt[None]
             N = varlen.varlen.num_seqs
             txt_varlen, img_varlen, joint_varlen = varlen.a, varlen.b, varlen.varlen
         else:
-            N = -1  # keep t as is: [B], or [1] broadcast to the batch
+            N = -1  # keep t's shape
             txt_varlen = img_varlen = joint_varlen = None
         L_txt = txt.shape[1]
         pe = split(rope, L_txt, varlen, dim=0)  # (txt_pe, img_pe)

@@ -17,7 +17,7 @@ from ..utils import create_weight_merge_hook, load_hf_state_dict
 from ..varlen import Joint, Varlen, merge, per_token, seq_ids, split
 from .gated_norm import gated_norm
 
-SEQ_MULTIPLE = 32  # each sample's image and text tokens are padded to a multiple of this
+SEQ_MULTIPLE = 32  # pad each sample's image and text to a multiple of this
 
 
 class FinalLayer(nn.Module):
@@ -27,7 +27,7 @@ class FinalLayer(nn.Module):
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), Linear(256, hidden_size))
 
     def forward(self, x: Tensor, c: Tensor, varlen: Varlen | None = None) -> Tensor:
-        scale = per_token(self.adaLN_modulation(c).unsqueeze(1), varlen)  # [B, 1, D] or [1, T, D]
+        scale = per_token(self.adaLN_modulation(c).unsqueeze(1), varlen)
         x = (1.0 + scale) * F.layer_norm(x, x.shape[-1:], eps=1e-6)
         return self.linear(x)
 
@@ -99,7 +99,6 @@ class Block(nn.Module):
         self.ffn_norm2 = nn.RMSNorm(dim, eps=eps)
         self.eps = eps
 
-    # x: [1, T, D] packed (varlen) or [B, L, D]. adaln_input: [N, mod_dim] per sample
     def forward(self, x: Tensor, adaln_input: Tensor | None, pe: Tensor, varlen: Varlen | None = None) -> Tensor:
         idx = seq_ids(varlen)
 
@@ -170,7 +169,7 @@ class ZImage(nn.Module):
         return list(self.layers)
 
     def make_rope(self, nH: int, nW: int, L_txt: int) -> Tensor:
-        # rope of one sample's joint sequence [img, txt], both padded to a multiple of SEQ_MULTIPLE.
+        # one sample's [img, txt] rope, both padded.
         # RoPE embedding has 3 components:
         # - time: text embeds stay at pos=[1,L+1), img embeds stay at pos=L+1, where L is the padded text length
         # - height: all text embeds stay at pos=0
@@ -187,22 +186,18 @@ class ZImage(nn.Module):
         # inputs/outputs follow the repo convention: t=1 is noise, predict velocity (noise - data).
         # the original Z-Image uses t=0 as noise and predicts (data - noise), so flip both t and v.
         #
-        # img: [B, L_img, p*p*C] patchified. txt: [B, L_txt, txt_dim] without padding. timesteps: [B] or [1].
-        # rope: [L, D] from make_rope(). returns [B, L_img, p*p*C].
-        # packed (varlen=Joint of [img, txt]): img [T_img, p*p*C], txt [T_txt, txt_dim], timesteps [N],
-        # rope: cat of per-sample make_rope(). returns [T_img, p*p*C].
+        # img: [B, L, p*p*C], or [T, p*p*C] packed with varlen. txt: unpadded. rope: from make_rope()
         packed = varlen is not None
         if packed:
             img, txt = img[None], txt[None]
             N = varlen.varlen.num_seqs
         else:
-            N = -1  # keep t as is: [B], or [1] broadcast to the batch
+            N = -1  # keep t's shape
 
         t_embeds = timestep_embedding(1 - timesteps.expand(N), 256)
         t_embeds = self.t_embedder(t_embeds.to(self.t_embedder[0][0].weight.dtype))  # [N, mod_dim]
 
-        # each sample's image and text are padded to a multiple of SEQ_MULTIPLE with learned pad tokens.
-        # padding is done after embedding, so it happens here instead of in the caller.
+        # pad with learned tokens, so it must happen after embedding
         if packed:
             img_lens, txt_lens = varlen.a.lens, varlen.b.lens
             pad_img_lens, pad_txt_lens = [_round_up(L) for L in img_lens], [_round_up(L) for L in txt_lens]
@@ -247,7 +242,6 @@ def _round_up(L: int) -> int:
 
 
 def _pad(x: Tensor, lens: list[int], pad_token: Tensor) -> Tensor:
-    # x: [B, L, D], or [1, T, D] packed with per-sample lens. pad each sample to a multiple of SEQ_MULTIPLE
     B = x.shape[0]
     xs = x.split(lens, dim=1) if len(lens) > 1 else [x]
     out = []

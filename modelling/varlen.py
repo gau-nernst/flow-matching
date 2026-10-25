@@ -5,17 +5,14 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-# packed batch of variable-length sequences. tokens of all samples are concatenated along the sequence dim.
-# models take packed inputs as [T, ...] and run blocks on [1, T, ...], so existing [B, L, ...] kernels work.
-#
-# code inside model blocks should only use the tensor fields and num_seqs, not lens. torch.compile guards
-# on the Python values a block reads, so reading lens would recompile for every new batch composition.
+# packed sequences, concatenated along the sequence dim. blocks run on [1, T, ...].
+# blocks must not read lens, otherwise torch.compile recompiles for every batch composition.
 @dataclasses.dataclass(frozen=True)
 class Varlen:
     lens: tuple[int, ...]
     cu_seqlens: Tensor  # [N+1] int32
-    seq_ids: Tensor  # [T] int32, sample index of each token. used to look up per-sample conditioning
-    max_seqlen: int  # rounded up, to reduce recompiles. only used to size attention kernels
+    seq_ids: Tensor  # [T] int32, sample of each token
+    max_seqlen: int  # rounded up to reduce recompiles
     num_seqs: int
 
     @staticmethod
@@ -29,14 +26,13 @@ class Varlen:
         return Varlen(tuple(lens), cu_seqlens, seq_ids, max_seqlen, len(lens))
 
 
-# joint sequence made of two packed streams a and b, concatenated per sample: [a_0, b_0, a_1, b_1, ...].
-# e.g. [txt, img] in Flux, [img, txt] in Z-Image and MOSS. this is the varlen input of all models.
+# two packed streams, interleaved per sample: [a_0, b_0, a_1, b_1, ...]
 @dataclasses.dataclass(frozen=True)
 class Joint:
     a: Varlen
     b: Varlen
     varlen: Varlen  # of the joint sequence
-    gather: Tensor  # [Ta + Tb] index into cat([a, b]) for each joint token
+    gather: Tensor  # [Ta + Tb] index into cat([a, b])
     a_pos: Tensor  # [Ta] positions of a tokens in the joint sequence
     b_pos: Tensor  # [Tb]
 
@@ -55,8 +51,7 @@ class Joint:
         return Joint(a, b, varlen, *(torch.cat(x).to(device) for x in (gather, a_pos, b_pos)))
 
 
-# helpers below accept None (dense [B, L, ...] batch), and run the dense code path for a single packed
-# sample too. lengths come from tensor shapes, not Python values.
+# helpers below take None for a dense batch. a single packed sample also takes the dense path
 def is_packed(varlen: Varlen | Joint | None) -> bool:
     if isinstance(varlen, Joint):
         varlen = varlen.varlen
@@ -69,7 +64,6 @@ def merge(a: Tensor, b: Tensor, joint: Joint | None, dim: int = 1) -> Tensor:
 
 
 def split(x: Tensor, a_len: int, joint: Joint | None, dim: int = 1) -> tuple[Tensor, Tensor]:
-    # a_len: length of stream a in the dense case
     if is_packed(joint):
         return x.index_select(dim, joint.a_pos), x.index_select(dim, joint.b_pos)
     return x.narrow(dim, 0, a_len), x.narrow(dim, a_len, x.shape[dim] - a_len)
@@ -79,7 +73,7 @@ def seq_ids(varlen: Varlen | None) -> Tensor | None:
     return varlen.seq_ids if is_packed(varlen) else None
 
 
-# per-sample conditioning [N, 1, D] -> per-token [1, T, D] for packed input. no-op otherwise
+# [N, 1, D] -> [1, T, D] for packed input
 def per_token(cond: Tensor, varlen: Varlen | None) -> Tensor:
     if not is_packed(varlen):
         return cond
@@ -87,19 +81,19 @@ def per_token(cond: Tensor, varlen: Varlen | None) -> Tensor:
 
 
 def varlen_attn(q: Tensor, k: Tensor, v: Tensor, varlen: Varlen) -> Tensor:
-    # q, k, v: [1, T, H, D] packed. CUDA only
+    # CUDA only
     from torch.nn.attention.varlen import varlen_attn as _varlen_attn
 
     cu, max_len = varlen.cu_seqlens, varlen.max_seqlen
     return _varlen_attn(q[0], k[0], v[0], cu, cu, max_len, max_len).unsqueeze(0)
 
 
-# [..., H, W, C] -> [..., H/p * W/p, p * p * C]. channels_first: features are ordered (C, p, p) (Flux.1)
+# [..., H, W, C] -> [..., H/p * W/p, p * p * C]. channels_first: (C, p, p) order, for Flux.1
 def patchify(x: Tensor, p: int, channels_first: bool = False) -> Tensor:
     *B, H, W, C = x.shape
     n = len(B)
     x = x.reshape(*B, H // p, p, W // p, p, C)
-    order = (0, 2, 4, 1, 3) if channels_first else (0, 2, 1, 3, 4)  # (nH, nW, ...) then the patch
+    order = (0, 2, 4, 1, 3) if channels_first else (0, 2, 1, 3, 4)
     x = x.permute(*range(n), *(n + i for i in order))
     return x.reshape(*B, (H // p) * (W // p), p * p * C)
 
@@ -118,8 +112,7 @@ def unpatchify(x: Tensor, nH: int, nW: int, p: int, channels_first: bool = False
     return x.reshape(*B, nH * p, nW * p, C)
 
 
-# pack per-sample tokens into model inputs: model(img, t, **kwargs).
-# imgs: [L_img_i, C] each. txts: [L_txt_i, D] each. ropes: per-sample joint ropes, in the model's order.
+# returns (img, kwargs) for model(img, t, **kwargs). ropes: per-sample joint ropes
 def pack(
     imgs: list[Tensor], txts: list[Tensor], ropes: list[Tensor], txt_first: bool
 ) -> tuple[Tensor, dict[str, Tensor | Joint]]:
