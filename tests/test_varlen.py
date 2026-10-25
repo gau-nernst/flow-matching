@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from modelling.flux1.model import timestep_embedding
+import modelling.attn
 from modelling.varlen import Varlen, varlen_attn
 from modelling.z_image.gated_norm import gated_norm
 from modelling.z_image.model import ZImage, ZImageConfig
@@ -54,18 +55,27 @@ def dense_reference(model: ZImage, img: Tensor, timesteps: Tensor, txt: Tensor) 
     return -unified.view(B, nH, nW, p, p, C).transpose(2, 3).reshape(B, H, W, C)
 
 
-def test_varlen_attn_reference():
-    torch.manual_seed(0)
-    lens = [5, 17, 32]
-    varlen = Varlen.from_lens(lens)
-    q, k, v = torch.randn(3, 1, sum(lens), 2, 64).unbind(0)
-    out = varlen_attn(q, k, v, varlen)
+def masked_varlen_attn(q: Tensor, k: Tensor, v: Tensor, varlen: Varlen) -> Tensor:
+    # reference: block-diagonal mask, so tokens only attend within their sample
+    mask = varlen.seq_ids[:, None] == varlen.seq_ids[None, :]
+    q, k, v = [x.transpose(1, 2) for x in (q, k, v)]
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask).transpose(1, 2)
 
-    # block-diagonal mask
-    seq = varlen.seq_ids
-    mask = seq[:, None] == seq[None, :]
-    expected = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mask)
-    torch.testing.assert_close(out, expected.transpose(1, 2))
+
+# varlen_attn is CUDA only. model tests on CPU use the masked reference instead
+if not torch.cuda.is_available():
+    modelling.attn.varlen_attn = masked_varlen_attn
+
+
+def test_varlen_attn():
+    if not torch.cuda.is_available():
+        print("  skipped: needs CUDA")
+        return
+    torch.manual_seed(0)
+    lens = [5, 17, 300]
+    varlen = Varlen.from_lens(lens, "cuda")
+    q, k, v = torch.randn(3, 1, sum(lens), 2, 64, device="cuda", dtype=torch.bfloat16).unbind(0)
+    torch.testing.assert_close(varlen_attn(q, k, v, varlen), masked_varlen_attn(q, k, v, varlen))
 
 
 @torch.enable_grad()  # use the eager paths of custom ops

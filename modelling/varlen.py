@@ -77,14 +77,8 @@ def per_token(cond: Tensor, varlen: Varlen | None) -> Tensor:
 
 
 def varlen_attn(q: Tensor, k: Tensor, v: Tensor, varlen: Varlen) -> Tensor:
-    # q, k, v: [1, T, H, D] packed
-    if q.is_cuda:
-        from torch.nn.attention.varlen import varlen_attn as _varlen_attn
+    # q, k, v: [1, T, H, D] packed. CUDA only
+    from torch.nn.attention.varlen import varlen_attn as _varlen_attn
 
-        cu, max_len = varlen.cu_seqlens, varlen.max_seqlen
-        return _varlen_attn(q[0], k[0], v[0], cu, cu, max_len, max_len).unsqueeze(0)
-
-    # reference: block-diagonal mask, so tokens only attend within their sample. O(T^2) memory
-    mask = varlen.seq_ids[:, None] == varlen.seq_ids[None, :]
-    q, k, v = [x.transpose(1, 2) for x in (q, k, v)]
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask).transpose(1, 2)
+    cu, max_len = varlen.cu_seqlens, varlen.max_seqlen
+    return _varlen_attn(q[0], k[0], v[0], cu, cu, max_len, max_len).unsqueeze(0)
