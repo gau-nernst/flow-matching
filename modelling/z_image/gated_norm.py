@@ -9,11 +9,12 @@ from torch import Tensor
 def _gated_norm_kernel(
     x_ptr,  # [B, L, D]
     w_ptr,  # [D]
-    gate_ptr,  # [B, D]
+    gate_ptr,  # [B, D] or [1, D]
     add_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
     L: tl.constexpr,
     D: tl.constexpr,
+    gate_stride_b: tl.constexpr,  # 0 to broadcast gate across batch
     gate_type: tl.constexpr,
     eps: float = 1e-5,
 ):
@@ -26,7 +27,7 @@ def _gated_norm_kernel(
     x = tl.load(x_ptr + (pid_b * L * D + pid_l * D + offs), mask, other=0.0)
     w = tl.load(w_ptr + offs, mask)
     if gate_ptr is not None:
-        gate = tl.load(gate_ptr + (pid_b * D + offs), mask)
+        gate = tl.load(gate_ptr + (pid_b * gate_stride_b + offs), mask)
 
     x = x.to(tl.float32)
     var = tl.sum(x * x) * (1.0 / D)
@@ -71,11 +72,13 @@ def gated_norm(
         return x
 
     assert x.is_contiguous() and w.is_contiguous()
+    B, L, D = x.shape
+    gate_stride_b = 0
     if gate is not None:
-        assert gate.is_contiguous()
+        assert gate.is_contiguous() and gate.numel() in (D, B * D), gate.shape
+        gate_stride_b = 0 if gate.numel() == D else D
     if add is not None:
         assert add.is_contiguous()
-    B, L, D = x.shape
     out = torch.empty_like(x)
-    _gated_norm_kernel[(L, B)](x, w, gate, add, out, L, D, gate_type, eps)
+    _gated_norm_kernel[(L, B)](x, w, gate, add, out, L, D, gate_stride_b, gate_type, eps)
     return out
