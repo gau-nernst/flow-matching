@@ -12,6 +12,7 @@ from ..attn import dispatch_attn
 from ..flux1.model import LastLayer, MLPEmbedder, Modulation, timestep_embedding
 from ..flux1.modulate import modulate
 from ..linear import Linear, nvfp4_mm
+from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
 
@@ -303,17 +304,6 @@ def _load_flux2(repo_id: str, filename: str):
     return model
 
 
-def load_flux2(name: str = "klein-4B"):
-    repo_id, filename = {
-        "dev": ("black-forest-labs/FLUX.2-dev", "flux2-dev.safetensors"),
-        "klein-4B": ("black-forest-labs/FLUX.2-klein-4B", "flux-2-klein-4b.safetensors"),
-        "klein-4B-fp8": ("black-forest-labs/FLUX.2-klein-4b-fp8", "flux-2-klein-4b-fp8.safetensors"),
-        "klein-4B-nvfp4": ("black-forest-labs/FLUX.2-klein-4b-nvfp4", "flux-2-klein-4b-nvfp4.safetensors"),
-        "klein-9B": ("black-forest-labs/FLUX.2-klein-9B", "flux-2-klein-9b.safetensors"),
-        "klein-9B-fp8": ("black-forest-labs/FLUX.2-klein-9b-fp8", "flux-2-klein-9b-fp8.safetensors"),
-        "klein-9B-nvfp4": ("black-forest-labs/FLUX.2-klein-9b-nvfp4", "flux-2-klein-9b-nvfp4.safetensors"),
-        "klein-base-4B": ("black-forest-labs/FLUX.2-klein-base-4B", "flux-2-klein-base-4b.safetensors"),
-        "klein-base-9B": ("black-forest-labs/FLUX.2-klein-base-9B", "flux-2-klein-base-9b.safetensors"),
-    }[name]
-
-    return _load_flux2(repo_id, filename)
+def load_flux2(name: str = "flux2-klein-4B"):
+    spec = MODELS[name]
+    return _load_flux2(spec.repo_id, spec.filename)

@@ -7,6 +7,7 @@ from torch import Tensor, nn
 from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer, Qwen3Model
 
+from ..registry import MODELS
 from ..solvers import get_solver
 from ..vae import load_vae
 from .model import ZImage, load_zimage
@@ -16,13 +17,13 @@ class ZImagePipeline:
     BASE_DEFAULTS = dict(num_steps=28, cfg_scale=3.0, time_shift=6.0)
     TURBO_DEFAULTS = dict(num_steps=8, cfg_scale=1.0, time_shift=3.0)
 
-    def __init__(self, zimage: ZImage | None = None) -> None:
+    def __init__(self, zimage: ZImage | None = None, text_encoder_id: str = "Qwen/Qwen3-4B") -> None:
         self.zimage = zimage or load_zimage().bfloat16()
         self.ae = load_vae("flux1").bfloat16()
 
         # text stuff
-        self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B")
-        self.qwen3 = Qwen3Model.from_pretrained("Qwen/Qwen3-4B", dtype="auto")
+        self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_id)
+        self.qwen3 = Qwen3Model.from_pretrained(text_encoder_id, dtype="auto")
         # prune unneeded parts
         self.qwen3.layers = self.qwen3.layers[:-1]
         self.qwen3.norm = nn.Identity()
@@ -36,6 +37,17 @@ class ZImagePipeline:
         for m in (self.ae, self.qwen3, self.zimage):
             m.cuda()
         return self
+
+    @property
+    def model(self) -> ZImage:
+        return self.zimage
+
+    @classmethod
+    def load(cls, name: str):
+        zimage = load_zimage(name)
+        if "nvfp4" not in name:  # HF checkpoints are FP32
+            zimage.bfloat16()
+        return cls(zimage, MODELS[name].text_encoder_id)
 
     @staticmethod
     def embed_text(tokenizer: PreTrainedTokenizer, qwen3: Qwen3Model, prompts: str | list[str]):

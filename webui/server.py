@@ -13,26 +13,15 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from modelling import Flux2Pipeline, ZImagePipeline, load_zimage
+from modelling import MODELS, Flux2Pipeline, ZImagePipeline, load_pipeline
 
 APP_ROOT = Path(__file__).resolve().parent
 STATIC_DIR = APP_ROOT / "static"
 IMAGE_DIR = APP_ROOT / "images"
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-MODEL_DEFAULTS = {
-    "FLUX.2-klein-4B": Flux2Pipeline.KLEIN_DEFAULTS,
-    "FLUX.2-klein-4B-fp8": Flux2Pipeline.KLEIN_DEFAULTS,
-    "FLUX.2-klein-4B-nvfp4": Flux2Pipeline.KLEIN_DEFAULTS,
-    "FLUX.2-klein-9B": Flux2Pipeline.KLEIN_DEFAULTS,
-    "FLUX.2-klein-9B-fp8": Flux2Pipeline.KLEIN_DEFAULTS,
-    "FLUX.2-klein-9B-nvfp4": Flux2Pipeline.KLEIN_DEFAULTS,
-    "FLUX.2-klein-base-4B": Flux2Pipeline.KLEIN_BASE_DEFAULTS,
-    "FLUX.2-klein-base-9B": Flux2Pipeline.KLEIN_BASE_DEFAULTS,
-    "Z-Image-Turbo": ZImagePipeline.TURBO_DEFAULTS,
-    "Z-Image-Turbo-nvfp4": ZImagePipeline.TURBO_DEFAULTS,
-    "Z-Image-Base": ZImagePipeline.BASE_DEFAULTS,
-}
+# skip models whose text encoder is not supported yet
+MODEL_DEFAULTS = {name: spec.sample_defaults for name, spec in MODELS.items() if spec.text_encoder_id is not None}
 
 PIPELINE: Flux2Pipeline | ZImagePipeline | None = None
 ACTIVE_MODEL: str | None = None
@@ -67,7 +56,7 @@ def _set_attention_impl(attention_impl: str) -> int:
     if PIPELINE is None:
         return 0
 
-    model = PIPELINE.flux if isinstance(PIPELINE, Flux2Pipeline) else PIPELINE.zimage
+    model = PIPELINE.model
     updated = 0
     for module in model.modules():
         if hasattr(module, "attn_impl"):
@@ -224,19 +213,7 @@ def load_model(model_name: str):
         gc.collect()
         torch.cuda.empty_cache()
 
-    if model_name.startswith("FLUX.2-"):
-        PIPELINE = Flux2Pipeline.load(model_name.removeprefix("FLUX.2-"))
-
-    elif model_name.startswith("Z-Image-"):
-        zimage_name = model_name.removeprefix("Z-Image-").lower()
-        zimage = load_zimage(zimage_name)
-        if "nvfp4" not in zimage_name:
-            zimage.bfloat16()
-        PIPELINE = ZImagePipeline(zimage)
-
-    else:
-        raise ValueError(f"Unsupported model {model_name}")
-
+    PIPELINE = load_pipeline(model_name)
     _set_attention_impl(ATTENTION_IMPL)
     PIPELINE.cuda()
     ACTIVE_MODEL = model_name

@@ -21,7 +21,7 @@ from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, IterableDataset, default_collate, get_worker_info
 from tqdm import tqdm
 
-from modelling import AutoEncoder, Flux2
+from modelling import MODELS, AutoEncoder, Flux2
 from modelling.flux2.pipeline import Flux2Qwen3TextEncoder, flux2_generate, flux2_time_shift
 from time_sampler import LogitNormal, Uniform
 from train_utils import EMA, compute_loss, parse_img_size, random_resize, setup_model
@@ -161,8 +161,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval_interval", type=int, default=100)
     parser.add_argument("--test_img_size", type=parse_img_size, default=(512, 512))
     parser.add_argument("--test_prompt_path", required=True)
-    parser.add_argument("--test_num_steps", type=int)  # default: 50 for base models, 4 otherwise
-    parser.add_argument("--test_cfg_scale", type=float)  # default: 4.0 for base models, 1.0 otherwise
+    parser.add_argument("--test_num_steps", type=int)  # default: from model registry
+    parser.add_argument("--test_cfg_scale", type=float)  # default: from model registry
     parser.add_argument("--log_dir", type=Path, required=True)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--run_name", default="Debug")
@@ -170,10 +170,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     assert args.batch_size % args.gradient_accumulation == 0
-    is_base = "base" in args.model
+    defaults = MODELS[args.model].sample_defaults
     sample_kwargs = dict(
-        num_steps=args.test_num_steps if args.test_num_steps is not None else (50 if is_base else 4),
-        cfg_scale=args.test_cfg_scale if args.test_cfg_scale is not None else (4.0 if is_base else 1.0),
+        num_steps=args.test_num_steps if args.test_num_steps is not None else defaults["num_steps"],
+        cfg_scale=args.test_cfg_scale if args.test_cfg_scale is not None else defaults["cfg_scale"],
     )
     batch_size = args.batch_size // args.gradient_accumulation
     torch._dynamo.config.cache_size_limit = 1000

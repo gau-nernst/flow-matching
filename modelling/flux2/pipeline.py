@@ -12,6 +12,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from ..offload import PerLayerOffloadCUDAStream
 from ..qwen3 import Qwen3ForCausalLM
+from ..registry import MODELS
 from ..solvers import get_solver
 from ..vae import load_vae
 from .model import Flux2, load_flux2
@@ -87,15 +88,16 @@ class Flux2Pipeline:
             m.cuda()
         return self
 
-    @staticmethod
-    def load(name: str):
-        if "4B" in name:
-            text_id = "Qwen/Qwen3-4B-FP8"
-        elif "9B" in name:
-            text_id = "Qwen/Qwen3-8B-FP8"
-        else:
-            raise ValueError
-        return Flux2Pipeline(load_flux2(name), text_id)
+    @property
+    def model(self) -> Flux2:
+        return self.flux
+
+    @classmethod
+    def load(cls, name: str):
+        text_encoder_id = MODELS[name].text_encoder_id
+        if text_encoder_id is None:
+            raise ValueError(f"Text encoder for {name} is not supported")
+        return cls(load_flux2(name), text_encoder_id)
 
     # default is for klein
     @torch.no_grad()

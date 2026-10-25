@@ -11,6 +11,7 @@ from torch import Tensor, nn
 from ..attn import dispatch_attn
 from ..flux1.model import timestep_embedding
 from ..linear import Linear, nvfp4_mm
+from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_weight_merge_hook, load_hf_state_dict
 from .gated_norm import gated_norm
@@ -215,25 +216,10 @@ class ZImage(nn.Module):
         return -img
 
 
-def load_zimage(name: str = "turbo"):
-    (
-        repo_id,
-        filename,
-    ) = {
-        "turbo": (
-            "Tongyi-MAI/Z-Image-Turbo",
-            "transformer/diffusion_pytorch_model.safetensors.index.json",
-        ),
-        "base": (
-            "Tongyi-MAI/Z-Image",
-            "transformer/diffusion_pytorch_model.safetensors.index.json",
-        ),
-        "turbo-nvfp4": (
-            "Comfy-Org/z_image_turbo",
-            "split_files/diffusion_models/z_image_turbo_nvfp4.safetensors",
-        ),
-    }[name]
-    state_dict = load_hf_state_dict(repo_id, filename)
+def load_zimage(name: str = "z-image-turbo"):
+    spec = MODELS[name]
+    repo_id = spec.repo_id
+    state_dict = load_hf_state_dict(repo_id, spec.filename)
 
     # remap comfy ckpt
     if repo_id.startswith("Comfy-Org/"):

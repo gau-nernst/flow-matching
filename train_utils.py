@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 from torchvision.transforms import v2
 
 from modelling import (
+    MODELS,
     Flux2,
     Flux2Qwen3TextEncoder,
     load_flux2,
@@ -24,21 +25,14 @@ def setup_model(
     model_name: str, lora: int, fp8: bool, use_compile: bool, mem_budget: float = 0.7, ckpt_ratio: float = 0.5
 ):
     if model_name.startswith("flux2-"):
-        model = load_flux2(model_name.removeprefix("flux2-"))
+        model = load_flux2(model_name)
         layers = list(model.double_blocks) + list(model.single_blocks)
 
         ae = load_vae("flux2")
-
-        if model_name.startswith(("flux2-klein-4B", "flux2-klein-base-4B")):
-            text_id = "Qwen/Qwen3-4B-FP8"
-        elif model_name.startswith(("flux2-klein-9B", "flux2-klein-base-9B")):
-            text_id = "Qwen/Qwen3-8B-FP8"
-        else:
-            raise ValueError
-        text_embedder = Flux2Qwen3TextEncoder(text_id)
+        text_embedder = Flux2Qwen3TextEncoder(MODELS[model_name].text_encoder_id)
 
     elif model_name.startswith("z-image-"):
-        model = load_zimage(model_name.removeprefix("z-image-"))
+        model = load_zimage(model_name)
         layers = list(model.layers)
 
         ae = load_vae("flux1")
