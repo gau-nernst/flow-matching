@@ -12,7 +12,7 @@ from ..attn import dispatch_attn
 from ..linear import Linear
 from ..rope import RopeND, apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-from ..varlen import Joint, Varlen, per_token
+from ..varlen import Joint, Varlen, merge, per_token, seq_ids, split
 from .modulate import modulate
 
 
@@ -89,29 +89,30 @@ class DoubleStreamBlock(nn.Module):
         self.img_mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(approximate="tanh"), nn.Linear(mlp_dim, dim))
         self.txt_mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(approximate="tanh"), nn.Linear(mlp_dim, dim))
 
-    # img, txt: [1, T, D] packed. vec: [N, D] per sample. joint: [txt, img] per sample
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, joint: Joint) -> tuple[Tensor, Tensor]:
-        txt_varlen, img_varlen = joint.a, joint.b
+    # img, txt: [B, L, D], or [1, T, D] packed. vec: [B or N, D]. joint: [txt, img] per sample, or None
+    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, joint: Joint | None) -> tuple[Tensor, Tensor]:
+        txt_varlen, img_varlen = (joint.a, joint.b) if joint is not None else (None, None)
+        img_idx, txt_idx = seq_ids(img_varlen), seq_ids(txt_varlen)
         img_shift1, img_scale1, img_gate1, img_shift2, img_scale2, img_gate2 = self.img_mod(vec)
         txt_shift1, txt_scale1, txt_gate1, txt_shift2, txt_scale2, txt_gate2 = self.txt_mod(vec)
 
-        img_mod1 = modulate(img, img_shift1, img_scale1, eps=self.eps, idx=img_varlen.seq_ids)[0]
-        txt_mod1 = modulate(txt, txt_shift1, txt_scale1, eps=self.eps, idx=txt_varlen.seq_ids)[0]
+        img_mod1 = modulate(img, img_shift1, img_scale1, eps=self.eps, idx=img_idx)[0]
+        txt_mod1 = modulate(txt, txt_shift1, txt_scale1, eps=self.eps, idx=txt_idx)[0]
         img_q, img_k, img_v = self.img_attn.forward_qkv(img_mod1)
         txt_q, txt_k, txt_v = self.txt_attn.forward_qkv(txt_mod1)
 
-        q = apply_rope(joint.merge(txt_q, img_q), pe)
-        k = apply_rope(joint.merge(txt_k, img_k), pe)
-        v = joint.merge(txt_v, img_v)
-        attn = dispatch_attn(q, k, v, self.attn_impl, joint.varlen).flatten(2)
-        txt_attn, img_attn = joint.split(attn)
+        q = apply_rope(merge(txt_q, img_q, joint), pe)
+        k = apply_rope(merge(txt_k, img_k, joint), pe)
+        v = merge(txt_v, img_v, joint)
+        attn = dispatch_attn(q, k, v, self.attn_impl, joint.varlen if joint is not None else None).flatten(2)
+        txt_attn, img_attn = split(attn, txt.shape[1], joint)
 
         img = torch.addcmul(img, per_token(img_gate1, img_varlen), self.img_attn.proj(img_attn))
-        img_mod2 = modulate(img, img_shift2, img_scale2, idx=img_varlen.seq_ids)[0]
+        img_mod2 = modulate(img, img_shift2, img_scale2, idx=img_idx)[0]
         img = torch.addcmul(img, per_token(img_gate2, img_varlen), self.img_mlp(img_mod2))
 
         txt = torch.addcmul(txt, per_token(txt_gate1, txt_varlen), self.txt_attn.proj(txt_attn))
-        txt_mod2 = modulate(txt, txt_shift2, txt_scale2, idx=txt_varlen.seq_ids)[0]
+        txt_mod2 = modulate(txt, txt_shift2, txt_scale2, idx=txt_idx)[0]
         txt = torch.addcmul(txt, per_token(txt_gate2, txt_varlen), self.txt_mlp(txt_mod2))
 
         return img, txt
@@ -146,10 +147,10 @@ class SingleStreamBlock(nn.Module):
         ]
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
-    # x: [1, T, D] packed. vec: [N, D] per sample
-    def forward(self, x: Tensor, vec: Tensor, pe: Tensor, varlen: Varlen) -> Tensor:
+    # x: [B, L, D], or [1, T, D] packed. vec: [B or N, D]
+    def forward(self, x: Tensor, vec: Tensor, pe: Tensor, varlen: Varlen | None) -> Tensor:
         shift, scale, gate = self.modulation(vec)
-        x_mod, _ = modulate(x, shift, scale, eps=self.eps, idx=varlen.seq_ids)
+        x_mod, _ = modulate(x, shift, scale, eps=self.eps, idx=seq_ids(varlen))
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.dim, self.mlp_dim], dim=-1)
 
         q, k, v = qkv.unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
@@ -171,8 +172,7 @@ class LastLayer(nn.Module):
     # x: [B, L, D], or [1, T, D] packed with varlen. vec: [B or N, D]
     def forward(self, x: Tensor, vec: Tensor, varlen: Varlen | None = None) -> Tensor:
         shift, scale = self.adaLN_modulation(vec)[:, None, :].chunk(2, dim=-1)
-        idx = varlen.seq_ids if varlen is not None else None
-        return self.linear(modulate(x, shift, scale, idx=idx)[0])
+        return self.linear(modulate(x, shift, scale, idx=seq_ids(varlen))[0])
 
 
 # default is Flux.1-dev
@@ -213,6 +213,7 @@ class Flux1(nn.Module):
         self.final_layer = LastLayer(cfg.dim, 1, cfg.img_dim)
 
     def make_rope(self, H: int, W: int, L: int):
+        # rope of one sample's joint sequence [txt, img]. H, W: patchified image size. L: text length
         # RoPE embedding has 3 components:
         # - time: text embeds stay at pos=0, img embeds stay at pos=0
         # - height: all text embeds stay at pos=0
@@ -223,68 +224,45 @@ class Flux1(nn.Module):
 
     def forward(
         self,
-        img: Tensor | list[Tensor],
+        img: Tensor,
         t: Tensor,
-        txt: Tensor | list[Tensor],
+        txt: Tensor,
+        rope: Tensor,
         vec: Tensor,
         guidance: Tensor | None = None,
-        rope: Tensor | list[Tensor] | None = None,
-    ) -> Tensor | list[Tensor]:
-        # img: [B, C, H, W] or a list of [C, H_i, W_i]. txt: [B, L, D] or a list of [L_i, D]. vec: [B, vec_dim].
-        # t, guidance: [B] or [1]. rope: shared, a list of per-sample ropes (txt first), or None (computed).
-        # returns the same type as img.
-        # all samples are packed into one sequence (varlen), so images and texts can have different sizes.
-        is_batched = isinstance(img, Tensor)
-        imgs = list(img.unbind(0)) if is_batched else img
-        txts = list(txt.unbind(0)) if isinstance(txt, Tensor) else txt
-        assert len(imgs) == len(txts), (len(imgs), len(txts))
-        N = len(imgs)
-        device = imgs[0].device
-        p = self.cfg.patch_size
-
-        # we integrate patchify and unpatchify into model's forward pass
-        img_sizes = []
-        patches = []
-        for x in imgs:
-            C, H, W = x.shape
-            nH, nW = H // p, W // p
-            img_sizes.append((C, nH, nW))
-            x = x.reshape(C, nH, p, nW, p).permute(1, 3, 0, 2, 4)  # (nH, nW, C, 2, 2)
-            patches.append(x.reshape(nH * nW, C * p * p))
-
-        if rope is None:
-            ropes = [self.make_rope(nH, nW, x.shape[0]) for (_, nH, nW), x in zip(img_sizes, txts)]
+        varlen: Joint | None = None,
+    ) -> Tensor:
+        # img: [B, L_img, C*p*p] patchified with channels_first=True. txt: [B, L_txt, D]. vec: [B, vec_dim].
+        # t, guidance: [B] or [1]. rope: [L_txt + L_img, D] from make_rope(). returns [B, L_img, C*p*p].
+        # packed (varlen=Joint of [txt, img]): img [T_img, C*p*p], txt [T_txt, D], vec [N, vec_dim],
+        # rope: cat of per-sample make_rope(). returns [T_img, C*p*p].
+        packed = varlen is not None
+        if packed:
+            img, txt = img[None], txt[None]
+            N = varlen.varlen.num_seqs
+            img_varlen, joint_varlen = varlen.b, varlen.varlen
         else:
-            ropes = rope if isinstance(rope, list) else [rope] * N
+            N = -1  # keep t as is: [B], or [1] broadcast to the batch
+            img_varlen = joint_varlen = None
 
-        txt_varlen = Varlen.from_lens([x.shape[0] for x in txts], device)
-        img_varlen = Varlen.from_lens([x.shape[0] for x in patches], device)
-        joint = Joint.from_varlens(txt_varlen, img_varlen, device)
-        pe = torch.cat(ropes)
-
-        img = self.img_in(torch.cat(patches)[None].to(self.img_in.weight.dtype))
-        txt = self.txt_in(torch.cat(txts)[None])
+        img = self.img_in(img.to(self.img_in.weight.dtype))
+        txt = self.txt_in(txt)
         vec = self.time_in(timestep_embedding(t.expand(N), 256).to(img.dtype)) + self.vector_in(vec)
 
         if guidance is not None:  # allow no guidance_embed
             vec = vec + self.guidance_in(timestep_embedding(guidance.expand(N), 256).to(img.dtype))
 
         for block in self.double_blocks:
-            img, txt = block(img, txt, vec, pe, joint)
+            img, txt = block(img, txt, vec, rope, varlen)
 
-        x = joint.merge(txt, img)
+        L_txt = txt.shape[1]
+        x = merge(txt, img, varlen)
         for block in self.single_blocks:
-            x = block(x, vec, pe, joint.varlen)
-        img = joint.split(x)[1]
+            x = block(x, vec, rope, joint_varlen)
+        img = split(x, L_txt, varlen)[1]
 
-        img = self.final_layer(img, vec, img_varlen)[0]  # (T_img, patch_size ** 2 * out_channels)
-
-        # unpatchify
-        outs = []
-        for x, (C, nH, nW) in zip(img_varlen.split(img, dim=0), img_sizes):
-            x = x.view(nH, nW, C, p, p).permute(2, 0, 3, 1, 4)  # (C, nH, 2, nW, 2)
-            outs.append(x.reshape(C, nH * p, nW * p))
-        return torch.stack(outs) if is_batched else outs
+        img = self.final_layer(img, vec, img_varlen)
+        return img[0] if packed else img
 
 
 def _load_flux1(repo_id: str, filename: str, prefix: str | None = None):

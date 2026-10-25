@@ -14,7 +14,7 @@ from ..linear import Linear
 from ..registry import MODELS
 from ..rope import apply_rope, compute_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-from ..varlen import Joint, Varlen
+from ..varlen import Joint, Varlen, merge, seq_ids, split
 
 HEAD_DIM = 128
 
@@ -69,8 +69,8 @@ class TextBlock(nn.Module):
         self.ffn_gate = Linear(dim, ffn_dim)
         self.ffn_down = Linear(ffn_dim, dim)
 
-    # x: [1, T, D] packed
-    def forward(self, x: Tensor, rope: Tensor, varlen: Varlen) -> Tensor:
+    # x: [B, L, D], or [1, T, D] packed
+    def forward(self, x: Tensor, rope: Tensor, varlen: Varlen | None) -> Tensor:
         # attention
         q, k, v = self.qkv(self.norm1(x)).unflatten(-1, (3, -1, HEAD_DIM)).unbind(2)
         q = apply_rope(q, rope, self.q_norm.weight, interleaved=False)
@@ -101,12 +101,12 @@ class Block(nn.Module):
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     # FFN residual is deferred to the next block's modulate(). modulation is shared, so gate_f is the same.
-    # x: [1, T, D] packed. mod: [N, 6, D] per sample
+    # x: [B, L, D], or [1, T, D] packed. mod: [B or N, 6, D]
     def forward(
-        self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor, varlen: Varlen
+        self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor, varlen: Varlen | None
     ) -> tuple[Tensor, Tensor]:
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.split(1, dim=1)  # [N, 1, D] each
-        idx = varlen.seq_ids
+        idx = seq_ids(varlen)
 
         # attention
         res_gate = gate_f if ffn_out is not None else None
@@ -166,51 +166,50 @@ class MOSSImage(nn.Module):
 
     def forward(
         self,
-        img: Tensor | list[Tensor],
+        img: Tensor,
         time: Tensor,
-        txt: Tensor | list[Tensor],
+        txt: Tensor,
+        rope: Tensor,
+        varlen: Joint | None = None,
         skip_layers: tuple[int, ...] = (),
-    ) -> Tensor | list[Tensor]:
-        # img: [B, H, W, C] or a list of [H_i, W_i, C]. time: [B] or [1] in [0, 1] (1 is noise).
-        # txt: [B, L, text_dim] or a list of [L_i, text_dim], without padding. returns the same type as img.
+    ) -> Tensor:
+        # img: [B, L_img, C] flattened latents. txt: [B, L_txt, text_dim] without padding.
+        # time: [B] or [1] in [0, 1] (1 is noise). rope: [L_img + L_txt, D] from make_rope(). returns [B, L_img, C].
+        # packed (varlen=Joint of [img, txt]): img [T_img, C], txt [T_txt, text_dim], time [N],
+        # rope: cat of per-sample make_rope(). returns [T_img, C].
         # skip_layers: blocks to skip, for the negative branch of CFG
-        # all samples are packed into one sequence (varlen), so images and texts can have different sizes.
-        is_batched = isinstance(img, Tensor)
-        imgs = list(img.unbind(0)) if is_batched else img
-        txts = list(txt.unbind(0)) if isinstance(txt, Tensor) else txt
-        assert len(imgs) == len(txts), (len(imgs), len(txts))
-        N = len(imgs)
-        device = imgs[0].device
+        packed = varlen is not None
+        if packed:
+            img, txt = img[None], txt[None]
+            N = varlen.varlen.num_seqs
+            txt_varlen, joint_varlen = varlen.b, varlen.varlen
+        else:
+            N = -1  # keep t as is: [B], or [1] broadcast to the batch
+            txt_varlen = joint_varlen = None
         dtype = self.video_embedder.weight.dtype
 
         vec = self.time_embedding(timestep_embedding(time.expand(N), 256).to(dtype))
         mod = self.shared_block_modulation(vec).unflatten(1, (6, -1))  # [N, 6, D]
         shift, scale = self.video_head_modulation(vec).unflatten(1, (2, -1)).unbind(1)  # [N, D] each
 
-        img_varlen = Varlen.from_lens([x.shape[0] * x.shape[1] for x in imgs], device)
-        txt_varlen = Varlen.from_lens([x.shape[0] for x in txts], device)
-        joint = Joint.from_varlens(img_varlen, txt_varlen, device)  # [img, txt] per sample
-        rope = torch.cat([self.make_rope(x.shape[0], x.shape[1], y.shape[0], device) for x, y in zip(imgs, txts)])
-        txt_rope = joint.split(rope, dim=0)[1]
-
-        x_img = self.video_embedder(torch.cat([x.flatten(0, 1) for x in imgs])[None].to(dtype))
-        x_txt = self.text_embedder.proj(torch.cat(txts)[None].to(dtype))
+        L_img = img.shape[1]
+        txt_rope = split(rope, L_img, varlen, dim=0)[1]
+        x_img = self.video_embedder(img.to(dtype))
+        x_txt = self.text_embedder.proj(txt.to(dtype))
         for block in self.text_embedder.blocks:
             x_txt = block(x_txt, txt_rope, txt_varlen)
 
-        x = joint.merge(x_img, x_txt)
+        x = merge(x_img, x_txt, varlen)
         ffn_out = None
         for i, block in enumerate(self.layers):
             if i not in skip_layers:
-                x, ffn_out = block(x, ffn_out, rope, mod, joint.varlen)
+                x, ffn_out = block(x, ffn_out, rope, mod, joint_varlen)
 
         gate_f = mod[:, 5:6]
         norm = self.final_norm_video.weight
-        idx = joint.varlen.seq_ids
-        y, _ = modulate(x, shift[:, None], scale[:, None], ffn_out, gate_f, 1e-6, norm, True, idx)
-        out = self.final_linear_video(joint.split(y)[0])[0]
-        outs = [o.unflatten(0, x.shape[:2]) for o, x in zip(img_varlen.split(out, dim=0), imgs)]
-        return torch.stack(outs) if is_batched else outs
+        y, _ = modulate(x, shift[:, None], scale[:, None], ffn_out, gate_f, 1e-6, norm, True, seq_ids(joint_varlen))
+        out = self.final_linear_video(split(y, L_img, varlen)[0])
+        return out[0] if packed else out
 
 
 def load_moss_image(name: str = "moss-image-sft"):

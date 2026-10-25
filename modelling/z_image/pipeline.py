@@ -10,6 +10,7 @@ from transformers import AutoTokenizer, Qwen3Model
 from ..registry import MODELS
 from ..solvers import get_solver
 from ..vae import load_vae
+from ..varlen import pack, patchify, unpatchify
 from .model import ZImage, load_zimage
 
 
@@ -76,11 +77,16 @@ class ZImagePipeline:
         return [txt_embeds[i, mask[i]] for i in range(len(formatted_prompts))]
 
     # imgs: list of uint8 [H_i, W_i, 3], can have different sizes.
-    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs), all per-sample lists
+    # returns (latents, model_kwargs) for training: model(torch.cat(noisy_latents), t, **model_kwargs).
+    # latents: per-sample [L_i, C] tokens. model_kwargs: packed inputs
     @torch.no_grad()
     def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
-        latents = [self.ae.encode(x[None])[0] for x in imgs]
-        return latents, dict(txt=self.embed_text(prompts))
+        p = self.model.cfg.patch_size
+        latents = [self.ae.encode(x[None])[0] for x in imgs]  # [h, w, C] each
+        txts = self.embed_text(prompts)
+        ropes = [self.model.make_rope(x.shape[0] // p, x.shape[1] // p, y.shape[0]) for x, y in zip(latents, txts)]
+        tokens = [patchify(x, p) for x in latents]
+        return tokens, pack(tokens, txts, ropes, txt_first=False)[1]
 
     # cfg_scale, num_steps and time_shift default to self.sample_defaults
     @torch.no_grad()
@@ -157,18 +163,32 @@ def zimage_generate(
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
 
+    # prompts have different lengths, so samples are packed
+    B, H, W, _ = latents.shape
+    p = zimage.cfg.patch_size
+    nH, nW = H // p, W // p
+    imgs = list(patchify(latents, p).unbind(0))
+
+    def model_kwargs(txts: list[Tensor]) -> dict:
+        ropes = [zimage.make_rope(nH, nW, x.shape[0]) for x in txts]
+        return pack(imgs, txts, ropes, txt_first=False)[1]
+
+    pos_kwargs = model_kwargs(txt)
+    neg_kwargs = model_kwargs(neg_txt) if cfg_scale != 1.0 else None
+    latents = torch.cat(imgs)
+
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
         t = torch.tensor([timesteps[i]], device="cuda")
-        v = zimage(latents, t, txt).float()
+        v = zimage(latents, t, **pos_kwargs).float()
 
         # classifier-free guidance
         if cfg_scale != 1.0:
-            assert neg_txt is not None
-            neg_v = zimage(latents, t, neg_txt).float()
+            assert neg_kwargs is not None
+            neg_v = zimage(latents, t, **neg_kwargs).float()
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
         if progress_cb is not None:
             progress_cb(i + 1, num_steps)
 
-    return latents
+    return unpatchify(latents.view(B, nH * nW, -1), nH, nW, p)

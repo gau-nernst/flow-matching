@@ -1,19 +1,31 @@
-# CPU tests for varlen (packed) batching. run with pytest, or directly:
-#   CUDA_VISIBLE_DEVICES= PYTHONPATH=. python tests/test_varlen.py [name filter]
-# the Triton kernel tests need the interpreter on CPU: TRITON_INTERPRET=1 ... tests/test_varlen.py kernel
+# tests for varlen (packed) batching. run directly:
+#   PYTHONPATH=. python tests/test_varlen.py [name filter]
+# model tests run on CPU. Triton kernel tests and varlen_attn run on CUDA. without a GPU, run the kernel tests
+# with the interpreter: CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 PYTHONPATH=. python tests/test_varlen.py kernel
 import os
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from modelling.flux1.model import timestep_embedding
 import modelling.attn
-from modelling.varlen import Varlen, varlen_attn
+from modelling.flux1.model import timestep_embedding
+from modelling.varlen import Varlen, pack, patchify, unpatchify, varlen_attn
 from modelling.z_image.gated_norm import gated_norm
 from modelling.z_image.model import ZImage, ZImageConfig
 
 TRITON_INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
+
+
+# Triton kernels run on CUDA, or on CPU with the interpreter
+def kernel_test(fn):
+    def wrapper():
+        if not (TRITON_INTERPRET or torch.cuda.is_available()):
+            return print("  skipped: needs CUDA, or TRITON_INTERPRET=1 on CPU")
+        with torch.device("cpu" if TRITON_INTERPRET else "cuda"):
+            return fn()
+
+    return wrapper
 
 
 def tiny_zimage() -> ZImage:
@@ -62,9 +74,11 @@ def masked_varlen_attn(q: Tensor, k: Tensor, v: Tensor, varlen: Varlen) -> Tenso
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask).transpose(1, 2)
 
 
-# varlen_attn is CUDA only. model tests on CPU use the masked reference instead
-if not torch.cuda.is_available():
-    modelling.attn.varlen_attn = masked_varlen_attn
+# varlen_attn is CUDA only. model tests run on CPU and use the masked reference instead
+_cuda_varlen_attn = modelling.attn.varlen_attn
+modelling.attn.varlen_attn = lambda q, k, v, varlen: (_cuda_varlen_attn if q.is_cuda else masked_varlen_attn)(
+    q, k, v, varlen
+)
 
 
 def test_varlen_attn():
@@ -79,76 +93,101 @@ def test_varlen_attn():
     torch.testing.assert_close(varlen_attn(q, k, v, varlen).float(), expected, atol=1e-2, rtol=1e-2)
 
 
-@torch.enable_grad()  # use the eager paths of custom ops
-def test_zimage_varlen_matches_dense():
-    model = tiny_zimage()
-    # image token counts are multiples of 32, since dense padding of image RoPE was broken otherwise
-    sizes = [(16, 16), (16, 32), (32, 16)]
-    txt_lens = [5, 40, 17]
-    imgs = [torch.randn(H, W, 16) for H, W in sizes]
-    txts = [torch.randn(L, 64) for L in txt_lens]
-    t = torch.tensor([0.3, 0.6, 0.9])
+def test_patchify():
+    x = torch.randn(2, 8, 12, 4)
+    for channels_first in (False, True):
+        y = patchify(x, 2, channels_first)
+        assert y.shape == (2, 24, 16)
+        torch.testing.assert_close(unpatchify(y, 4, 6, 2, channels_first), x)
+        torch.testing.assert_close(patchify(x[1], 2, channels_first), y[1])  # no batch dim
 
-    outs = model(imgs, t, txts)
+    # layouts from main: Z-Image (p, p, C), Flux.1 (C, p, p) from NCHW
+    torch.testing.assert_close(patchify(x, 2), x.view(2, 4, 2, 6, 2, 4).transpose(2, 3).reshape(2, 24, 16))
+    nchw = x.permute(0, 3, 1, 2)
+    flux1 = nchw.reshape(2, 4, 4, 2, 6, 2).permute(0, 2, 4, 1, 3, 5).reshape(2, 24, 16)
+    torch.testing.assert_close(patchify(x, 2, channels_first=True), flux1)
+
+
+# packed forward of several samples == dense forward of each sample. extra: per-sample [N, ...] model inputs
+def assert_packed_matches_single(model, imgs, txts, ropes, t, txt_first, extra=None, **kwargs):
+    extra = extra or {}
+    img, model_kwargs = pack(imgs, txts, ropes, txt_first)
+    out = model(img, t, **model_kwargs, **extra, **kwargs)
+    assert out.shape == img.shape, (out.shape, img.shape)
+    outs = out.split([x.shape[0] for x in imgs])
     for i in range(len(imgs)):
-        expected = dense_reference(model, imgs[i][None], t[i : i + 1], txts[i][None])[0]
+        extra_i = {k: v[i : i + 1] for k, v in extra.items()}
+        (expected,) = model(imgs[i][None], t[i : i + 1], txts[i][None], ropes[i], **extra_i, **kwargs)
         torch.testing.assert_close(outs[i], expected, atol=1e-5, rtol=1e-5)
 
 
-@torch.enable_grad()
-def test_zimage_varlen_matches_single():
-    # includes image token counts that need padding (6x6 = 36 tokens)
-    model = tiny_zimage()
-    sizes = [(12, 12), (16, 24), (8, 40)]
-    txt_lens = [3, 33, 64]
-    imgs = [torch.randn(H, W, 16) for H, W in sizes]
-    txts = [torch.randn(L, 64) for L in txt_lens]
-    t = torch.tensor([0.1, 0.5, 1.0])
-
-    outs = model(imgs, t, txts)
-    for i in range(len(imgs)):
-        (expected,) = model([imgs[i]], t[i : i + 1], [txts[i]])
-        assert outs[i].shape == imgs[i].shape
-        torch.testing.assert_close(outs[i], expected, atol=1e-5, rtol=1e-5)
-
-
-@torch.enable_grad()
-def test_zimage_batched_tensor_input():
-    # batched tensors (same image size) with a shared t of shape [1], like sampling
-    model = tiny_zimage()
-    img = torch.randn(2, 16, 16, 16)
-    txts = [torch.randn(7, 64), torch.randn(50, 64)]
-    t = torch.tensor([0.5])
-
-    out = model(img, t, txts)
-    assert isinstance(out, Tensor) and out.shape == img.shape
-    for i in range(2):
-        (expected,) = model([img[i]], t, [txts[i]])
+# dense [B, ...] forward == dense forward of each sample. inputs are stacked
+def assert_dense_matches_single(model, img, t, txt, rope, **kwargs):
+    out = model(img, t, txt, rope, **kwargs)
+    assert out.shape == img.shape, (out.shape, img.shape)
+    for i in range(img.shape[0]):
+        kwargs_i = {k: v[i : i + 1] if isinstance(v, Tensor) and v.shape[0] > 1 else v for k, v in kwargs.items()}
+        t_i = t[i : i + 1] if t.shape[0] > 1 else t
+        (expected,) = model(img[i : i + 1], t_i, txt[i : i + 1], rope, **kwargs_i)
         torch.testing.assert_close(out[i], expected, atol=1e-5, rtol=1e-5)
 
 
-def test_zimage_varlen_grads():
+def zimage_inputs(model: ZImage, sizes, txt_lens):
+    imgs = [patchify(torch.randn(H, W, 16), 2) for H, W in sizes]
+    txts = [torch.randn(L, 64) for L in txt_lens]
+    ropes = [model.make_rope(H // 2, W // 2, L) for (H, W), L in zip(sizes, txt_lens)]
+    return imgs, txts, ropes
+
+
+@torch.enable_grad()  # use the eager paths of custom ops
+def test_zimage_matches_main():
+    model = tiny_zimage()
+    # image token counts are multiples of 32, since dense padding of image RoPE was broken on main
+    for (H, W), L in zip([(16, 16), (16, 32), (32, 16)], [5, 40, 17]):
+        img = torch.randn(1, H, W, 16)
+        txt = torch.randn(1, L, 64)
+        t = torch.tensor([0.3])
+        out = model(patchify(img, 2), t, txt, model.make_rope(H // 2, W // 2, L))
+        torch.testing.assert_close(unpatchify(out, H // 2, W // 2, 2), dense_reference(model, img, t, txt))
+
+
+@torch.enable_grad()
+def test_zimage_packed():
+    # includes image token counts that need padding (6x6 = 36 tokens)
+    model = tiny_zimage()
+    imgs, txts, ropes = zimage_inputs(model, [(12, 12), (16, 24), (8, 40)], [3, 33, 64])
+    assert_packed_matches_single(model, imgs, txts, ropes, torch.tensor([0.1, 0.5, 1.0]), txt_first=False)
+
+
+@torch.enable_grad()
+def test_zimage_dense_batch():
+    model = tiny_zimage()
+    imgs, txts, ropes = zimage_inputs(model, [(12, 12)] * 2, [7, 7])
+    for t in (torch.tensor([0.5]), torch.tensor([0.2, 0.7])):
+        assert_dense_matches_single(model, torch.stack(imgs), t, torch.stack(txts), ropes[0])
+
+
+def test_zimage_packed_grads():
     # grads of a packed batch == sum of per-sample grads
     model = tiny_zimage()
-    sizes = [(16, 16), (12, 20)]
-    imgs = [torch.randn(H, W, 16) for H, W in sizes]
-    txts = [torch.randn(L, 64) for L in (9, 45)]
+    imgs, txts, ropes = zimage_inputs(model, [(16, 16), (12, 20)], [9, 45])
     t = torch.tensor([0.2, 0.7])
 
-    sum(x.square().mean() for x in model(imgs, t, txts)).backward()
+    img, model_kwargs = pack(imgs, txts, ropes, txt_first=False)
+    out = model(img, t, **model_kwargs).split([x.shape[0] for x in imgs])
+    sum(x.square().mean() for x in out).backward()
     grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
 
     model.zero_grad()
     for i in range(2):
-        model([imgs[i]], t[i : i + 1], [txts[i]])[0].square().mean().backward()
+        model(imgs[i][None], t[i : i + 1], txts[i][None], ropes[i]).square().mean().backward()
     for n, p in model.named_parameters():
         if n in grads:
             torch.testing.assert_close(grads[n], p.grad, atol=1e-5, rtol=1e-4, msg=n)
 
 
+@kernel_test
 def test_gated_norm_kernel_varlen():
-    if not (TRITON_INTERPRET or torch.cuda.is_available()):
-        return print("  skipped: needs TRITON_INTERPRET=1 on CPU")
     torch.manual_seed(0)
     D = 96
     varlen = Varlen.from_lens([3, 5, 2])
@@ -166,10 +205,9 @@ def test_gated_norm_kernel_varlen():
         torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
 
 
+@kernel_test
 def test_gated_norm_kernel_batched():
     # existing [B, L, D] usage, with per-batch and broadcast gates
-    if not (TRITON_INTERPRET or torch.cuda.is_available()):
-        return print("  skipped: needs TRITON_INTERPRET=1 on CPU")
     torch.manual_seed(0)
     x = torch.randn(2, 4, 64)
     w = torch.randn(64)
@@ -181,9 +219,8 @@ def test_gated_norm_kernel_batched():
         torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
 
 
+@kernel_test
 def test_modulate_kernel():
-    if not (TRITON_INTERPRET or torch.cuda.is_available()):
-        return print("  skipped: needs TRITON_INTERPRET=1 on CPU")
     from modelling.flux1.modulate import modulate
 
     torch.manual_seed(0)
@@ -234,22 +271,13 @@ def flux2_inputs(model, sizes, txt_lens):
 
 
 @torch.enable_grad()
-def test_flux2_varlen_matches_single():
+def test_flux2():
     model = tiny_flux2()
     imgs, txts, ropes = flux2_inputs(model, [(8, 8), (6, 10), (12, 4)], [16, 16, 16])
     t = torch.tensor([0.2, 0.5, 0.8])
-    outs = model(imgs, t, txts, ropes)
-    for i in range(3):
-        (expected,) = model([imgs[i]], t[i : i + 1], [txts[i]], [ropes[i]])
-        torch.testing.assert_close(outs[i], expected, atol=1e-5, rtol=1e-5)
-
-    # batched tensor input with a shared rope
+    assert_packed_matches_single(model, imgs, txts, ropes, t, txt_first=True)
     img = torch.stack([imgs[0], imgs[0] * 0.5])
-    txt = torch.stack([txts[0], txts[1]])
-    out = model(img, torch.tensor([0.3]), txt, ropes[0])
-    for i in range(2):
-        (expected,) = model([img[i]], torch.tensor([0.3]), [txt[i]], [ropes[0]])
-        torch.testing.assert_close(out[i], expected, atol=1e-5, rtol=1e-5)
+    assert_dense_matches_single(model, img, torch.tensor([0.3]), torch.stack(txts[:2]), ropes[0])
 
 
 def tiny_flux1():
@@ -260,21 +288,18 @@ def tiny_flux1():
 
 
 @torch.enable_grad()
-def test_flux1_varlen_matches_single():
+def test_flux1():
     model = tiny_flux1()
-    imgs = [torch.randn(4, H, W) for H, W in [(16, 16), (12, 20), (8, 24)]]
-    txts = [torch.randn(L, 64) for L in (10, 10, 10)]
+    sizes = [(8, 8), (6, 10), (4, 12)]
+    imgs = [torch.randn(h * w, 16) for h, w in sizes]
+    txts = [torch.randn(10, 64) for _ in sizes]
+    ropes = [model.make_rope(h, w, 10) for h, w in sizes]
     vec = torch.randn(3, 32)
     t = torch.tensor([0.2, 0.5, 0.8])
     guidance = torch.tensor([3.5])
-    outs = model(imgs, t, txts, vec, guidance)
-    for i in range(3):
-        (expected,) = model([imgs[i]], t[i : i + 1], [txts[i]], vec[i : i + 1], guidance)
-        assert expected.shape == imgs[i].shape
-        torch.testing.assert_close(outs[i], expected, atol=1e-5, rtol=1e-5)
-
-    out = model(torch.stack([imgs[0], imgs[0]]), t[:2], torch.stack(txts[:2]), vec[:2], guidance)
-    torch.testing.assert_close(out[1], model([imgs[0]], t[1:2], [txts[1]], vec[1:2], guidance)[0])
+    assert_packed_matches_single(model, imgs, txts, ropes, t, txt_first=True, extra=dict(vec=vec), guidance=guidance)
+    img = torch.stack([imgs[0], imgs[0]])
+    assert_dense_matches_single(model, img, t[:2], torch.stack(txts[:2]), ropes[0], vec=vec[:2], guidance=guidance)
 
 
 def tiny_moss():
@@ -285,19 +310,18 @@ def tiny_moss():
 
 
 @torch.enable_grad()
-def test_moss_varlen_matches_single():
+def test_moss():
     model = tiny_moss()
-    imgs = [torch.randn(H, W, 32) for H, W in [(8, 8), (6, 10), (4, 12)]]
-    txts = [torch.randn(L, 64) for L in (5, 23, 12)]
+    sizes = [(8, 8), (6, 10), (4, 12)]
+    txt_lens = [5, 23, 12]
+    imgs = [torch.randn(h * w, 32) for h, w in sizes]
+    txts = [torch.randn(L, 64) for L in txt_lens]
+    ropes = [model.make_rope(h, w, L) for (h, w), L in zip(sizes, txt_lens)]
     t = torch.tensor([0.2, 0.5, 0.8])
     for skip_layers in ((), (1,)):
-        outs = model(imgs, t, txts, skip_layers)
-        for i in range(3):
-            (expected,) = model([imgs[i]], t[i : i + 1], [txts[i]], skip_layers)
-            torch.testing.assert_close(outs[i], expected, atol=1e-5, rtol=1e-5)
-
-    out = model(torch.stack([imgs[0], imgs[0]]), torch.tensor([0.4]), [txts[0], txts[1]])
-    torch.testing.assert_close(out[1], model([imgs[0]], torch.tensor([0.4]), [txts[1]])[0])
+        assert_packed_matches_single(model, imgs, txts, ropes, t, txt_first=False, skip_layers=skip_layers)
+    txt = torch.stack([txts[0], txts[0] * 0.5])
+    assert_dense_matches_single(model, torch.stack([imgs[0], imgs[0]]), torch.tensor([0.4]), txt, ropes[0])
 
 
 @torch.enable_grad()
@@ -307,11 +331,10 @@ def test_compute_loss_multires():
     from train_utils import compute_loss
 
     model = tiny_zimage()
-    latents = [torch.randn(H, W, 16) for H, W in [(16, 16), (12, 20)]]
-    txt = [torch.randn(L, 64) for L in (9, 45)]
+    latents, txts, ropes = zimage_inputs(model, [(16, 16), (12, 20)], [9, 45])
 
     torch.manual_seed(1)
-    loss = compute_loss(model, latents, Uniform(), dict(txt=txt))
+    loss = compute_loss(model, latents, Uniform(), pack(latents, txts, ropes, txt_first=False)[1])
     loss.backward()
     grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
 
@@ -322,7 +345,7 @@ def test_compute_loss_multires():
     noise = [torch.randn_like(x) for x in latents]
     losses = []
     for i in range(2):
-        (v,) = model([latents[i].lerp(noise[i], t[i])], t[i : i + 1], [txt[i]])
+        (v,) = model(latents[i].lerp(noise[i], t[i])[None], t[i : i + 1], txts[i][None], ropes[i])
         losses.append(F.mse_loss(noise[i] - latents[i], v))
     expected = torch.stack(losses).mean()
     expected.backward()

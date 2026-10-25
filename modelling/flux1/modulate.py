@@ -91,7 +91,7 @@ def modulate(
         return out, x
 
     B, L, D = x.shape
-    assert x.is_contiguous()
+    x = x.contiguous()  # e.g. the image part of a dense [B, L, D] joint sequence
 
     def check(t: Tensor) -> int:  # returns row stride
         assert t.ndim == 3 and t.shape[1:] == (1, D) and t.stride(-1) == 1, (x.shape, t.shape, t.stride())
@@ -105,7 +105,7 @@ def modulate(
     gate_stride = 0
     if res is not None:
         assert gate is not None
-        assert res.is_contiguous()
+        res = res.contiguous()
         gate_stride = check(gate)
     if norm_weight is not None:
         assert norm_weight.shape == (D,) and norm_weight.is_contiguous()

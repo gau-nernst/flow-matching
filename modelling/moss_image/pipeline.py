@@ -11,6 +11,7 @@ from ..qwen3_5 import Qwen3_5Model
 from ..registry import MODELS
 from ..solvers import get_solver
 from ..vae import load_vae
+from ..varlen import pack
 from .model import MOSSImage, load_moss_image
 
 
@@ -73,11 +74,15 @@ class MOSSImagePipeline:
         return cls(load_moss_image(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
     # imgs: list of uint8 [H_i, W_i, 3], can have different sizes.
-    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs), all per-sample lists
+    # returns (latents, model_kwargs) for training: model(torch.cat(noisy_latents), t, **model_kwargs).
+    # latents: per-sample [L_i, C] tokens. model_kwargs: packed inputs
     @torch.no_grad()
     def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
-        latents = [self.ae.encode(x[None])[0] for x in imgs]
-        return latents, dict(txt=self.text_encoder(prompts))
+        latents = [self.ae.encode(x[None])[0] for x in imgs]  # [h, w, C] each
+        txts = self.text_encoder(prompts)
+        ropes = [self.model.make_rope(*x.shape[:2], y.shape[0], x.device) for x, y in zip(latents, txts)]
+        tokens = [x.flatten(0, 1) for x in latents]
+        return tokens, pack(tokens, txts, ropes, txt_first=False)[1]
 
     # cfg_scale, num_steps, shift and uncond_skip_layers default to self.sample_defaults
     @torch.no_grad()
@@ -156,19 +161,30 @@ def moss_image_generate(
 ) -> Tensor:
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    B = latents.shape[0]
+
+    # prompts have different lengths, so samples are packed
+    B, H, W, C = latents.shape
+    imgs = list(latents.flatten(1, 2).unbind(0))
+
+    def model_kwargs(txts: list[Tensor]) -> dict:
+        ropes = [moss.make_rope(H, W, x.shape[0], latents.device) for x in txts]
+        return pack(imgs, txts, ropes, txt_first=False)[1]
+
+    pos_kwargs = model_kwargs(txt)
+    neg_kwargs = model_kwargs(neg_txt) if cfg_scale != 1.0 else None
+    latents = torch.cat(imgs)
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
-        t = torch.tensor([timesteps[i]], device=latents.device).expand(B)
-        v = moss(latents, t, txt).float()
+        t = torch.tensor([timesteps[i]], device=latents.device)
+        v = moss(latents, t, **pos_kwargs).float()
 
         # classifier-free guidance
         if cfg_scale != 1.0:
-            neg_v = moss(latents, t, neg_txt, skip_layers=uncond_skip_layers).float()
+            neg_v = moss(latents, t, **neg_kwargs, skip_layers=uncond_skip_layers).float()
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
         if progress_cb is not None:
             progress_cb(i + 1, num_steps)
 
-    return latents
+    return latents.view(B, H, W, C)

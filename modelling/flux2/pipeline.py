@@ -15,6 +15,7 @@ from ..qwen3 import Qwen3ForCausalLM
 from ..registry import MODELS
 from ..solvers import get_solver
 from ..vae import load_vae
+from ..varlen import pack
 from .model import Flux2, load_flux2
 
 
@@ -92,14 +93,16 @@ class Flux2Pipeline:
         return cls(load_flux2(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
     # imgs: list of uint8 [H_i, W_i, 3], can have different sizes.
-    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs), all per-sample lists
+    # returns (latents, model_kwargs) for training: model(torch.cat(noisy_latents), t, **model_kwargs).
+    # latents: per-sample [L_i, C] tokens. model_kwargs: packed inputs
     def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
         with torch.no_grad():
             latents = [self.ae.encode(x[None])[0] for x in imgs]  # [h, w, C] each
-        txt = list(self.text_encoder(prompts).unbind(0))
-        txt_rope = self.model.make_txt_rope(txt[0].shape[0])
-        rope = [torch.cat([txt_rope, self.model.make_img_rope(*x.shape[:2])]) for x in latents]
-        return [x.flatten(0, 1) for x in latents], dict(txt=txt, rope=rope)
+        txts = list(self.text_encoder(prompts).unbind(0))
+        txt_rope = self.model.make_txt_rope(txts[0].shape[0])
+        ropes = [torch.cat([txt_rope, self.model.make_img_rope(*x.shape[:2])]) for x in latents]
+        tokens = [x.flatten(0, 1) for x in latents]
+        return tokens, pack(tokens, txts, ropes, txt_first=True)[1]
 
     # cfg_scale and num_steps default to self.sample_defaults
     @torch.no_grad()
