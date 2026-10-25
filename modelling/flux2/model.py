@@ -15,6 +15,7 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
+from ..varlen import Joint, Varlen, per_token
 
 
 class MLP(nn.ModuleList):
@@ -81,44 +82,56 @@ class DoubleStreamBlock(nn.Module):
         ]
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
+    def _rope_joint(
+        self, txt_x: Tensor, img_x: Tensor, pe: tuple[Tensor, Tensor], norms: tuple[Tensor, Tensor], joint: Joint
+    ) -> Tensor:
+        # apply RoPE + QK-norm to each stream, then merge into the joint [txt, img] sequence
+        qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else txt_x.dtype
+        txt_pe, img_pe = pe
+        txt_norm, img_norm = norms
+
+        if joint.varlen.num_seqs == 1:
+            # write into a pre-allocated buffer to avoid torch.cat()
+            Ltxt = txt_x.shape[1]
+            out = txt_x.new_empty(1, Ltxt + img_x.shape[1], *txt_x.shape[2:], dtype=qk_dtype)
+            apply_rope(txt_x, txt_pe, txt_norm, self.eps, out=out[:, :Ltxt])
+            apply_rope(img_x, img_pe, img_norm, self.eps, out=out[:, Ltxt:])
+            return out
+
+        txt_x = apply_rope(txt_x, txt_pe, txt_norm, self.eps)
+        img_x = apply_rope(img_x, img_pe, img_norm, self.eps)
+        return joint.merge(txt_x, img_x).to(qk_dtype)
+
+    # img, txt: [1, T, D] packed. pe: (txt_pe, img_pe). mod_*: [N, 1, D] per sample. joint: [txt, img] per sample
     def forward(
         self,
         img: Tensor,
         img_res: Tensor | None,
         txt: Tensor,
         txt_res: Tensor | None,
-        pe: Tensor,
+        pe: tuple[Tensor, Tensor],
         mod_img: tuple[Tensor, ...],
         mod_txt: tuple[Tensor, ...],
+        joint: Joint,
     ) -> tuple[Tensor, Tensor]:
-        B, Limg, _ = img.shape
-        _, Ltxt, _ = txt.shape
-
+        txt_idx = joint.a.seq_ids
+        img_idx = joint.b.seq_ids
         img_shift1, img_scale1, img_gate1, img_shift2, img_scale2, img_gate2 = mod_img
         txt_shift1, txt_scale1, txt_gate1, txt_shift2, txt_scale2, txt_gate2 = mod_txt
 
-        img_res, img = modulate(img, img_shift1, img_scale1, img_res, img_gate2)
-        txt_res, txt = modulate(txt, txt_shift1, txt_scale1, txt_res, txt_gate2)
+        img_res, img = modulate(img, img_shift1, img_scale1, img_res, img_gate2, idx=img_idx)
+        txt_res, txt = modulate(txt, txt_shift1, txt_scale1, txt_res, txt_gate2, idx=txt_idx)
         img_q, img_k, img_v = self.img_attn.qkv(img_res).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
         txt_q, txt_k, txt_v = self.txt_attn.qkv(txt_res).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
 
-        # pre-allocate buffer to avoid torch.cat()
-        qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else img.dtype
-        q = img.new_empty(B, Ltxt + Limg, *img_q.shape[2:], dtype=qk_dtype)
-        apply_rope(txt_q, pe[:Ltxt], self.txt_attn.q_norm, self.eps, out=q[:, :Ltxt])
-        apply_rope(img_q, pe[Ltxt:], self.img_attn.q_norm, self.eps, out=q[:, Ltxt:])
+        q = self._rope_joint(txt_q, img_q, pe, (self.txt_attn.q_norm, self.img_attn.q_norm), joint)
+        k = self._rope_joint(txt_k, img_k, pe, (self.txt_attn.k_norm, self.img_attn.k_norm), joint)
+        v = joint.merge(txt_v, img_v)
+        attn = dispatch_attn(q, k, v, self.attn_impl, joint.varlen).flatten(2)
+        txt_attn, img_attn = joint.split(attn)
 
-        k = torch.empty_like(q)
-        apply_rope(txt_k, pe[:Ltxt], self.txt_attn.k_norm, self.eps, out=k[:, :Ltxt])
-        apply_rope(img_k, pe[Ltxt:], self.img_attn.k_norm, self.eps, out=k[:, Ltxt:])
-
-        # TODO: remove cat?
-        v = torch.cat((txt_v, img_v), dim=1)
-        attn = dispatch_attn(q, k, v, impl=self.attn_impl).flatten(2)
-        txt_attn, img_attn = attn.split([txt.shape[1], img.shape[1]], dim=1)
-
-        img_res, img = modulate(img, img_shift2, img_scale2, self.img_attn.proj(img_attn), img_gate1)
-        txt_res, txt = modulate(txt, txt_shift2, txt_scale2, self.txt_attn.proj(txt_attn), txt_gate1)
+        img_res, img = modulate(img, img_shift2, img_scale2, self.img_attn.proj(img_attn), img_gate1, idx=img_idx)
+        txt_res, txt = modulate(txt, txt_shift2, txt_scale2, self.txt_attn.proj(txt_attn), txt_gate1, idx=txt_idx)
         img_res = self.img_mlp(img_res)
         txt_res = self.txt_mlp(txt_res)
         return img_res, img, txt_res, txt
@@ -145,10 +158,11 @@ class SingleStreamBlock(nn.Module):
         ]
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
-    def forward(self, x: Tensor, res: Tensor | None, pe: Tensor, mod: tuple[Tensor, ...]) -> Tensor:
+    # x: [1, T, D] packed. mod: [N, 1, D] per sample
+    def forward(self, x: Tensor, res: Tensor | None, pe: Tensor, mod: tuple[Tensor, ...], varlen: Varlen) -> Tensor:
         # TODO: fuse quantize with modulate
         shift, scale, gate = mod
-        x_mod, x = modulate(x, shift, scale, res, gate)
+        x_mod, x = modulate(x, shift, scale, res, gate, idx=varlen.seq_ids)
 
         if self.linear1.is_nvfp4():
             xs_2 = self.linear1.input_scale
@@ -172,7 +186,7 @@ class SingleStreamBlock(nn.Module):
         q, k, v = qkv.unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
         q = apply_rope(q, pe, self.q_norm, self.eps, out=torch.empty_like(q, dtype=qk_dtype))
         k = apply_rope(k, pe, self.k_norm, self.eps, out=torch.empty_like(k, dtype=qk_dtype))
-        attn = dispatch_attn(q, k, v, impl=self.attn_impl).flatten(2)
+        attn = dispatch_attn(q, k, v, self.attn_impl, varlen).flatten(2)
 
         # TODO: pre-allocate attn+mlp buffer
         return self.linear2(torch.cat([attn, mlp], 2)), x
@@ -237,39 +251,56 @@ class Flux2(nn.Module):
 
     def forward(
         self,
-        img: Tensor,
+        img: Tensor | list[Tensor],
         time: Tensor,
-        txt: Tensor,
-        rope: Tensor,
+        txt: Tensor | list[Tensor],
+        rope: Tensor | list[Tensor],
         guidance: Tensor | None = None,
-    ) -> Tensor:
-        B, Limg, _ = img.shape
-        _, Ltxt, _ = txt.shape
+    ) -> Tensor | list[Tensor]:
+        # img: [B, L_img, C] or a list of [L_img_i, C]. txt: [B, L_txt, D] or a list of [L_txt_i, D].
+        # rope: [L_txt + L_img, D/2] shared by all samples, or a list of per-sample ropes (txt first).
+        # time, guidance: [B] or [1]. returns the same type as img.
+        # all samples are packed into one sequence (varlen), so images and texts can have different sizes.
+        is_batched = isinstance(img, Tensor)
+        imgs = list(img.unbind(0)) if is_batched else img
+        txts = list(txt.unbind(0)) if isinstance(txt, Tensor) else txt
+        ropes = rope if isinstance(rope, list) else [rope] * len(imgs)
+        assert len(imgs) == len(txts) == len(ropes), (len(imgs), len(txts), len(ropes))
+        N = len(imgs)
+        device = imgs[0].device
 
-        img = self.img_in(img.to(self.img_in.weight.dtype))
-        txt = self.txt_in(txt)
-        vec = self.time_in(timestep_embedding(time, 256).to(img.dtype))
+        txt_varlen = Varlen.from_lens([x.shape[0] for x in txts], device)
+        img_varlen = Varlen.from_lens([x.shape[0] for x in imgs], device)
+        joint = Joint.from_varlens(txt_varlen, img_varlen, device)
+        joint_pe = torch.cat(ropes)
+        pe = joint.split(joint_pe, dim=0)  # (txt_pe, img_pe)
+
+        img = self.img_in(torch.cat(imgs)[None].to(self.img_in.weight.dtype))
+        txt = self.txt_in(torch.cat(txts)[None])
+        vec = self.time_in(timestep_embedding(time.expand(N), 256).to(img.dtype))  # [N, D]
 
         if guidance is not None:  # allow no guidance_embed
-            vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
+            vec = vec + self.guidance_in(timestep_embedding(guidance.expand(N), 256).to(img.dtype))
 
         mod_img = self.double_stream_modulation_img(vec)
         mod_txt = self.double_stream_modulation_txt(vec)
         img_res = txt_res = None
         for block in self.double_blocks:
-            img_res, img, txt_res, txt = block(img, img_res, txt, txt_res, rope, mod_img, mod_txt)
+            img_res, img, txt_res, txt = block(img, img_res, txt, txt_res, pe, mod_img, mod_txt, joint)
 
-        img = torch.addcmul(img, mod_img[-1], img_res)
-        txt = torch.addcmul(txt, mod_txt[-1], txt_res)
-        joint = torch.cat([txt, img], dim=1)
+        img = torch.addcmul(img, per_token(mod_img[-1], img_varlen), img_res)
+        txt = torch.addcmul(txt, per_token(mod_txt[-1], txt_varlen), txt_res)
+        x = joint.merge(txt, img)
 
         mod = self.single_stream_modulation(vec)
         res = None
         for block in self.single_blocks:
-            res, joint = block(joint, res, rope, mod)
-        img = torch.addcmul(joint[:, Ltxt:], mod[-1], res[:, Ltxt:])
+            res, x = block(x, res, joint_pe, mod, joint.varlen)
+        img = torch.addcmul(joint.split(x)[1], per_token(mod[-1], img_varlen), joint.split(res)[1])
 
-        return self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
+        out = self.final_layer(img, vec, img_varlen)[0]  # (T_img, patch_size ** 2 * out_channels)
+        outs = img_varlen.split(out, dim=0)
+        return torch.stack(outs) if is_batched else list(outs)
 
 
 def _load_flux2(repo_id: str, filename: str):

@@ -14,7 +14,7 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_weight_merge_hook, load_hf_state_dict
-from ..varlen import Varlen, interleave
+from ..varlen import Joint, Varlen, per_token
 from .gated_norm import gated_norm
 
 SEQ_MULTIPLE = 32  # each sample's image and text tokens are padded to a multiple of this
@@ -27,8 +27,7 @@ class FinalLayer(nn.Module):
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), Linear(256, hidden_size))
 
     def forward(self, x: Tensor, c: Tensor, varlen: Varlen | None = None) -> Tensor:
-        scale = self.adaLN_modulation(c)  # [B, D]
-        scale = scale[varlen.seq_ids.long()].unsqueeze(0) if varlen is not None else scale.unsqueeze(1)
+        scale = per_token(self.adaLN_modulation(c).unsqueeze(1), varlen)  # [B, 1, D] or [1, T, D]
         x = (1.0 + scale) * F.layer_norm(x, x.shape[-1:], eps=1e-6)
         return self.linear(x)
 
@@ -234,9 +233,10 @@ class ZImage(nn.Module):
             img = layer(img, t_embeds, img_rope, img_varlen)
 
         # joint processing. each sample is [img, txt]
-        unified = interleave(img, img_varlen, txt, txt_varlen)
-        unified_rope = interleave(img_rope, img_varlen, txt_rope, txt_varlen, dim=0)
-        unified_varlen = Varlen.from_lens([a + b for a, b in zip(img_varlen.lens, txt_varlen.lens)], device)
+        joint = Joint.from_varlens(img_varlen, txt_varlen, device)
+        unified_varlen = joint.varlen
+        unified = joint.merge(img, txt)
+        unified_rope = joint.merge(img_rope, txt_rope, dim=0)
         for layer in self.layers:
             unified = layer(unified, t_embeds, unified_rope, unified_varlen)
 

@@ -75,12 +75,12 @@ class ZImagePipeline:
         txt_embeds = self.qwen3(input_ids, attention_mask=mask, output_hidden_states=True).last_hidden_state
         return [txt_embeds[i, mask[i]] for i in range(len(formatted_prompts))]
 
-    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs)
+    # imgs: list of uint8 [H_i, W_i, 3], can have different sizes.
+    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs), all per-sample lists
     @torch.no_grad()
-    def prepare_train_inputs(self, imgs: Tensor, prompts: list[str]) -> tuple[Tensor, dict]:
-        latents = self.ae.encode(imgs)
-        txt = self.embed_text(prompts)
-        return latents, dict(txt=txt)
+    def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
+        latents = [self.ae.encode(x[None])[0] for x in imgs]
+        return latents, dict(txt=self.embed_text(prompts))
 
     # cfg_scale, num_steps and time_shift default to self.sample_defaults
     @torch.no_grad()

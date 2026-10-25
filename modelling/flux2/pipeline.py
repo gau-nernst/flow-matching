@@ -91,15 +91,15 @@ class Flux2Pipeline:
         spec = MODELS[name]
         return cls(load_flux2(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
-    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs)
-    def prepare_train_inputs(self, imgs: Tensor, prompts: list[str]) -> tuple[Tensor, dict]:
+    # imgs: list of uint8 [H_i, W_i, 3], can have different sizes.
+    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs), all per-sample lists
+    def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
         with torch.no_grad():
-            latents = self.ae.encode(imgs)
-        txt = self.text_encoder(prompts)
-        img_rope = self.model.make_img_rope(*latents.shape[1:3])
-        txt_rope = self.model.make_txt_rope(txt.shape[1])
-        rope = torch.cat([txt_rope, img_rope], dim=0)
-        return latents.flatten(1, 2), dict(txt=txt, rope=rope)
+            latents = [self.ae.encode(x[None])[0] for x in imgs]  # [h, w, C] each
+        txt = list(self.text_encoder(prompts).unbind(0))
+        txt_rope = self.model.make_txt_rope(txt[0].shape[0])
+        rope = [torch.cat([txt_rope, self.model.make_img_rope(*x.shape[:2])]) for x in latents]
+        return [x.flatten(0, 1) for x in latents], dict(txt=txt, rope=rope)
 
     # cfg_scale and num_steps default to self.sample_defaults
     @torch.no_grad()
