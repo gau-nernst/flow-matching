@@ -14,7 +14,7 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_weight_merge_hook, load_hf_state_dict
-from ..varlen import VarlenMetadata, pack_inputs, expand_to_tokens
+from ..varlen import VarlenMetadata, expand_to_tokens, pack_inputs
 from .gated_norm import gated_norm
 
 

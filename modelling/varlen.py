@@ -5,6 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from .utils import list_to_tensor_async
+
 
 # a batch is either uniform, with shape [B, L, ...], or varlen, with shape [1, L, ...]: B samples concatenated
 # along L. this describes where each sample sits in a varlen batch
@@ -16,7 +18,7 @@ class VarlenMetadata(NamedTuple):
 
     @staticmethod
     def from_lens(lens: list[int], device: torch.types.Device) -> "VarlenMetadata":
-        lens_t = torch.tensor(lens, dtype=torch.int32).pin_memory().to(device, non_blocking=True)
+        lens_t = list_to_tensor_async(lens, device, torch.int32)
         cu_seqlens = F.pad(lens_t.cumsum(0, dtype=torch.int32), (1, 0))
         # output_size: otherwise it reads the sum back from the GPU
         ids = torch.arange(len(lens), dtype=torch.int32, device=device)

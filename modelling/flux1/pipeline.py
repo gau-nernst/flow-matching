@@ -7,6 +7,7 @@ from tqdm import tqdm
 from ..offload import PerLayerOffloadCUDAStream
 from ..solvers import get_solver
 from ..text_embedder import load_clip_l, load_t5
+from ..utils import list_to_tensor_async
 from ..vae import AutoEncoder, load_vae
 from .model import Flux1, load_flux1
 
@@ -168,7 +169,7 @@ def flux1_generate(
 
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    timesteps_tensor = torch.tensor(timesteps).pin_memory().to(latents.device, non_blocking=True)
+    timesteps_tensor = list_to_tensor_async(timesteps, latents.device)
     latents, kwargs = flux.prepare(latents.permute(0, 2, 3, 1), txt, vec)  # NCHW -> NHWC
     if cfg_scale != 1.0:
         assert neg_txt is not None and neg_vec is not None

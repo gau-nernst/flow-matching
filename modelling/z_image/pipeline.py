@@ -10,6 +10,7 @@ from transformers import AutoTokenizer
 from ..qwen3 import Qwen3ForCausalLM
 from ..registry import MODELS
 from ..solvers import get_solver
+from ..utils import list_to_tensor_async
 from ..vae import load_vae
 from ..varlen import VarlenMetadata
 from .model import ZImage, load_zimage
@@ -67,7 +68,7 @@ class ZImagePipeline:
 
         device = next(self.qwen3.parameters()).device
         varlen = VarlenMetadata.from_lens(lens, device) if len(lens) > 1 else None
-        input_ids = torch.tensor([x for ids in input_ids for x in ids]).pin_memory().to(device, non_blocking=True)[None]
+        input_ids = list_to_tensor_async([x for ids in input_ids for x in ids], device)[None]
         return list(self.qwen3(input_ids, varlen=varlen)[0].split(lens))
 
     # imgs: uint8 [H_i, W_i, 3]. returns per-sample latents and kwargs for model.prepare()
@@ -150,7 +151,7 @@ def zimage_generate(
 ) -> Tensor:
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    timesteps_tensor = torch.tensor(timesteps).pin_memory().to(latents.device, non_blocking=True)
+    timesteps_tensor = list_to_tensor_async(timesteps, latents.device)
 
     # pack, since prompts have different lengths
     imgs = list(latents)

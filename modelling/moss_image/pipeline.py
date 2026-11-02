@@ -10,6 +10,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 from ..qwen3_5 import Qwen3_5Model
 from ..registry import MODELS
 from ..solvers import get_solver
+from ..utils import list_to_tensor_async
 from ..vae import load_vae
 from .model import MOSSImage, load_moss_image
 
@@ -157,7 +158,7 @@ def moss_image_generate(
 ) -> Tensor:
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    timesteps_tensor = torch.tensor(timesteps).pin_memory().to(latents.device, non_blocking=True)
+    timesteps_tensor = list_to_tensor_async(timesteps, latents.device)
 
     # pack, since prompts have different lengths
     imgs = list(latents)

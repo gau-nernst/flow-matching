@@ -14,6 +14,7 @@ from ..offload import PerLayerOffloadCUDAStream
 from ..qwen3 import Qwen3ForCausalLM
 from ..registry import MODELS
 from ..solvers import get_solver
+from ..utils import list_to_tensor_async
 from ..vae import load_vae
 from .model import Flux2, load_flux2
 
@@ -219,7 +220,7 @@ def flux2_generate(
 
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    timesteps_tensor = torch.tensor(timesteps).pin_memory().to(latents.device, non_blocking=True)
+    timesteps_tensor = list_to_tensor_async(timesteps, latents.device)
 
     latents, kwargs = flux.prepare(latents, txt, ref=ref_latents)
     if cfg_scale != 1.0:
