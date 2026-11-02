@@ -15,10 +15,12 @@ class VarlenMetadata(NamedTuple):
 
     @staticmethod
     def from_lens(lens: list[int], device: torch.types.Device = None) -> "VarlenMetadata":
-        lens_t = torch.tensor(lens, dtype=torch.int32)
+        lens_t = torch.tensor(lens, dtype=torch.int32).pin_memory().to(device, non_blocking=True)
         cu_seqlens = F.pad(lens_t.cumsum(0, dtype=torch.int32), (1, 0))
-        seq_ids = torch.repeat_interleave(torch.arange(len(lens), dtype=torch.int32), lens_t)
-        return VarlenMetadata(cu_seqlens.to(device), seq_ids.to(device), max(lens))
+        # output_size: otherwise it reads the sum back from the GPU
+        ids = torch.arange(len(lens), dtype=torch.int32, device=device)
+        seq_ids = torch.repeat_interleave(ids, lens_t, output_size=sum(lens))
+        return VarlenMetadata(cu_seqlens, seq_ids, max(lens))
 
     # metadata of torch.cat([self_tensor, other_tensor], dim=1). the tensor keeps the two streams apart,
     # so perm is needed for attention, which wants each sample contiguous:

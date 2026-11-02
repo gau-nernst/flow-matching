@@ -67,7 +67,7 @@ class ZImagePipeline:
 
         device = next(self.qwen3.parameters()).device
         varlen = VarlenMetadata.from_lens(lens, device) if len(lens) > 1 else None
-        input_ids = torch.tensor(sum(input_ids, []), device=device)[None]
+        input_ids = torch.tensor(sum(input_ids, [])).pin_memory().to(device, non_blocking=True)[None]
         return list(self.qwen3(input_ids, varlen=varlen)[0].split(lens))
 
     # imgs: uint8 [H_i, W_i, 3]. returns per-sample latents and kwargs for model.prepare()
@@ -150,6 +150,7 @@ def zimage_generate(
 ) -> Tensor:
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
+    timesteps_tensor = torch.tensor(timesteps).pin_memory().to("cuda", non_blocking=True)
 
     # pack, since prompts have different lengths
     imgs = list(latents)
@@ -158,7 +159,7 @@ def zimage_generate(
     neg_kwargs = zimage.prepare(imgs, neg_txt)[1] if cfg_scale != 1.0 else None
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
-        t = torch.tensor([timesteps[i]], device="cuda")
+        t = timesteps_tensor[None, i]
         v = zimage(latents, t, **pos_kwargs).float()
 
         # classifier-free guidance

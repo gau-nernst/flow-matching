@@ -41,7 +41,7 @@ class MOSSImageTextEncoder:
                 [dict(role="user", content=text)], tokenize=False, add_generation_prompt=True, enable_thinking=True
             )
             input_ids = self.tokenizer(text, truncation=True, max_length=self.max_length, return_tensors="pt").input_ids
-            outputs.append(self.model(input_ids.to(device))[0])
+            outputs.append(self.model(input_ids.pin_memory().to(device, non_blocking=True))[0])
         return outputs
 
 
@@ -155,6 +155,7 @@ def moss_image_generate(
 ) -> Tensor:
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
+    timesteps_tensor = torch.tensor(timesteps).pin_memory().to(latents.device, non_blocking=True)
 
     # pack, since prompts have different lengths
     imgs = list(latents)
@@ -163,7 +164,7 @@ def moss_image_generate(
     neg_kwargs = moss.prepare(imgs, neg_txt)[1] if cfg_scale != 1.0 else None
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
-        t = torch.tensor([timesteps[i]], device=latents.device)
+        t = timesteps_tensor[None, i]
         v = moss(latents, t, **pos_kwargs).float()
 
         # classifier-free guidance

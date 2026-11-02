@@ -53,11 +53,12 @@ class Flux2Qwen3TextEncoder(nn.Module):
         device = next(self.parameters()).device
 
         # same as HF: mask pad tokens as keys only. the DiT attends to pad tokens.
-        pad_mask = inputs["attention_mask"].to(device).bool()  # [B, L]
+        pad_mask = inputs["attention_mask"].pin_memory().to(device, non_blocking=True).bool()  # [B, L]
         L = pad_mask.shape[1]
         attn_mask = torch.ones(L, L, dtype=torch.bool, device=device).tril() & pad_mask[:, None, None, :]
 
-        outputs = self.model(inputs["input_ids"].to(device), output_indices=self.output_indices, attn_mask=attn_mask)
+        input_ids = inputs["input_ids"].pin_memory().to(device, non_blocking=True)
+        outputs = self.model(input_ids, output_indices=self.output_indices, attn_mask=attn_mask)
         return torch.cat(outputs, dim=-1)
 
 
@@ -146,7 +147,7 @@ class Flux2Pipeline:
             ref_latents = []
             for img in ref_imgs:
                 img = crop_to_multiple(img).convert("RGB")
-                img = torch.from_numpy(np.asarray(img)).to(device)
+                img = torch.from_numpy(np.asarray(img)).pin_memory().to(device, non_blocking=True)
                 ref_latents.append(self.ae.encode(img.unsqueeze(0)).squeeze(0))
         else:
             ref_latents = None
@@ -218,7 +219,7 @@ def flux2_generate(
 
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    timesteps_tensor = torch.tensor(timesteps).to("cuda", non_blocking=True)
+    timesteps_tensor = torch.tensor(timesteps).pin_memory().to("cuda", non_blocking=True)
 
     latents, kwargs = flux.prepare(latents, txt, ref=ref_latents)
 

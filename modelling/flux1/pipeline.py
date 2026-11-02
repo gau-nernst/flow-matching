@@ -168,13 +168,14 @@ def flux1_generate(
 
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
+    timesteps_tensor = torch.tensor(timesteps).pin_memory().to("cuda", non_blocking=True)
     latents, kwargs = flux.prepare(latents.permute(0, 2, 3, 1), txt, vec)  # NCHW -> NHWC
     if cfg_scale != 1.0:
         assert neg_txt is not None and neg_vec is not None
         neg_kwargs = dict(kwargs, txt=neg_txt, vec=neg_vec)
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
-        t = torch.tensor([timesteps[i]], device="cuda")
+        t = timesteps_tensor[None, i]
         v = flux(latents, t, **kwargs, guidance=guidance).float()
 
         # classifier-free guidance
