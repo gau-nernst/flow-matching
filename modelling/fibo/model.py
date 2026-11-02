@@ -11,6 +11,7 @@ from torch import Tensor, nn
 from ..attn import dispatch_attn
 from ..flux1.model import timestep_embedding
 from ..linear import Linear
+from ..registry import MODELS
 from ..rope import RopeND
 from ..utils import load_hf_state_dict
 from ..z_image.gated_norm import gated_norm
@@ -137,14 +138,51 @@ class Fibo(nn.Module):
         ratio = min(max((txt_len - 256) / (2048 - 256), 0.0), 1.0)
         return math.ceil((256 + ratio * (MAX_NUM_GIST_TOKENS - 256)) / 64) * 64
 
-    # img: [B, H, W, C] (Flux.2 VAE latents, patchified + normalized)
-    # time: [B] in [0, 1], 1 is noise
-    # txt: [B, 6, L, txt_dim]. text encoder bundles: the Perceiver's first, then one per injection block.
+    # blocks to add LoRA to
+    def lora_blocks(self) -> list[nn.Module]:
+        return list(self.layers)
+
+    # one sample's [gist, context, image] rope. axes (plane, h, w). gist token i is on plane 1+i, the image on plane
+    # MAX_NUM_GIST_TOKENS+1, context image k on the k-th plane after it.
+    # reference order is [gist, image, context]. we put context before the image, so that clean and noisy tokens
+    # are 2 contiguous segments. positions come from RoPE, so this only changes rounding.
+    def make_rope(self, H: int, W: int, L_txt: int, ctx_sizes: list[tuple[int, int]] = ()) -> Tensor:
+        img_plane = MAX_NUM_GIST_TOKENS + 1
+        gist_rope = self.pos_embed.create((1, 0, 0), (self.num_gist_tokens(L_txt), 1, 1))
+        ctx_rope = [self.pos_embed.create((img_plane + 1 + k, 0, 0), (1, *s)) for k, s in enumerate(ctx_sizes)]
+        return torch.cat([gist_rope, *ctx_rope, self.pos_embed.create((img_plane, 0, 0), (1, H, W))])
+
+    # latents: [B, H, W, C] (Flux.2 VAE latents, patchified + normalized), or a list of [H_i, W_i, C] of one size
+    # txt: [B, 6, L, txt_dim], or a list of [6, L, txt_dim] of one length. text encoder bundles: the Perceiver's first,
+    # then one per injection block.
     # ctx: latents of the images to edit, [B, h, w, C] each, sizes can differ. clean tokens (t=0), not predicted.
-    def forward(self, img: Tensor, time: Tensor, txt: Tensor, ctx: list[Tensor] | None = None) -> Tensor:
-        B, H, W, _ = img.shape
-        dtype = self.x_embedder.weight.dtype
+    def prepare(
+        self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor], ctx: list[Tensor] | None = None
+    ) -> tuple[Tensor, dict]:
+        if not isinstance(latents, Tensor):
+            if len({x.shape for x in latents}) > 1 or len({x.shape for x in txt}) > 1:
+                raise NotImplementedError("Fibo needs a batch of one image size and one prompt length")
+            latents, txt = torch.stack(latents), torch.stack(list(txt))
+
+        _, H, W, _ = latents.shape
         ctx = ctx or []
+        rope = self.make_rope(H, W, txt.shape[2], [c.shape[1:3] for c in ctx])
+        kwargs = dict(txt=txt, rope=rope)
+        if ctx:
+            kwargs["ctx"] = torch.cat([c.flatten(1, 2) for c in ctx], dim=1)
+        return latents.flatten(1, 2), kwargs
+
+    def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
+        # sizes: (H, W) of a uniform batch, or a list per sample
+        if isinstance(sizes, tuple):
+            return out.unflatten(1, sizes)
+        outs = out.flatten(0, -2).split([H * W for H, W in sizes])
+        return [x.unflatten(0, size) for x, size in zip(outs, sizes)]
+
+    # inputs are from prepare(). img: [B, L_img, C]. time: [B] in [0, 1], 1 is noise. ctx: [B, L_ctx, C]
+    def forward(self, img: Tensor, time: Tensor, txt: Tensor, rope: Tensor, ctx: Tensor | None = None) -> Tensor:
+        B, L_img, _ = img.shape
+        dtype = self.x_embedder.weight.dtype
 
         # image tokens get the real timestep, clean tokens (gist, context) get t=0
         t_mlp = self.t_embedder.mlp
@@ -152,42 +190,31 @@ class Fibo(nn.Module):
         vec_clean = t_mlp(timestep_embedding(torch.zeros_like(time), 256).to(dtype))
         vecs = torch.stack([vec_clean, vec], dim=1)
 
-        # RoPE axes (plane, h, w). gist token i is on plane 1+i, the image on plane MAX_NUM_GIST_TOKENS+1,
-        # context image k on the k-th plane after it.
-        # reference order is [gist, image, context]. we put context before the image, so that clean and noisy tokens
-        # are 2 contiguous segments. positions come from RoPE, so this only changes rounding.
-        img_plane = MAX_NUM_GIST_TOKENS + 1
-        ctx_pe = [self.pos_embed.create((img_plane + 1 + k, 0, 0), (1, *c.shape[1:3])) for k, c in enumerate(ctx)]
-        img_pe = self.pos_embed.create((img_plane, 0, 0), (1, H, W))
-        pe = torch.cat([*ctx_pe, img_pe], dim=0)
-        x = self.x_embedder(torch.cat([c.flatten(1, 2) for c in [*ctx, img]], dim=1).to(dtype))
-        num_ctx = x.shape[1] - H * W
+        num_gist = self.num_gist_tokens(txt.shape[2])
+        x = self.x_embedder((img if ctx is None else torch.cat([ctx, img], dim=1)).to(dtype))
+        num_ctx = x.shape[1] - L_img
         for block in self.noise_refiner:
-            x = block(x, vecs, pe, split=num_ctx) if num_ctx else block(x, vec[:, None], pe)
+            x = block(x, vecs, rope[num_gist:], split=num_ctx) if num_ctx else block(x, vec[:, None], rope[num_gist:])
 
         # Perceiver
         txt = txt.to(dtype)
-        num_gist = self.num_gist_tokens(txt.shape[2])
         gist = self.perceiver.latent_queries[:num_gist].unsqueeze(0).expand(B, -1, -1)
         for layer in self.perceiver.layers:
             gist = layer(gist, txt[:, 0])
         gist = self.perceiver.norm_out(gist)
-        gist_pe = self.pos_embed.create((1, 0, 0), (num_gist, 1, 1))
 
         # one stream: gist tokens, context tokens, then image tokens. injection blocks also read their own text bundle.
         x = torch.cat([gist, x], dim=1)
-        pe = torch.cat([gist_pe, pe], dim=0)
         bundle_ids = {layer_id: i + 1 for i, layer_id in enumerate(INJECTION_LAYER_IDS)}
         for i, block in enumerate(self.layers):
-            x = block(x, vecs, pe, txt[:, bundle_ids[i]] if i in bundle_ids else None, num_gist + num_ctx)
+            x = block(x, vecs, rope, txt[:, bundle_ids[i]] if i in bundle_ids else None, num_gist + num_ctx)
 
-        x = self.final_layer(x[:, num_gist + num_ctx :], vec)
-        return x.unflatten(1, (H, W))
+        return self.final_layer(x[:, num_gist + num_ctx :], vec)
 
 
-def load_fibo(name: str = "dev"):
-    repo_id = {"dev": "briaai/Fibo-2.0-dev"}[name]
-    state_dict = load_hf_state_dict(repo_id, "transformer/diffusion_pytorch_model.safetensors.index.json")
+def load_fibo(name: str = "fibo-2.0-dev"):
+    spec = MODELS[name]
+    state_dict = load_hf_state_dict(spec.repo_id, spec.filename)
 
     with torch.device("meta"):
         model = Fibo()

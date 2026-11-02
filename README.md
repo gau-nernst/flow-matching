@@ -5,6 +5,7 @@ Supported models:
 - [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) and its derivatives: [Flex.1-alpha](https://huggingface.co/ostris/Flex.1-alpha)
 - Z-Image: [Base](https://huggingface.co/Tongyi-MAI/Z-Image) and [Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo). Turbo-NVFP4 from Comfy-UI.
 - [FLUX.2-klein](https://github.com/black-forest-labs/flux2). T2I and TI2I. NVFP4 checkpoints are supported.
+- [Fibo 2.0](https://huggingface.co/briaai/Fibo-2.0-dev). T2I and editing. LoRA training is one sample per micro-batch (`--batch_tokens 1`), as it has no varlen support.
 
 Supported features:
 

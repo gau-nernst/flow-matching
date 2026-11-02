@@ -14,6 +14,7 @@ from transformers import AutoConfig, AutoProcessor
 
 from ..qwen3 import Qwen3Model
 from ..qwen3_vl import Qwen3VLVisionModel, qwen3_vl_forward, qwen3_vl_position_ids, qwen3_vl_rope
+from ..registry import MODELS
 from ..solvers import get_solver
 from ..utils import load_hf_state_dict
 from ..vae import load_vae
@@ -266,20 +267,31 @@ class FiboPipeline:
     # at every step.
     TEXT_IMAGES_MAX_NOISE_LEVEL = 0.9
 
-    def __init__(self, fibo: Fibo | None = None, text_encoder_id: str = "Qwen/Qwen3-VL-4B-Instruct-FP8") -> None:
-        self.fibo = fibo or load_fibo()
+    def __init__(
+        self,
+        fibo: Fibo | None = None,
+        text_encoder_id: str = "Qwen/Qwen3-VL-4B-Instruct-FP8",
+        sample_defaults: dict | None = None,  # used by generate(). default: fibo-2.0-dev
+    ) -> None:
+        self.model = fibo or load_fibo()
+        self.sample_defaults = sample_defaults or MODELS["fibo-2.0-dev"].sample_defaults
         self.ae = load_vae("flux2").bfloat16()  # same weights as Flux.2. reference code runs the VAE in FP32
         self.text_encoder = FiboTextEncoder(text_encoder_id)
 
     def cpu(self):
-        for m in (self.fibo, self.ae, self.text_encoder):
+        for m in (self.model, self.ae, self.text_encoder):
             m.cpu()
         return self
 
     def cuda(self):
-        for m in (self.fibo, self.ae, self.text_encoder):
+        for m in (self.model, self.ae, self.text_encoder):
             m.cuda()
         return self
+
+    @classmethod
+    def load(cls, name: str):
+        spec = MODELS[name]
+        return cls(load_fibo(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
     # prompt: a structured JSON caption (preferred), or a short description.
     #   with images: the edit instruction, or a JSON object with "edit_instruction" and the caption of the result
@@ -287,6 +299,7 @@ class FiboPipeline:
     # images: up to 5 images to edit, which the instruction can refer to as <image_1>, <image_2>, ...
     # mask: the region of the single image to regenerate, white on black.
     # text_images: show Qwen3-VL an image of each text in the caption's text_render, as training did.
+    # cfg_scale and num_steps default to self.sample_defaults
     @torch.no_grad()
     def generate(
         self,
@@ -296,13 +309,15 @@ class FiboPipeline:
         mask: Image.Image | None = None,
         text_images: bool = True,
         img_size: int | tuple[int, int] | None = None,
-        cfg_scale: float = 5.0,
-        num_steps: int = 30,
+        cfg_scale: float | None = None,
+        num_steps: int | None = None,
         seed: int | None = None,
         solver: str = "euler",
         pbar: bool = False,
         progress_cb: Callable[[int, int], None] | None = None,
     ) -> Tensor:
+        cfg_scale = self.sample_defaults["cfg_scale"] if cfg_scale is None else cfg_scale
+        num_steps = self.sample_defaults["num_steps"] if num_steps is None else num_steps
         prompts = [prompt] if isinstance(prompt, str) else prompt
         images = [images] if isinstance(images, Image.Image) else images
         if images is not None:
@@ -366,7 +381,7 @@ class FiboPipeline:
             noise = torch.randn(1, H, W, ae.cfg.z_dim * 4, device=device, generator=rng)
             cb = (lambda step, n, i=i: progress_cb(i * n + step, len(txts) * n)) if progress_cb else None
             latents = fibo_generate(
-                fibo=self.fibo,
+                fibo=self.model,
                 latents=noise,
                 timesteps=fibo_timesteps(num_steps, H * W),
                 txt=txt[None],
@@ -410,20 +425,26 @@ def fibo_generate(
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
     B = latents.shape[0]
+    size = tuple(latents.shape[1:3])
+
+    # the number of gist tokens depends on the text length, so each text has its own rope
+    neg_kwargs = fibo.prepare(latents, neg_txt, ctx)[1] if cfg_scale != 1.0 else None
+    base_kwargs = fibo.prepare(latents, base_txt, ctx)[1] if base_txt is not None else None
+    latents, pos_kwargs = fibo.prepare(latents, txt, ctx)
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
         t = torch.tensor([timesteps[i]], device=latents.device).expand(B)
         # base_txt (prompt without text images) is used while the noise level is above base_max_noise_level
         use_base = base_txt is not None and timesteps[i] > base_max_noise_level
-        v = fibo(latents, t, base_txt if use_base else txt, ctx).float()
+        v = fibo(latents, t, **(base_kwargs if use_base else pos_kwargs)).float()
 
         # classifier-free guidance. the images to edit condition both passes.
         if cfg_scale != 1.0:
-            neg_v = fibo(latents, t, neg_txt, ctx).float()
+            neg_v = fibo(latents, t, **neg_kwargs).float()
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
         if progress_cb is not None:
             progress_cb(i + 1, num_steps)
 
-    return latents
+    return fibo.unpatchify(latents, size)
