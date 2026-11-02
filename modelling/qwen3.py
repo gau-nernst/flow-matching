@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn.attention.varlen import varlen_attn
 from transformers import Qwen3Config
 
 from .linear import Linear
@@ -39,8 +40,7 @@ class Qwen3Attention(nn.Module):
         q = apply_rope(q, pos_embeds, self.q_norm.weight, self.eps, interleaved=False)
         k = apply_rope(k, pos_embeds, self.k_norm.weight, self.eps, interleaved=False)
         if varlen is not None:
-            from torch.nn.attention.varlen import varlen_attn
-
+            assert attn_mask is None
             cu, max_len = varlen.cu_seqlens, varlen.max_seqlen
             # window_size (-1, 0) is causal
             out = varlen_attn(q[0], k[0], v[0], cu, cu, max_len, max_len, window_size=(-1, 0), enable_gqa=True)[None]

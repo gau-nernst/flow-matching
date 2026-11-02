@@ -106,12 +106,12 @@ class Block(nn.Module):
         if self.adaLN_modulation is not None:
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).unsqueeze(1).chunk(4, dim=2)
 
-            y = gated_norm(x, self.attention_norm1.weight, gate=scale_msa, eps=self.eps, gate_idx=idx)
+            y = gated_norm(x, self.attention_norm1.weight, gate=scale_msa, eps=self.eps, idx=idx)
             attn = self.attention(y, pe, varlen)
-            x = gated_norm(attn, self.attention_norm2.weight, gate_msa, x, "tanh", self.eps, gate_idx=idx)
+            x = gated_norm(attn, self.attention_norm2.weight, gate_msa, x, "tanh", self.eps, idx=idx)
 
-            ffn = self.feed_forward(gated_norm(x, self.ffn_norm1.weight, gate=scale_mlp, eps=self.eps, gate_idx=idx))
-            x = gated_norm(ffn, self.ffn_norm2.weight, gate_mlp, x, "tanh", self.eps, gate_idx=idx)
+            ffn = self.feed_forward(gated_norm(x, self.ffn_norm1.weight, gate=scale_mlp, eps=self.eps, idx=idx))
+            x = gated_norm(ffn, self.ffn_norm2.weight, gate_mlp, x, "tanh", self.eps, idx=idx)
 
         else:
             attn = self.attention(self.attention_norm1(x), pe, varlen)
@@ -170,13 +170,13 @@ class ZImage(nn.Module):
     def lora_blocks(self) -> list[nn.Module]:
         return list(self.layers)
 
-    def make_rope(self, nH: int, nW: int, L_txt: int) -> Tensor:
+    def make_rope(self, H: int, W: int, L_txt: int) -> Tensor:
         # one sample's [img, txt] rope.
         # RoPE embedding has 3 components:
         # - time: text embeds stay at pos=[1,L+1), img embeds stay at pos=L+1
         # - height: all text embeds stay at pos=0
         # - width: all text embeds stay at pos=0
-        img_rope = self.pos_embed.create((L_txt + 1, 0, 0), (1, nH, nW))
+        img_rope = self.pos_embed.create((L_txt + 1, 0, 0), (1, H, W))
         txt_rope = self.pos_embed.create((1, 0, 0), (L_txt, 1, 1))
         return torch.cat([img_rope, txt_rope])
 
@@ -218,20 +218,17 @@ class ZImage(nn.Module):
         rope: Tensor,
         txt_varlen: VarlenMetadata | None = None,
         img_varlen: VarlenMetadata | None = None,
+        joint_varlen: VarlenMetadata | None = None,
     ) -> Tensor:
         # inputs/outputs follow the repo convention: t=1 is noise, predict velocity (noise - data).
         # the original Z-Image uses t=0 as noise and predicts (data - noise), so flip both t and v.
         # inputs are from prepare(). img: [B, L_img, p*p*C], or [1, L_img, p*p*C] if varlen
         if img_varlen is not None:
-            B = img_varlen.cu_seqlens.shape[0] - 1
-            joint_varlen = img_varlen.concat(txt_varlen)
-        else:
-            B = -1  # keep t's shape
-            joint_varlen = None
+            t = t.expand(img_varlen.cu_seqlens.shape[0] - 1)
         L_img = img.shape[1]
         img_rope, txt_rope = rope[:L_img], rope[L_img:]
 
-        t_embeds = timestep_embedding(1 - t.expand(B), 256)
+        t_embeds = timestep_embedding(1 - t, 256)
         t_embeds = self.t_embedder(t_embeds.to(self.t_embedder[0][0].weight.dtype))  # [B, mod_dim]
 
         # text-only processing

@@ -168,7 +168,7 @@ def flux1_generate(
 
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    timesteps_tensor = torch.tensor(timesteps).pin_memory().to("cuda", non_blocking=True)
+    timesteps_tensor = torch.tensor(timesteps).pin_memory().to(latents.device, non_blocking=True)
     latents, kwargs = flux.prepare(latents.permute(0, 2, 3, 1), txt, vec)  # NCHW -> NHWC
     if cfg_scale != 1.0:
         assert neg_txt is not None and neg_vec is not None

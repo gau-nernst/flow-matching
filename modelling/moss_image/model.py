@@ -190,19 +190,16 @@ class MOSSImage(nn.Module):
         rope: Tensor,
         txt_varlen: VarlenMetadata | None = None,
         img_varlen: VarlenMetadata | None = None,
+        joint_varlen: VarlenMetadata | None = None,
         skip_layers: tuple[int, ...] = (),
     ) -> Tensor:
         # inputs are from prepare(). returns [B, L_img, C], or [1, L_img, C] if varlen
         # skip_layers: blocks to skip, for the negative branch of CFG
         if img_varlen is not None:
-            B = img_varlen.cu_seqlens.shape[0] - 1
-            joint_varlen = img_varlen.concat(txt_varlen)
-        else:
-            B = -1  # keep t's shape
-            joint_varlen = None
+            t = t.expand(img_varlen.cu_seqlens.shape[0] - 1)
         dtype = self.video_embedder.weight.dtype
 
-        vec = self.time_embedding(timestep_embedding(t.expand(B), 256).to(dtype))
+        vec = self.time_embedding(timestep_embedding(t, 256).to(dtype))
         mod = self.shared_block_modulation(vec).unflatten(1, (6, -1))  # [B, 6, D]
         shift, scale = self.video_head_modulation(vec).unflatten(1, (2, -1)).unbind(1)  # [B, D] each
 

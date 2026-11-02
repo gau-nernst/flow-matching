@@ -15,7 +15,7 @@ class VarlenMetadata(NamedTuple):
     perm: Tensor | None = None  # from concat(), for attention
 
     @staticmethod
-    def from_lens(lens: list[int], device: torch.types.Device = None) -> "VarlenMetadata":
+    def from_lens(lens: list[int], device: torch.types.Device) -> "VarlenMetadata":
         lens_t = torch.tensor(lens, dtype=torch.int32).pin_memory().to(device, non_blocking=True)
         cu_seqlens = F.pad(lens_t.cumsum(0, dtype=torch.int32), (1, 0))
         # output_size: otherwise it reads the sum back from the GPU
@@ -47,7 +47,7 @@ def per_token(cond: Tensor, idx: Tensor | None) -> Tensor:
     return cond if idx is None else cond[:, 0].index_select(0, idx).unsqueeze(0)
 
 
-# returns (img, kwargs) for model(img, t, **kwargs). a single sample stays a uniform batch, otherwise a varlen batch.
+# returns (img, kwargs) for model(img, t, **kwargs). samples of the same size stay a uniform batch.
 # imgs: patchified [L_i, D]. grids: patchified (H, W) of each sample. make_rope(H, W, L_txt): one sample's joint rope
 def pack_inputs(
     imgs: list[Tensor],
@@ -57,21 +57,25 @@ def pack_inputs(
     txt_first: bool,
 ) -> tuple[Tensor, dict]:
     txts = list(txt)
-    if len(imgs) == 1:
-        return imgs[0][None], dict(txt=txts[0][None], rope=make_rope(*grids[0], txts[0].shape[0]))
+    assert len(imgs) == len(txts) == len(grids), (len(imgs), len(txts), len(grids))
+    if len(set(grids)) == 1 and len({x.shape[0] for x in txts}) == 1:
+        return torch.stack(imgs), dict(txt=torch.stack(txts), rope=make_rope(*grids[0], txts[0].shape[0]))
 
     # joint rope in the same order as the joint sequence: [all first stream, all second stream]
     firsts, seconds = [], []
-    for img, txt_, (H, W) in zip(imgs, txts, grids, strict=True):
+    for img, txt_, (H, W) in zip(imgs, txts, grids):
         lens = [txt_.shape[0], img.shape[0]] if txt_first else [img.shape[0], txt_.shape[0]]
         first, second = make_rope(H, W, txt_.shape[0]).split(lens)
         firsts.append(first)
         seconds.append(second)
 
     device = imgs[0].device
+    txt_varlen = VarlenMetadata.from_lens([x.shape[0] for x in txts], device)
+    img_varlen = VarlenMetadata.from_lens([x.shape[0] for x in imgs], device)
     return torch.cat(imgs)[None], dict(
         txt=torch.cat(txts)[None],
         rope=torch.cat(firsts + seconds),
-        txt_varlen=VarlenMetadata.from_lens([x.shape[0] for x in txts], device),
-        img_varlen=VarlenMetadata.from_lens([x.shape[0] for x in imgs], device),
+        txt_varlen=txt_varlen,
+        img_varlen=img_varlen,
+        joint_varlen=txt_varlen.concat(img_varlen) if txt_first else img_varlen.concat(txt_varlen),
     )

@@ -3,7 +3,7 @@ name = "flow-matching"
 version = "0.0.0"
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.9.1",
+    "torch>=2.14.1",
     "torchvision>=0.24.1",
     "ruff>=0.14.13",
     "ipykernel>=7.1.0",

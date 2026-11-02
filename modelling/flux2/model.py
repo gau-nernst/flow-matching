@@ -241,11 +241,8 @@ class Flux2(nn.Module):
     def make_img_rope(self, H: int, W: int, t: int = 0) -> Tensor:
         return self.pos_embed.create((t, 0, 0, 0), (1, H, W, 1))
 
-    def make_txt_rope(self, L: int):
-        return self.pos_embed.create((0, 0, 0, 0), (1, 1, 1, L))
-
     def make_rope(self, H: int, W: int, L_txt: int) -> Tensor:
-        return torch.cat([self.make_txt_rope(L_txt), self.make_img_rope(H, W)])
+        return torch.cat([self.pos_embed.create((0, 0, 0, 0), (1, 1, 1, L_txt)), self.make_img_rope(H, W)])
 
     # latents: [B, H, W, C] (uniform) or a list of [H_i, W_i, C] (varlen). ref: uniform only
     def prepare(
@@ -281,25 +278,24 @@ class Flux2(nn.Module):
         ref: Tensor | None = None,
         txt_varlen: VarlenMetadata | None = None,
         img_varlen: VarlenMetadata | None = None,
+        joint_varlen: VarlenMetadata | None = None,
     ) -> Tensor:
         # inputs are from prepare(). returns [B, L_img, C], or [1, L_img, C] if varlen
         if img_varlen is not None:
             B = img_varlen.cu_seqlens.shape[0] - 1
-            joint_varlen = txt_varlen.concat(img_varlen)
-        else:
-            B = -1  # keep t's shape
-            joint_varlen = None
-        L_img = img.shape[1]
+            t = t.expand(B)
+            guidance = guidance.expand(B) if guidance is not None else None
+        Limg = img.shape[1]
         if ref is not None:
             img = torch.cat([img, ref], dim=1)
-        L_txt = txt.shape[1]
+        Ltxt = txt.shape[1]
 
         img = self.img_in(img.to(self.img_in.weight.dtype))
         txt = self.txt_in(txt)
-        vec = self.time_in(timestep_embedding(t.expand(B), 256).to(img.dtype))  # [B, D]
+        vec = self.time_in(timestep_embedding(t, 256).to(img.dtype))  # [B, D]
 
         if guidance is not None:  # allow no guidance_embed
-            vec = vec + self.guidance_in(timestep_embedding(guidance.expand(B), 256).to(img.dtype))
+            vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
 
         mod_img = self.double_stream_modulation_img(vec)
         mod_txt = self.double_stream_modulation_txt(vec)
@@ -311,16 +307,15 @@ class Flux2(nn.Module):
         txt_idx = txt_varlen.seq_ids if txt_varlen is not None else None
         img = torch.addcmul(img, per_token(mod_img[-1], img_idx), img_res)
         txt = torch.addcmul(txt, per_token(mod_txt[-1], txt_idx), txt_res)
-        x = torch.cat((txt, img), dim=1)
+        joint = torch.cat([txt, img], dim=1)
 
         mod = self.single_stream_modulation(vec)
         res = None
         for block in self.single_blocks:
-            res, x = block(x, res, rope, mod, joint_varlen)
-        img = torch.addcmul(x[:, L_txt:], per_token(mod[-1], img_idx), res[:, L_txt:])
+            res, joint = block(joint, res, rope, mod, joint_varlen)
+        img = torch.addcmul(joint[:, Ltxt:], per_token(mod[-1], img_idx), res[:, Ltxt:])
 
-        img = self.final_layer(img, vec, img_varlen)
-        return img[:, :L_img]
+        return self.final_layer(img[:, :Limg], vec, img_varlen)
 
 
 def _load_flux2(repo_id: str, filename: str):

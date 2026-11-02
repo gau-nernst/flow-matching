@@ -84,8 +84,7 @@ def random_resize(img_pil: Image.Image, min_size: int, max_size: int):
     img_pil = img_pil.resize((target_width, target_height), Image.Resampling.BICUBIC)
 
     # slightly crop the image so that each side is divisible by 16.
-    # to reduce fragmentation, make it in <factor> increment.
-    factor = 64
+    factor = 16
     height = target_height // factor * factor
     width = target_width // factor * factor
     img_pt = torch.from_numpy(np.array(img_pil)).permute(2, 0, 1)  # HWC->CHW

@@ -4,6 +4,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from ..varlen import per_token
+
 
 @triton.jit
 def _modulate_kernel(
@@ -76,12 +78,9 @@ def modulate(
     # x: [B, L, D]. shift, scale, gate: [B, 1, D] or [1, 1, D]
     # varlen: x: [1, L, D]. shift, scale, gate: [B, 1, D]. idx: [L]
     if torch.is_grad_enabled():
-        if idx is not None:
-            shift, scale = [t[:, 0].index_select(0, idx).unsqueeze(0) for t in (shift, scale)]
-            if gate is not None:
-                gate = gate[:, 0].index_select(0, idx).unsqueeze(0)
+        shift, scale = per_token(shift, idx), per_token(scale, idx)
         if res is not None:
-            x = torch.addcmul(x, gate, res)
+            x = torch.addcmul(x, per_token(gate, idx), res)
         if rms:
             out = F.rms_norm(x, x.shape[-1:], norm_weight, eps=eps)
         else:

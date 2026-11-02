@@ -100,7 +100,9 @@ class MOSSImagePipeline:
         if uncond_skip_layers is None:
             uncond_skip_layers = self.sample_defaults["uncond_skip_layers"]
         txts = self.text_encoder(prompt)
-        neg_txts = self.text_encoder(neg_prompt) * len(txts) if cfg_scale != 1.0 else None
+        neg_txts = self.text_encoder(neg_prompt) if cfg_scale != 1.0 else None
+        if neg_txts is not None and len(neg_txts) == 1:
+            neg_txts = neg_txts * len(txts)
 
         height, width = (img_size, img_size) if isinstance(img_size, int) else img_size
         ae = self.ae

@@ -219,9 +219,12 @@ def flux2_generate(
 
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    timesteps_tensor = torch.tensor(timesteps).pin_memory().to("cuda", non_blocking=True)
+    timesteps_tensor = torch.tensor(timesteps).pin_memory().to(latents.device, non_blocking=True)
 
     latents, kwargs = flux.prepare(latents, txt, ref=ref_latents)
+    if cfg_scale != 1.0:
+        assert neg_txt is not None
+        neg_kwargs = dict(kwargs, txt=neg_txt)
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
         t = timesteps_tensor[None, i]
@@ -229,8 +232,7 @@ def flux2_generate(
 
         # classifier-free guidance
         if cfg_scale != 1.0:
-            assert neg_txt is not None
-            neg_v = flux(latents, t, **dict(kwargs, txt=neg_txt), guidance=guidance).float()
+            neg_v = flux(latents, t, **neg_kwargs, guidance=guidance).float()
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
