@@ -5,11 +5,13 @@ from collections.abc import Callable
 import torch
 from torch import Tensor, nn
 from tqdm import tqdm
-from transformers import AutoTokenizer, Qwen3Model
+from transformers import AutoTokenizer
 
+from ..qwen3 import Qwen3ForCausalLM
 from ..registry import MODELS
 from ..solvers import get_solver
 from ..vae import load_vae
+from ..varlen import VarlenMetadata
 from .model import ZImage, load_zimage
 
 
@@ -26,7 +28,7 @@ class ZImagePipeline:
 
         # text stuff
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_id)
-        self.qwen3 = Qwen3Model.from_pretrained(text_encoder_id, dtype="auto")
+        self.qwen3 = Qwen3ForCausalLM.from_pretrained(text_encoder_id).model
         # prune unneeded parts
         self.qwen3.layers = self.qwen3.layers[:-1]
         self.qwen3.norm = nn.Identity()
@@ -60,20 +62,13 @@ class ZImagePipeline:
             )
             for prompt in prompts
         ]
-        inputs = self.tokenizer(
-            formatted_prompts,
-            # padding="max_length",
-            padding="longest",
-            max_length=512,
-            truncation=True,
-            return_tensors="pt",
-        )
+        input_ids = self.tokenizer(formatted_prompts, max_length=512, truncation=True).input_ids
+        lens = [len(x) for x in input_ids]
 
         device = next(self.qwen3.parameters()).device
-        input_ids = inputs.input_ids.to(device)
-        mask = inputs.attention_mask.to(device).bool()
-        txt_embeds = self.qwen3(input_ids, attention_mask=mask, output_hidden_states=True).last_hidden_state
-        return [txt_embeds[i, mask[i]] for i in range(len(formatted_prompts))]
+        varlen = VarlenMetadata.from_lens(lens, device) if len(lens) > 1 else None
+        input_ids = torch.tensor(sum(input_ids, []), device=device)[None]
+        return list(self.qwen3(input_ids, varlen=varlen)[0].split(lens))
 
     # imgs: uint8 [H_i, W_i, 3]. returns per-sample latents and kwargs for model.prepare()
     @torch.no_grad()
