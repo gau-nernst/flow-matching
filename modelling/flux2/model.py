@@ -15,7 +15,7 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-from ..varlen import VarlenMetadata, joint_metadata, pack_inputs, per_token
+from ..varlen import VarlenMetadata, pack_inputs, per_token
 
 
 class MLP(nn.ModuleList):
@@ -286,7 +286,7 @@ class Flux2(nn.Module):
         if packed:
             img, txt = img[None], txt[None]
             N = img_varlen.cu_seqlens.shape[0] - 1
-            joint_varlen = joint_metadata(txt_varlen, img_varlen)
+            joint_varlen = txt_varlen.concat(img_varlen)
         else:
             N = -1  # keep t's shape
             joint_varlen = None

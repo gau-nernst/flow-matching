@@ -15,7 +15,7 @@ from ..linear import Linear
 from ..registry import MODELS
 from ..rope import apply_rope, compute_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-from ..varlen import VarlenMetadata, joint_metadata, pack_inputs
+from ..varlen import VarlenMetadata, pack_inputs
 
 HEAD_DIM = 128
 
@@ -196,7 +196,7 @@ class MOSSImage(nn.Module):
         if packed:
             img, txt = img[None], txt[None]
             N = img_varlen.cu_seqlens.shape[0] - 1
-            joint_varlen = joint_metadata(img_varlen, txt_varlen)
+            joint_varlen = img_varlen.concat(txt_varlen)
         else:
             N = -1  # keep t's shape
             joint_varlen = None
