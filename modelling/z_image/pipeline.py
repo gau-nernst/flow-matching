@@ -50,7 +50,8 @@ class ZImagePipeline:
         return cls(load_zimage(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
     # one unpadded [L_i, D] per prompt
-    def embed_text(self, prompts: str | list[str]) -> list[Tensor]:
+    @torch.no_grad()
+    def text_encoder(self, prompts: str | list[str]) -> list[Tensor]:
         if isinstance(prompts, str):
             prompts = [prompts]
 
@@ -70,12 +71,6 @@ class ZImagePipeline:
         varlen = VarlenMetadata.from_lens(lens, device) if len(lens) > 1 else None
         input_ids = list_to_tensor_async([x for ids in input_ids for x in ids], device)[None]
         return list(self.qwen3(input_ids, varlen=varlen)[0].split(lens))
-
-    # imgs: uint8 [H_i, W_i, 3]. returns per-sample latents and kwargs for model.prepare()
-    @torch.no_grad()
-    def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
-        latents = [self.ae.encode(x[None])[0] for x in imgs]
-        return latents, dict(txt=self.embed_text(prompts))
 
     # cfg_scale, num_steps and time_shift default to self.sample_defaults
     @torch.no_grad()
@@ -97,9 +92,9 @@ class ZImagePipeline:
         cfg_scale = self.sample_defaults["cfg_scale"] if cfg_scale is None else cfg_scale
         num_steps = self.sample_defaults["num_steps"] if num_steps is None else num_steps
         time_shift = self.sample_defaults["time_shift"] if time_shift is None else time_shift
-        txt_embeds = self.embed_text(prompt)
+        txt_embeds = self.text_encoder(prompt)
         bsize = len(txt_embeds)
-        neg_txt_embeds = self.embed_text(neg_prompt) if cfg_scale != 1.0 else None
+        neg_txt_embeds = self.text_encoder(neg_prompt) if cfg_scale != 1.0 else None
         if neg_txt_embeds is not None and len(neg_txt_embeds) == 1:
             neg_txt_embeds = neg_txt_embeds * bsize
         if isinstance(img_size, int):

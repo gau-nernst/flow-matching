@@ -73,12 +73,6 @@ class MOSSImagePipeline:
         spec = MODELS[name]
         return cls(load_moss_image(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
-    # imgs: uint8 [H_i, W_i, 3]. returns per-sample latents and kwargs for model.prepare()
-    @torch.no_grad()
-    def prepare_train_inputs(self, imgs: list[Tensor], prompts: list[str]) -> tuple[list[Tensor], dict]:
-        latents = [self.ae.encode(x[None])[0] for x in imgs]
-        return latents, dict(txt=self.text_encoder(prompts))
-
     # cfg_scale, num_steps, shift and uncond_skip_layers default to self.sample_defaults
     @torch.no_grad()
     def generate(

@@ -229,8 +229,10 @@ if __name__ == "__main__":
                 imgs = imgs + distill_imgs
                 prompts = prompts + distill_prompts
 
-            latents, cond = pipeline.prepare_train_inputs([x.cuda(non_blocking=True) for x in imgs], prompts)
-            loss = compute_loss(model, latents, time_sampler, cond)
+            with torch.no_grad():
+                latents = [pipeline.ae.encode(x.cuda(non_blocking=True)[None])[0] for x in imgs]
+                txt = pipeline.text_encoder(prompts)
+            loss = compute_loss(model, latents, time_sampler, txt)
             loss.div(args.gradient_accumulation).backward()
 
         if step % args.log_interval == 0:

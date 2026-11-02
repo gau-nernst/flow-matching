@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 from torchvision.transforms import v2
 
-from modelling import MODELS, load_pipeline
+from modelling import load_pipeline
 from modelling.linear import Linear
 from time_sampler import TimeSampler
 
@@ -17,10 +17,10 @@ from time_sampler import TimeSampler
 def setup_model(
     model_name: str, lora: int, fp8: bool, use_compile: bool, mem_budget: float = 0.7, ckpt_ratio: float = 0.5
 ):
-    if not hasattr(MODELS[model_name].pipeline_cls, "prepare_train_inputs"):
-        raise ValueError(f"Training is not supported for {model_name} yet")
     pipeline = load_pipeline(model_name).cuda()
     model = pipeline.model
+    if not hasattr(model, "lora_blocks"):
+        raise ValueError(f"Training is not supported for {model_name} yet")
     model.train().requires_grad_(False)
     layers = model.lora_blocks()
 
@@ -47,13 +47,14 @@ def setup_model(
     return pipeline
 
 
-# latents, cond: from pipeline.prepare_train_inputs()
-def compute_loss(model: nn.Module, latents: list[Tensor], time_sampler: TimeSampler, cond: dict) -> Tensor:
+def compute_loss(
+    model: nn.Module, latents: list[Tensor], time_sampler: TimeSampler, txt: Tensor | list[Tensor]
+) -> Tensor:
     t = time_sampler(len(latents), device=latents[0].device)
     noise = [torch.randn_like(x) for x in latents]
     noisy = [x.lerp(n, t_) for x, n, t_ in zip(latents, noise, t)]
 
-    img, kwargs = model.prepare(noisy, **cond)
+    img, kwargs = model.prepare(noisy, txt)
     v = model.unpatchify(model(img, t, **kwargs), [x.shape[:2] for x in latents])
 
     # rectified flow loss. predict velocity from latents (t=0) to noise (t=1).
