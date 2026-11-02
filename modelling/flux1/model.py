@@ -12,6 +12,7 @@ from ..attn import dispatch_attn
 from ..linear import Linear
 from ..rope import RopeND, apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
+from ..varlen import VarlenMetadata
 from .modulate import modulate
 
 
@@ -160,9 +161,10 @@ class LastLayer(nn.Module):
         self.linear = nn.Linear(dim, patch_size * patch_size * out_channels, bias=bias)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim, bias=bias))
 
-    def forward(self, x: Tensor, vec: Tensor) -> Tensor:
+    def forward(self, x: Tensor, vec: Tensor, varlen: VarlenMetadata | None = None) -> Tensor:
+        idx = varlen.seq_ids if varlen is not None else None
         shift, scale = self.adaLN_modulation(vec)[:, None, :].chunk(2, dim=-1)
-        return self.linear(modulate(x, shift, scale)[0])
+        return self.linear(modulate(x, shift, scale, idx=idx)[0])
 
 
 # default is Flux.1-dev
@@ -203,6 +205,7 @@ class Flux1(nn.Module):
         self.final_layer = LastLayer(cfg.dim, 1, cfg.img_dim)
 
     def make_rope(self, H: int, W: int, L: int):
+        # one sample's [txt, img] rope. H, W: patchified size
         # RoPE embedding has 3 components:
         # - time: text embeds stay at pos=0, img embeds stay at pos=0
         # - height: all text embeds stay at pos=0
@@ -211,52 +214,46 @@ class Flux1(nn.Module):
         txt_rope = self.pos_embed.create((0, 0, 0), (1, 1, 1)).expand(L, -1)
         return torch.cat([txt_rope, img_rope], dim=0)
 
+    # latents: [B, H, W, C]
+    def prepare(self, latents: Tensor, txt: Tensor, vec: Tensor) -> tuple[Tensor, dict]:
+        B, H, W, C = latents.shape
+        p = self.cfg.patch_size
+        img = latents.view(B, H // p, p, W // p, p, C).permute(0, 1, 3, 5, 2, 4)  # (B, nH, nW, C, p, p)
+        img = img.reshape(B, (H // p) * (W // p), C * p * p)
+        return img, dict(txt=txt, vec=vec, rope=self.make_rope(H // p, W // p, txt.shape[1]))
+
+    def unpatchify(self, out: Tensor, size: tuple[int, int]) -> Tensor:
+        H, W = size
+        p = self.cfg.patch_size
+        x = out.view(out.shape[0], H // p, W // p, -1, p, p).permute(0, 1, 4, 2, 5, 3)  # (B, nH, p, nW, p, C)
+        return x.reshape(out.shape[0], H, W, -1)
+
     def forward(
         self,
         img: Tensor,
         t: Tensor,
         txt: Tensor,
+        rope: Tensor,
         vec: Tensor,
         guidance: Tensor | None = None,
-        rope: Tensor | None = None,
     ) -> Tensor:
-        # we integrate patchify and unpatchify into model's forward pass
-        B, C, H, W = img.shape
-        L = txt.shape[1]
-
-        patch_size = self.cfg.patch_size
-        nH = H // patch_size
-        nW = W // patch_size
-        img = img.to(self.img_in.weight.dtype)
-        img = img.view(B, C, nH, patch_size, nW, patch_size)
-        img = img.permute(0, 2, 4, 1, 3, 5)  # (B, nH, nW, C, 2, 2)
-        img = img.reshape(B, nH * nW, C * patch_size * patch_size)
-
-        img = self.img_in(img)
+        # inputs are from prepare(). img: [B, L_img, C*p*p]
+        img = self.img_in(img.to(self.img_in.weight.dtype))
         txt = self.txt_in(txt)
         vec = self.time_in(timestep_embedding(t, 256).to(img.dtype)) + self.vector_in(vec)
 
         if guidance is not None:  # allow no guidance_embed
             vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
 
-        if rope is None:
-            rope = self.make_rope(nH, nW, L)
-
         for block in self.double_blocks:
             img, txt = block(img, txt, vec, rope)
 
+        L = txt.shape[1]
         joint = torch.cat([txt, img], dim=1)
         for block in self.single_blocks:
             joint = block(joint, vec, rope)
-        img = joint[:, L:]
 
-        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
-
-        # unpatchify
-        img = img.view(B, nH, nW, C, patch_size, patch_size)
-        img = img.permute(0, 3, 1, 4, 2, 5)  # (B, C, nH, 2, nW, 2)
-        img = img.reshape(B, C, H, W)
-        return img
+        return self.final_layer(joint[:, L:], vec)
 
 
 def _load_flux1(repo_id: str, filename: str, prefix: str | None = None):

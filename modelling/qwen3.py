@@ -1,11 +1,13 @@
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn.attention.varlen import varlen_attn
 from transformers import Qwen3Config
 
 from .linear import Linear
 from .rope import apply_rope, compute_rope
 from .utils import create_remap_hook, create_weight_merge_hook, load_hf_state_dict
+from .varlen import VarlenMetadata
 
 
 class Qwen3Attention(nn.Module):
@@ -31,18 +33,25 @@ class Qwen3Attention(nn.Module):
         pos_embeds: Tensor,
         add: Tensor | None = None,
         attn_mask: Tensor | None = None,
+        varlen: VarlenMetadata | None = None,
     ) -> Tensor:
         qkv = self.qkv_proj(x).view(*x.shape[:-1], -1, self.head_dim)
         q, k, v = qkv.split((self.num_qo_heads, self.num_kv_heads, self.num_kv_heads), dim=-2)
-        q = apply_rope(q, pos_embeds, self.q_norm.weight, self.eps, interleaved=False).transpose(1, 2)
-        k = apply_rope(k, pos_embeds, self.k_norm.weight, self.eps, interleaved=False).transpose(1, 2)
-        v = v.transpose(1, 2)
-        if attn_mask is None:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        q = apply_rope(q, pos_embeds, self.q_norm.weight, self.eps, interleaved=False)
+        k = apply_rope(k, pos_embeds, self.k_norm.weight, self.eps, interleaved=False)
+        if varlen is not None:
+            assert attn_mask is None
+            cu, max_len = varlen.cu_seqlens, varlen.max_seqlen
+            # window_size (-1, 0) is causal
+            out = varlen_attn(q[0], k[0], v[0], cu, cu, max_len, max_len, window_size=(-1, 0), enable_gqa=True)[None]
         else:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=True)
-        out = self.o_proj(out.transpose(1, 2).flatten(-2), add)
-        return out
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            if attn_mask is None:
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            else:
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=True)
+            out = out.transpose(1, 2)
+        return self.o_proj(out.flatten(-2), add)
 
 
 class Qwen3MLP(nn.Module):
@@ -72,8 +81,10 @@ class Qwen3DecoderLayer(nn.Module):
         self.mlp = Qwen3MLP(cfg)
         self.layer_id = layer_id
 
-    def forward(self, x: Tensor, pos_embeds: Tensor, attn_mask: Tensor | None = None) -> Tensor:
-        x = self.self_attn(self.input_layernorm(x), pos_embeds, x, attn_mask)
+    def forward(
+        self, x: Tensor, pos_embeds: Tensor, attn_mask: Tensor | None = None, varlen: VarlenMetadata | None = None
+    ) -> Tensor:
+        x = self.self_attn(self.input_layernorm(x), pos_embeds, x, attn_mask, varlen)
         x = self.mlp(self.post_attention_layernorm(x), x)
         return x
 
@@ -88,21 +99,25 @@ class Qwen3Model(nn.Module):
         self.norm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
     # attn_mask: [B, 1, L, L] bool, True means attend. default to causal mask.
+    # varlen: input_ids is [1, L], without padding
     def forward(
         self,
         input_ids: Tensor,
         *,
         output_indices: tuple[int, ...] | None = None,
         attn_mask: Tensor | None = None,
+        varlen: VarlenMetadata | None = None,
     ) -> Tensor:
         x = self.embed_tokens(input_ids)
 
         theta = self.cfg.rope_parameters["rope_theta"]
-        pos_embeds = compute_rope(x.shape[-2], self.cfg.head_dim, theta, device=x.device)
+        L = x.shape[-2]
+        pos = L if varlen is None else torch.arange(L, device=x.device) - varlen.cu_seqlens[varlen.seq_ids]
+        pos_embeds = compute_rope(pos, self.cfg.head_dim, theta, device=x.device)
 
         intermediates = []
         for i, layer in enumerate(self.layers):
-            x = layer(x, pos_embeds, attn_mask)
+            x = layer(x, pos_embeds, attn_mask, varlen)
             if output_indices and i in output_indices:
                 intermediates.append(x)
 

@@ -7,6 +7,7 @@ from tqdm import tqdm
 from ..offload import PerLayerOffloadCUDAStream
 from ..solvers import get_solver
 from ..text_embedder import load_clip_l, load_t5
+from ..utils import list_to_tensor_async
 from ..vae import AutoEncoder, load_vae
 from .model import Flux1, load_flux1
 
@@ -125,7 +126,6 @@ class Flux1Pipeline:
             solver=solver,
             pbar=pbar,
         )
-        latents = latents.permute(0, 2, 3, 1)  # NCHW -> NHWC
         return self.ae.decode(latents, uint8=True)
 
 
@@ -169,18 +169,21 @@ def flux1_generate(
 
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    rope = flux.make_rope(H // 2, W // 2, txt.shape[1])
+    timesteps_tensor = list_to_tensor_async(timesteps, latents.device)
+    latents, kwargs = flux.prepare(latents.permute(0, 2, 3, 1), txt, vec)  # NCHW -> NHWC
+    if cfg_scale != 1.0:
+        assert neg_txt is not None and neg_vec is not None
+        neg_kwargs = dict(kwargs, txt=neg_txt, vec=neg_vec)
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
-        t = torch.tensor([timesteps[i]], device="cuda")
-        v = flux(latents, t, txt, vec, guidance, rope).float()
+        t = timesteps_tensor[None, i]
+        v = flux(latents, t, **kwargs, guidance=guidance).float()
 
         # classifier-free guidance
         if cfg_scale != 1.0:
-            assert neg_txt is not None and neg_vec is not None
-            neg_v = flux(latents, t, neg_txt, neg_vec, guidance, rope).float()
+            neg_v = flux(latents, t, **neg_kwargs, guidance=guidance).float()
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
 
-    return latents
+    return flux.unpatchify(latents, (H, W))  # NHWC

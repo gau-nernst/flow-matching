@@ -18,7 +18,7 @@ import psutil
 import torch
 import wandb
 from PIL import Image, ImageOps
-from torch.utils.data import DataLoader, IterableDataset, default_collate, get_worker_info
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from tqdm import tqdm
 
 from modelling import MODELS
@@ -36,12 +36,12 @@ class ImageDataset(IterableDataset):
         img_dir: str,
         min_size: int,
         max_size: int,
-        batch_size: int,
+        batch_tokens: int,
     ) -> None:
         self.img_dir = Path(img_dir)
         self.min_size = min_size
         self.max_size = max_size
-        self.batch_size = batch_size
+        self.batch_tokens = batch_tokens
 
         if str(meta_path).endswith(".tsv"):
             meta = pd.read_csv(meta_path, sep="\t")
@@ -54,8 +54,11 @@ class ImageDataset(IterableDataset):
         self.shuffle_rng = torch.Generator()
         self.shuffle_rng.seed()
 
+    # yields (list of uint8 [H, W, 3], list of prompts). sizes can differ.
+    # a batch holds up to batch_tokens image tokens (16x16 pixels each). a larger image is batched alone
     def __iter__(self):
-        buckets = dict()
+        batch = []
+        num_tokens = 0
         counter = -1
 
         # NOTE: not handle distributed training for now
@@ -80,15 +83,15 @@ class ImageDataset(IterableDataset):
                 img_pil = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
                 img_pt = random_resize(img_pil, self.min_size, self.max_size)
 
-                prompt = self.prompts[idx]
-                img_size = tuple(img_pt.shape[:2])
-                if img_size not in buckets:
-                    buckets[img_size] = []
-                buckets[img_size].append((img_pt, prompt))
+                img_tokens = img_pt.shape[0] * img_pt.shape[1] // 256
+                if batch and num_tokens + img_tokens > self.batch_tokens:
+                    imgs, prompts = zip(*batch)
+                    yield list(imgs), list(prompts)
+                    batch = []
+                    num_tokens = 0
 
-                if len(buckets[img_size]) == self.batch_size:
-                    yield default_collate(buckets[img_size])
-                    buckets[img_size] = []
+                batch.append((img_pt, self.prompts[idx]))
+                num_tokens += img_tokens
 
 
 @torch.no_grad()
@@ -132,7 +135,7 @@ if __name__ == "__main__":
     parser.add_argument("--distill_ds", type=json.loads)
 
     parser.add_argument("--num_steps", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_tokens", type=int, default=4096, help="image tokens per step. 4096 is 1024x1024")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
@@ -148,25 +151,23 @@ if __name__ == "__main__":
     parser.add_argument("--resume")
     args = parser.parse_args()
 
-    assert args.batch_size % args.gradient_accumulation == 0
     sample_kwargs = {**MODELS[args.model].sample_defaults, **args.test_sample_kwargs}
-    batch_size = args.batch_size // args.gradient_accumulation
+    batch_tokens = args.batch_tokens // args.gradient_accumulation
     torch._dynamo.config.cache_size_limit = 1000
     torch._dynamo.config.accumulated_cache_size_limit = 1000
 
     wandb.init(project="T2I finetune", name=args.run_name, dir="/tmp", mode="disabled" if args.profile else None)
 
-    def create_dloader(ds_config: dict, batch_size: int):
-        ds = ImageDataset(ds_config["meta_path"], ds_config["img_dir"], args.min_size, args.max_size, batch_size)
+    def create_dloader(ds_config: dict, batch_tokens: int):
+        ds = ImageDataset(ds_config["meta_path"], ds_config["img_dir"], args.min_size, args.max_size, batch_tokens)
         dloader = DataLoader(ds, batch_size=None, num_workers=args.num_workers, pin_memory=True)
         return iter(dloader)
 
     if args.distill_ds is not None:
-        assert batch_size % 2 == 0
-        train_dloader = create_dloader(args.train_ds, batch_size // 2)
-        distill_dloader = create_dloader(args.distill_ds, batch_size // 2)
+        train_dloader = create_dloader(args.train_ds, batch_tokens // 2)
+        distill_dloader = create_dloader(args.distill_ds, batch_tokens // 2)
     else:
-        train_dloader = create_dloader(args.train_ds, batch_size)
+        train_dloader = create_dloader(args.train_ds, batch_tokens)
         distill_dloader = None
 
     pipeline = setup_model(args.model, args.lora, args.fp8, args.compile, args.mem_budget, args.ckpt_ratio)
@@ -214,6 +215,7 @@ if __name__ == "__main__":
     torch.cuda.reset_peak_memory_stats()
     model.train()
     time0 = time.perf_counter()
+    num_imgs = 0
     while step < args.num_steps:
         if args.profile:
             if step == 5:
@@ -229,11 +231,14 @@ if __name__ == "__main__":
 
             if distill_dloader is not None:
                 distill_imgs, distill_prompts = next(distill_dloader)
-                imgs = torch.cat([imgs, distill_imgs], dim=0)
+                imgs = imgs + distill_imgs
                 prompts = prompts + distill_prompts
 
-            latents, model_kwargs = pipeline.prepare_train_inputs(imgs.cuda(), prompts)
-            loss = compute_loss(model, latents, time_sampler, model_kwargs)
+            num_imgs += len(imgs)
+            with torch.no_grad():
+                latents = [pipeline.ae.encode(x.cuda(non_blocking=True)[None])[0] for x in imgs]
+                txt = pipeline.text_encoder(prompts)
+            loss = compute_loss(model, latents, time_sampler, txt)
             loss.div(args.gradient_accumulation).backward()
 
         if step % args.log_interval == 0:
@@ -255,13 +260,14 @@ if __name__ == "__main__":
             memory_info = psutil.virtual_memory()
             time1 = time.perf_counter()
             log_dict = dict(
-                imgs_per_second=args.batch_size * args.log_interval / (time1 - time0),
+                imgs_per_second=num_imgs / (time1 - time0),
                 max_memory_allocated=torch.cuda.max_memory_allocated() / 1e9,
                 cpu_mem_active=memory_info.active / 1e9,
                 cpu_mem_used=memory_info.used / 1e9,
             )
             wandb.log(log_dict, step=step)
             time0 = time1
+            num_imgs = 0
 
         if step % args.eval_interval == 0:
             # only save LoRA weights (the only trainable params)

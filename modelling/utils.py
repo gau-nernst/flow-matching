@@ -7,6 +7,11 @@ from huggingface_hub import hf_hub_download
 from torch import Tensor, nn
 
 
+# no CUDA sync, unlike torch.tensor(data, device=device)
+def list_to_tensor_async(data: list, device: torch.types.Device, dtype: torch.dtype | None = None) -> torch.Tensor:
+    return torch.tensor(data, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
+
+
 def load_hf_state_dict(repo_id: str, filename: str, prefix: str | None = None):
     local_path = hf_hub_download(repo_id, filename)
 

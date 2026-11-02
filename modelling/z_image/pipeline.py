@@ -5,11 +5,14 @@ from collections.abc import Callable
 import torch
 from torch import Tensor, nn
 from tqdm import tqdm
-from transformers import AutoTokenizer, Qwen3Model
+from transformers import AutoTokenizer
 
+from ..qwen3 import Qwen3ForCausalLM
 from ..registry import MODELS
 from ..solvers import get_solver
+from ..utils import list_to_tensor_async
 from ..vae import load_vae
+from ..varlen import VarlenMetadata
 from .model import ZImage, load_zimage
 
 
@@ -26,7 +29,7 @@ class ZImagePipeline:
 
         # text stuff
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_id)
-        self.qwen3 = Qwen3Model.from_pretrained(text_encoder_id, dtype="auto")
+        self.qwen3 = Qwen3ForCausalLM.from_pretrained(text_encoder_id).model
         # prune unneeded parts
         self.qwen3.layers = self.qwen3.layers[:-1]
         self.qwen3.norm = nn.Identity()
@@ -46,7 +49,9 @@ class ZImagePipeline:
         spec = MODELS[name]
         return cls(load_zimage(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
 
-    def embed_text(self, prompts: str | list[str]) -> Tensor:
+    # one unpadded [L_i, D] per prompt
+    @torch.no_grad()
+    def text_encoder(self, prompts: str | list[str]) -> list[Tensor]:
         if isinstance(prompts, str):
             prompts = [prompts]
 
@@ -59,32 +64,13 @@ class ZImagePipeline:
             )
             for prompt in prompts
         ]
-        inputs = self.tokenizer(
-            formatted_prompts,
-            # padding="max_length",
-            padding="longest",
-            max_length=512,
-            truncation=True,
-            return_tensors="pt",
-        )
+        input_ids = self.tokenizer(formatted_prompts, max_length=512, truncation=True).input_ids
+        lens = [len(x) for x in input_ids]
 
         device = next(self.qwen3.parameters()).device
-        input_ids = inputs.input_ids.to(device)
-        mask = inputs.attention_mask.to(device).bool()
-        txt_embeds = self.qwen3(input_ids, attention_mask=mask, output_hidden_states=True).last_hidden_state
-
-        return txt_embeds
-
-        # remove padding
-        # TODO: use varlen attention instead
-        # return [txt_embeds[i, mask[i]] for i in range(len(formatted_prompts))]
-
-    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs)
-    @torch.no_grad()
-    def prepare_train_inputs(self, imgs: Tensor, prompts: list[str]) -> tuple[Tensor, dict]:
-        latents = self.ae.encode(imgs)
-        txt = self.embed_text(prompts)
-        return latents, dict(txt=txt)
+        varlen = VarlenMetadata.from_lens(lens, device) if len(lens) > 1 else None
+        input_ids = list_to_tensor_async([x for ids in input_ids for x in ids], device)[None]
+        return list(self.qwen3(input_ids, varlen=varlen)[0].split(lens))
 
     # cfg_scale, num_steps and time_shift default to self.sample_defaults
     @torch.no_grad()
@@ -106,10 +92,11 @@ class ZImagePipeline:
         cfg_scale = self.sample_defaults["cfg_scale"] if cfg_scale is None else cfg_scale
         num_steps = self.sample_defaults["num_steps"] if num_steps is None else num_steps
         time_shift = self.sample_defaults["time_shift"] if time_shift is None else time_shift
-        txt_embeds = self.embed_text(prompt)
-        neg_txt_embeds = self.embed_text(neg_prompt) if cfg_scale != 1.0 else None
-
-        bsize = txt_embeds.shape[0]
+        txt_embeds = self.text_encoder(prompt)
+        bsize = len(txt_embeds)
+        neg_txt_embeds = self.text_encoder(neg_prompt) if cfg_scale != 1.0 else None
+        if neg_txt_embeds is not None and len(neg_txt_embeds) == 1:
+            neg_txt_embeds = neg_txt_embeds * bsize
         if isinstance(img_size, int):
             height = width = img_size
         else:
@@ -150,8 +137,8 @@ def zimage_generate(
     zimage: ZImage,
     latents: Tensor,
     timesteps: list[float],
-    txt: Tensor,
-    neg_txt: Tensor | None = None,
+    txt: list[Tensor],
+    neg_txt: list[Tensor] | None = None,
     cfg_scale: float = 1.0,
     solver: str = "euler",
     pbar: bool = False,
@@ -159,19 +146,25 @@ def zimage_generate(
 ) -> Tensor:
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
+    timesteps_tensor = list_to_tensor_async(timesteps, latents.device)
+
+    # pack, since prompts have different lengths
+    imgs = list(latents)
+    sizes = [x.shape[:2] for x in imgs]
+    latents, pos_kwargs = zimage.prepare(imgs, txt)
+    neg_kwargs = zimage.prepare(imgs, neg_txt)[1] if cfg_scale != 1.0 else None
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
-        t = torch.tensor([timesteps[i]], device="cuda")
-        v = zimage(latents, t, txt).float()
+        t = timesteps_tensor[None, i]
+        v = zimage(latents, t, **pos_kwargs).float()
 
         # classifier-free guidance
         if cfg_scale != 1.0:
-            assert neg_txt is not None
-            neg_v = zimage(latents, t, neg_txt).float()
+            neg_v = zimage(latents, t, **neg_kwargs).float()
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
         if progress_cb is not None:
             progress_cb(i + 1, num_steps)
 
-    return latents
+    return torch.stack(zimage.unpatchify(latents, sizes))

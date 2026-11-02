@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 from torchvision.transforms import v2
 
-from modelling import MODELS, load_pipeline
+from modelling import load_pipeline
 from modelling.linear import Linear
 from time_sampler import TimeSampler
 
@@ -17,10 +17,10 @@ from time_sampler import TimeSampler
 def setup_model(
     model_name: str, lora: int, fp8: bool, use_compile: bool, mem_budget: float = 0.7, ckpt_ratio: float = 0.5
 ):
-    if not hasattr(MODELS[model_name].pipeline_cls, "prepare_train_inputs"):
-        raise ValueError(f"Training is not supported for {model_name} yet")
     pipeline = load_pipeline(model_name).cuda()
     model = pipeline.model
+    if not hasattr(model, "lora_blocks"):
+        raise ValueError(f"Training is not supported for {model_name} yet")
     model.train().requires_grad_(False)
     layers = model.lora_blocks()
 
@@ -47,16 +47,20 @@ def setup_model(
     return pipeline
 
 
-def compute_loss(model: nn.Module, latents: Tensor, time_sampler: TimeSampler, model_kwargs: dict) -> Tensor:
-    bsize = latents.shape[0]
-    t_vec = time_sampler(bsize, device=latents.device)
-    noise = torch.randn_like(latents)
-    interpolate = latents.lerp(noise, t_vec.view([-1] + [1] * (latents.ndim - 1)))
+def compute_loss(
+    model: nn.Module, latents: list[Tensor], time_sampler: TimeSampler, txt: Tensor | list[Tensor]
+) -> Tensor:
+    t = time_sampler(len(latents), device=latents[0].device)
+    noise = [torch.randn_like(x) for x in latents]
+    noisy = [x.lerp(n, t_) for x, n, t_ in zip(latents, noise, t)]
 
-    v = model(interpolate, t_vec, **model_kwargs)
+    img, kwargs = model.prepare(noisy, txt)
+    v = model.unpatchify(model(img, t, **kwargs), [x.shape[:2] for x in latents])
 
     # rectified flow loss. predict velocity from latents (t=0) to noise (t=1).
-    return F.mse_loss(noise.float() - latents.float(), v.float())
+    # each sample has the same weight regardless of resolution
+    losses = [F.mse_loss(n.float() - x.float(), v_.float()) for x, n, v_ in zip(latents, noise, v)]
+    return torch.stack(losses).mean()
 
 
 def parse_img_size(img_size: str):
@@ -81,8 +85,7 @@ def random_resize(img_pil: Image.Image, min_size: int, max_size: int):
     img_pil = img_pil.resize((target_width, target_height), Image.Resampling.BICUBIC)
 
     # slightly crop the image so that each side is divisible by 16.
-    # to reduce fragmentation, make it in <factor> increment.
-    factor = 64
+    factor = 16
     height = target_height // factor * factor
     width = target_width // factor * factor
     img_pt = torch.from_numpy(np.array(img_pil)).permute(2, 0, 1)  # HWC->CHW

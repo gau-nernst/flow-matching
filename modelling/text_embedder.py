@@ -54,7 +54,7 @@ class TextEmbedder(nn.Module):
             return_tensors="pt",
             return_attention_mask=self.use_attn_mask,
         )
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        inputs = {k: v.pin_memory().to(self.model.device, non_blocking=True) for k, v in inputs.items()}
         out = self.model(**inputs, output_hidden_states=True)
 
         out = self.unwrap_output(out, self.output_key)

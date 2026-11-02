@@ -4,17 +4,20 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from ..varlen import expand_to_tokens
+
 
 @triton.jit
 def _gated_norm_kernel(
     x_ptr,  # [B, L, D]
     w_ptr,  # [D]
-    gate_ptr,  # [B, D] or [1, D], strided
+    gate_ptr,  # [B or 1, D], strided
+    idx_ptr,  # [L] sample of each token, for a varlen batch
     add_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
+    gate_stride,  # 0 to broadcast
     L: tl.constexpr,
     D: tl.constexpr,
-    gate_stride_b: tl.constexpr,  # 0 to broadcast gate across batch
     gate_type: tl.constexpr,
     eps: float = 1e-5,
 ):
@@ -27,7 +30,11 @@ def _gated_norm_kernel(
     x = tl.load(x_ptr + (pid_b * L * D + pid_l * D + offs), mask, other=0.0)
     w = tl.load(w_ptr + offs, mask)
     if gate_ptr is not None:
-        gate = tl.load(gate_ptr + (pid_b * gate_stride_b + offs), mask)
+        if idx_ptr is not None:
+            gate_row = tl.load(idx_ptr + pid_l)
+        else:
+            gate_row = pid_b
+        gate = tl.load(gate_ptr + (gate_row * gate_stride + offs), mask)
 
     x = x.to(tl.float32)
     var = tl.sum(x * x) * (1.0 / D)
@@ -56,11 +63,15 @@ def gated_norm(
     add: Tensor | None = None,
     gate_type: str = "plus_one",
     eps: float = 1e-6,
+    idx: Tensor | None = None,
 ) -> Tensor:
+    # x: [B, L, D]. gate: [B, 1, D] or [1, 1, D]
+    # varlen: x: [1, L, D]. gate: [B, 1, D]. idx: [L]
     if torch.is_grad_enabled():
         # if True:
         x = F.rms_norm(x, x.shape[-1:], w, eps=eps)
         if gate is not None:
+            gate = expand_to_tokens(gate, idx)
             if gate_type == "plus_one":
                 x = x * (1.0 + gate)
             elif gate_type == "tanh":
@@ -73,12 +84,17 @@ def gated_norm(
 
     assert x.is_contiguous() and w.is_contiguous()
     B, L, D = x.shape
-    gate_stride_b = 0
+    gate_stride = 0
     if gate is not None:
-        assert gate.shape in ((B, 1, D), (1, 1, D)) and gate.stride(-1) == 1, (gate.shape, gate.stride())
-        gate_stride_b = gate.stride(0) if gate.shape[0] > 1 else 0
+        gate = gate.flatten(0, -2)
+        assert gate.shape[-1] == D and gate.stride(-1) == 1, (gate.shape, gate.stride())
+        if idx is not None:
+            assert B == 1 and idx.shape == (L,), (x.shape, idx.shape)
+        else:
+            assert gate.shape[0] in (1, B), (x.shape, gate.shape)
+        gate_stride = 0 if gate.shape[0] == 1 else gate.stride(0)
     if add is not None:
         assert add.is_contiguous()
     out = torch.empty_like(x)
-    _gated_norm_kernel[(L, B)](x, w, gate, add, out, L, D, gate_stride_b, gate_type, eps)
+    _gated_norm_kernel[(L, B)](x, w, gate, idx, add, out, gate_stride, L, D, gate_type, eps)
     return out

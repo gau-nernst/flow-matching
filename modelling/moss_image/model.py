@@ -1,5 +1,6 @@
 # https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT/blob/f972bd4/transformer/pipeline_moss_image.py
 
+from functools import partial
 from typing import NamedTuple
 
 import torch
@@ -14,6 +15,7 @@ from ..linear import Linear
 from ..registry import MODELS
 from ..rope import apply_rope, compute_rope
 from ..utils import create_remap_hook, load_hf_state_dict
+from ..varlen import VarlenMetadata, pack_inputs
 
 HEAD_DIM = 128
 
@@ -68,12 +70,13 @@ class TextBlock(nn.Module):
         self.ffn_gate = Linear(dim, ffn_dim)
         self.ffn_down = Linear(ffn_dim, dim)
 
-    def forward(self, x: Tensor, rope: Tensor) -> Tensor:
+    def forward(self, x: Tensor, rope: Tensor, varlen: VarlenMetadata | None = None) -> Tensor:
         # attention
+        # x: [B, L, D], or [1, L, D] if varlen
         q, k, v = self.qkv(self.norm1(x)).unflatten(-1, (3, -1, HEAD_DIM)).unbind(2)
         q = apply_rope(q, rope, self.q_norm.weight, interleaved=False)
         k = apply_rope(k, rope, self.k_norm.weight, interleaved=False)
-        x = self.proj(dispatch_attn(q, k, v).flatten(-2), x)
+        x = self.proj(dispatch_attn(q, k, v, varlen=varlen).flatten(-2), x)
 
         # FFN
         y = self.norm2(x)
@@ -99,21 +102,25 @@ class Block(nn.Module):
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     # FFN residual is deferred to the next block's modulate(). modulation is shared, so gate_f is the same.
-    def forward(self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor, varlen: VarlenMetadata | None = None
+    ) -> tuple[Tensor, Tensor]:
+        # x: [B, L, D], or [1, L, D] if varlen
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.split(1, dim=1)  # [B, 1, D] each
+        idx = varlen.seq_ids if varlen is not None else None
 
         # attention
         res_gate = gate_f if ffn_out is not None else None
-        y, x = modulate(x, shift_a, scale_a, ffn_out, res_gate, 1e-6, self.norm1.weight, True)
+        y, x = modulate(x, shift_a, scale_a, ffn_out, res_gate, 1e-6, self.norm1.weight, True, idx)
         q = self.q(y).unflatten(-1, (-1, HEAD_DIM))
         k = self.k(y).unflatten(-1, (-1, HEAD_DIM))
         v = self.v(y).unflatten(-1, (-1, HEAD_DIM))
         q = apply_rope(q, rope, self.q_norm.weight, interleaved=False)
         k = apply_rope(k, rope, self.k_norm.weight, interleaved=False)
-        attn_out = self.o(dispatch_attn(q, k, v).flatten(-2))
+        attn_out = self.o(dispatch_attn(q, k, v, varlen=varlen).flatten(-2))
 
         # FFN
-        y, x = modulate(x, shift_f, scale_f, attn_out, gate_a, 1e-6, self.norm2.weight, True)
+        y, x = modulate(x, shift_f, scale_f, attn_out, gate_a, 1e-6, self.norm2.weight, True, idx)
         hidden, gate = self.ffn_up_gate(y).chunk(2, dim=-1)
         return x, self.ffn_down(situ(hidden, gate))
 
@@ -142,6 +149,10 @@ class MOSSImage(nn.Module):
         self.final_linear_video = Linear(dim, cfg.latent_channels, bias=False)
         self.video_head_modulation = Linear(dim, 2 * dim)
 
+    # blocks to add LoRA to
+    def lora_blocks(self) -> list[nn.Module]:
+        return list(self.layers)
+
     def make_rope(self, H: int, W: int, L_txt: int, device: torch.types.Device = None) -> Tensor:
         # 4D RoPE (r, f, h, w). image tokens (0, L_txt, h - (H-1)/2, w - (W-1)/2), then text tokens (0, l, 0, 0)
         h, w = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij")
@@ -154,32 +165,61 @@ class MOSSImage(nn.Module):
         ids = torch.cat([img_ids, txt_ids])
         return torch.cat([compute_rope(ids[:, i], HEAD_DIM // 4, 10_000.0) for i in range(4)], dim=-1)
 
-    def forward(self, img: Tensor, time: Tensor, txt: Tensor, skip_layers: tuple[int, ...] = ()) -> Tensor:
-        # img: [B, H, W, C], time: [B] in [0, 1] (1 is noise), txt: [B, L, text_dim] without padding
+    # latents: [B, H, W, C] (uniform) or a list of [H_i, W_i, C] (varlen). txt: unpadded
+    def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
+        if isinstance(latents, Tensor):
+            _, H, W, _ = latents.shape
+            return latents.flatten(1, 2), dict(txt=txt, rope=self.make_rope(H, W, txt.shape[1], latents.device))
+
+        make_rope = partial(self.make_rope, device=latents[0].device)
+        imgs = [x.flatten(0, 1) for x in latents]
+        return pack_inputs(imgs, txt, [x.shape[:2] for x in latents], make_rope, txt_first=False)
+
+    def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
+        # sizes: (H, W) of a uniform batch, or a list per sample
+        if isinstance(sizes, tuple):
+            return out.unflatten(1, sizes)
+        outs = out.flatten(0, -2).split([H * W for H, W in sizes])
+        return [x.unflatten(0, size) for x, size in zip(outs, sizes)]
+
+    def forward(
+        self,
+        img: Tensor,
+        t: Tensor,
+        txt: Tensor,
+        rope: Tensor,
+        txt_varlen: VarlenMetadata | None = None,
+        img_varlen: VarlenMetadata | None = None,
+        joint_varlen: VarlenMetadata | None = None,
+        skip_layers: tuple[int, ...] = (),
+    ) -> Tensor:
+        # inputs are from prepare(). returns [B, L_img, C], or [1, L_img, C] if varlen
         # skip_layers: blocks to skip, for the negative branch of CFG
-        _, H, W, _ = img.shape
-        L_img = H * W
+        if img_varlen is not None:
+            t = t.expand(img_varlen.cu_seqlens.shape[0] - 1)
         dtype = self.video_embedder.weight.dtype
 
-        vec = self.time_embedding(timestep_embedding(time, 256).to(dtype))
-        mod = self.shared_block_modulation(vec).unflatten(1, (6, -1))
-        shift, scale = self.video_head_modulation(vec).unflatten(1, (2, -1)).unbind(1)
+        vec = self.time_embedding(timestep_embedding(t, 256).to(dtype))
+        mod = self.shared_block_modulation(vec).unflatten(1, (6, -1))  # [B, 6, D]
+        shift, scale = self.video_head_modulation(vec).unflatten(1, (2, -1)).unbind(1)  # [B, D] each
 
-        rope = self.make_rope(H, W, txt.shape[1], img.device)
-        x_img = self.video_embedder(img.flatten(1, 2).to(dtype))
+        L_img = img.shape[1]
+        x_img = self.video_embedder(img.to(dtype))
         x_txt = self.text_embedder.proj(txt.to(dtype))
         for block in self.text_embedder.blocks:
-            x_txt = block(x_txt, rope[L_img:])
+            x_txt = block(x_txt, rope[L_img:], txt_varlen)
 
         x = torch.cat([x_img, x_txt], dim=1)
         ffn_out = None
         for i, block in enumerate(self.layers):
             if i not in skip_layers:
-                x, ffn_out = block(x, ffn_out, rope, mod)
+                x, ffn_out = block(x, ffn_out, rope, mod, joint_varlen)
 
         gate_f = mod[:, 5:6]
-        y, _ = modulate(x, shift[:, None], scale[:, None], ffn_out, gate_f, 1e-6, self.final_norm_video.weight, True)
-        return self.final_linear_video(y[:, :L_img]).unflatten(1, (H, W))
+        norm = self.final_norm_video.weight
+        idx = joint_varlen.seq_ids if joint_varlen is not None else None
+        y, _ = modulate(x, shift[:, None], scale[:, None], ffn_out, gate_f, 1e-6, norm, True, idx)
+        return self.final_linear_video(y[:, :L_img])
 
 
 def load_moss_image(name: str = "moss-image-sft"):

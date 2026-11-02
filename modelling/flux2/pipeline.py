@@ -14,6 +14,7 @@ from ..offload import PerLayerOffloadCUDAStream
 from ..qwen3 import Qwen3ForCausalLM
 from ..registry import MODELS
 from ..solvers import get_solver
+from ..utils import list_to_tensor_async
 from ..vae import load_vae
 from .model import Flux2, load_flux2
 
@@ -53,11 +54,12 @@ class Flux2Qwen3TextEncoder(nn.Module):
         device = next(self.parameters()).device
 
         # same as HF: mask pad tokens as keys only. the DiT attends to pad tokens.
-        pad_mask = inputs["attention_mask"].to(device).bool()  # [B, L]
+        pad_mask = inputs["attention_mask"].pin_memory().to(device, non_blocking=True).bool()  # [B, L]
         L = pad_mask.shape[1]
         attn_mask = torch.ones(L, L, dtype=torch.bool, device=device).tril() & pad_mask[:, None, None, :]
 
-        outputs = self.model(inputs["input_ids"].to(device), output_indices=self.output_indices, attn_mask=attn_mask)
+        input_ids = inputs["input_ids"].pin_memory().to(device, non_blocking=True)
+        outputs = self.model(input_ids, output_indices=self.output_indices, attn_mask=attn_mask)
         return torch.cat(outputs, dim=-1)
 
 
@@ -90,16 +92,6 @@ class Flux2Pipeline:
     def load(cls, name: str):
         spec = MODELS[name]
         return cls(load_flux2(name), spec.text_encoder_id, sample_defaults=spec.sample_defaults)
-
-    # returns (latents, model_kwargs) for training: model(noisy_latents, t, **model_kwargs)
-    def prepare_train_inputs(self, imgs: Tensor, prompts: list[str]) -> tuple[Tensor, dict]:
-        with torch.no_grad():
-            latents = self.ae.encode(imgs)
-        txt = self.text_encoder(prompts)
-        img_rope = self.model.make_img_rope(*latents.shape[1:3])
-        txt_rope = self.model.make_txt_rope(txt.shape[1])
-        rope = torch.cat([txt_rope, img_rope], dim=0)
-        return latents.flatten(1, 2), dict(txt=txt, rope=rope)
 
     # cfg_scale and num_steps default to self.sample_defaults
     @torch.no_grad()
@@ -150,7 +142,7 @@ class Flux2Pipeline:
             ref_latents = []
             for img in ref_imgs:
                 img = crop_to_multiple(img).convert("RGB")
-                img = torch.from_numpy(np.asarray(img)).to(device)
+                img = torch.from_numpy(np.asarray(img)).pin_memory().to(device, non_blocking=True)
                 ref_latents.append(self.ae.encode(img.unsqueeze(0)).squeeze(0))
         else:
             ref_latents = None
@@ -216,54 +208,30 @@ def flux2_generate(
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> Tensor:
     B, H, W, _ = latents.shape
-    img_len = H * W
 
     if isinstance(guidance, (int, float)):
         guidance = torch.full((B,), guidance, device=latents.device)
 
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    timesteps_tensor = torch.tensor(timesteps).to("cuda", non_blocking=True)
+    timesteps_tensor = list_to_tensor_async(timesteps, latents.device)
 
-    img_rope = flux.make_img_rope(H, W)
-    txt_rope = flux.make_txt_rope(txt.shape[1])
-
-    if ref_latents is not None:
-        ref_ropes = []
-        flat_latents = []
-
-        for i, ref_lat in enumerate(ref_latents):
-            h, w, _ = ref_lat.shape
-            ref_ropes.append(flux.make_img_rope(h, w, t=10 * (i + 1)))
-            flat_latents.append(ref_lat.flatten(0, 1))
-
-        rope = torch.cat([txt_rope, img_rope, *ref_ropes], dim=0)
-        ref_imgs = torch.cat(flat_latents, dim=0).unsqueeze(0).expand(B, -1, -1)
-
-    else:
-        rope = torch.cat([txt_rope, img_rope], dim=0)
-
-    latents = latents.flatten(1, 2)  # (B,H,W,C) -> (B,H*W,C)
+    latents, kwargs = flux.prepare(latents, txt, ref=ref_latents)
+    if cfg_scale != 1.0:
+        assert neg_txt is not None
+        neg_kwargs = dict(kwargs, txt=neg_txt)
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
-        # concat reference latents (images) if needed.
-        if ref_latents is not None:
-            imgs = torch.cat([latents, ref_imgs], dim=1)
-        else:
-            imgs = latents
-
-        # only keep the velocity for the latents being denoised.
         t = timesteps_tensor[None, i]
-        v = flux(imgs, t, txt, rope, guidance)[:, :img_len].float()
+        v = flux(latents, t, **kwargs, guidance=guidance).float()
 
         # classifier-free guidance
         if cfg_scale != 1.0:
-            assert neg_txt is not None
-            neg_v = flux(imgs, t, neg_txt, rope, guidance)[:, :img_len].float()
+            neg_v = flux(latents, t, **neg_kwargs, guidance=guidance).float()
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
         if progress_cb is not None:
             progress_cb(i + 1, num_steps)
 
-    return latents.unflatten(1, (H, W))
+    return flux.unpatchify(latents, (H, W))
