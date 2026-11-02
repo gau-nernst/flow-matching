@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from ..varlen import per_token
+from ..varlen import expand_to_tokens
 
 
 @triton.jit
@@ -71,7 +71,7 @@ def gated_norm(
         # if True:
         x = F.rms_norm(x, x.shape[-1:], w, eps=eps)
         if gate is not None:
-            gate = per_token(gate, idx)
+            gate = expand_to_tokens(gate, idx)
             if gate_type == "plus_one":
                 x = x * (1.0 + gate)
             elif gate_type == "tanh":

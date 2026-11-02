@@ -15,7 +15,7 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-from ..varlen import VarlenMetadata, pack_inputs, per_token
+from ..varlen import VarlenMetadata, pack_inputs, expand_to_tokens
 
 
 class MLP(nn.ModuleList):
@@ -305,15 +305,15 @@ class Flux2(nn.Module):
 
         img_idx = img_varlen.seq_ids if img_varlen is not None else None
         txt_idx = txt_varlen.seq_ids if txt_varlen is not None else None
-        img = torch.addcmul(img, per_token(mod_img[-1], img_idx), img_res)
-        txt = torch.addcmul(txt, per_token(mod_txt[-1], txt_idx), txt_res)
+        img = torch.addcmul(img, expand_to_tokens(mod_img[-1], img_idx), img_res)
+        txt = torch.addcmul(txt, expand_to_tokens(mod_txt[-1], txt_idx), txt_res)
         joint = torch.cat([txt, img], dim=1)
 
         mod = self.single_stream_modulation(vec)
         res = None
         for block in self.single_blocks:
             res, joint = block(joint, res, rope, mod, joint_varlen)
-        img = torch.addcmul(joint[:, Ltxt:], per_token(mod[-1], img_idx), res[:, Ltxt:])
+        img = torch.addcmul(joint[:, Ltxt:], expand_to_tokens(mod[-1], img_idx), res[:, Ltxt:])
 
         return self.final_layer(img[:, :Limg], vec, img_varlen)
 

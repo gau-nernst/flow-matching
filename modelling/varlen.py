@@ -43,7 +43,7 @@ class VarlenMetadata(NamedTuple):
 
 
 # [B, 1, D] -> [1, L, D] for a varlen batch. idx: VarlenMetadata.seq_ids, or None for a uniform batch
-def per_token(cond: Tensor, idx: Tensor | None) -> Tensor:
+def expand_to_tokens(cond: Tensor, idx: Tensor | None) -> Tensor:
     return cond if idx is None else cond[:, 0].index_select(0, idx).unsqueeze(0)
 
 

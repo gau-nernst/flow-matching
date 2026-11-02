@@ -14,7 +14,7 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_weight_merge_hook, load_hf_state_dict
-from ..varlen import VarlenMetadata, pack_inputs, per_token
+from ..varlen import VarlenMetadata, pack_inputs, expand_to_tokens
 from .gated_norm import gated_norm
 
 
@@ -26,7 +26,7 @@ class FinalLayer(nn.Module):
 
     def forward(self, x: Tensor, c: Tensor, varlen: VarlenMetadata | None = None) -> Tensor:
         idx = varlen.seq_ids if varlen is not None else None
-        scale = per_token(self.adaLN_modulation(c).unsqueeze(1), idx)
+        scale = expand_to_tokens(self.adaLN_modulation(c).unsqueeze(1), idx)
         x = (1.0 + scale) * F.layer_norm(x, x.shape[-1:], eps=1e-6)
         return self.linear(x)
 
