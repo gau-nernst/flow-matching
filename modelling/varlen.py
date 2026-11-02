@@ -9,7 +9,7 @@ from torch import Tensor
 # a batch is either uniform, with shape [B, L, ...], or varlen, with shape [L, ...]: samples concatenated along L.
 # this describes where each sample sits in a varlen batch
 class VarlenMetadata(NamedTuple):
-    cu_seqlens: Tensor  # [N+1] int32
+    cu_seqlens: Tensor  # [B+1] int32
     seq_ids: Tensor  # [L] int32, sample of each token
     max_seqlen: int  # upper bound on sample length
     perm: Tensor | None = None  # from concat(), for attention
@@ -42,7 +42,7 @@ class VarlenMetadata(NamedTuple):
         return VarlenMetadata(cu_seqlens, seq_ids, self.max_seqlen + other.max_seqlen, perm)
 
 
-# [N, 1, D] -> [L, D] for a varlen batch. idx: VarlenMetadata.seq_ids, or None for a uniform batch
+# [B, 1, D] -> [L, D] for a varlen batch. idx: VarlenMetadata.seq_ids, or None for a uniform batch
 def per_token(cond: Tensor, idx: Tensor | None) -> Tensor:
     return cond if idx is None else cond[:, 0].index_select(0, idx)
 

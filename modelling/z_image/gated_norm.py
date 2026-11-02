@@ -9,7 +9,7 @@ from torch import Tensor
 def _gated_norm_kernel(
     x_ptr,  # [B, L, D]
     w_ptr,  # [D]
-    gate_ptr,  # [B or 1 or N, D], strided
+    gate_ptr,  # [B or 1, D], strided
     gate_idx_ptr,  # [L] sample of each token, for a varlen batch
     add_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
@@ -64,7 +64,7 @@ def gated_norm(
     gate_idx: Tensor | None = None,
 ) -> Tensor:
     # x: [B, L, D]. gate: [B, 1, D] or [1, 1, D]
-    # varlen: x: [L, D]. gate: [N, 1, D]. gate_idx: [L]
+    # varlen: x: [L, D]. gate: [B, 1, D]. gate_idx: [L]
     if torch.is_grad_enabled():
         # if True:
         if gate is not None and gate_idx is not None:

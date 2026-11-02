@@ -275,18 +275,18 @@ class Flux1(nn.Module):
     ) -> Tensor:
         # inputs are from prepare(). img: [B, L_img, C*p*p], or [L_img, C*p*p] if varlen
         if img_varlen is not None:
-            N = img_varlen.cu_seqlens.shape[0] - 1
+            B = img_varlen.cu_seqlens.shape[0] - 1
             joint_varlen = txt_varlen.concat(img_varlen)
         else:
-            N = -1  # keep t's shape
+            B = -1  # keep t's shape
             joint_varlen = None
 
         img = self.img_in(img.to(self.img_in.weight.dtype))
         txt = self.txt_in(txt)
-        vec = self.time_in(timestep_embedding(t.expand(N), 256).to(img.dtype)) + self.vector_in(vec)
+        vec = self.time_in(timestep_embedding(t.expand(B), 256).to(img.dtype)) + self.vector_in(vec)
 
         if guidance is not None:  # allow no guidance_embed
-            vec = vec + self.guidance_in(timestep_embedding(guidance.expand(N), 256).to(img.dtype))
+            vec = vec + self.guidance_in(timestep_embedding(guidance.expand(B), 256).to(img.dtype))
 
         for block in self.double_blocks:
             img, txt = block(img, txt, vec, rope, joint_varlen)

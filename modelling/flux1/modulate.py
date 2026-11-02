@@ -8,10 +8,10 @@ from torch import Tensor
 @triton.jit
 def _modulate_kernel(
     x_ptr,  # [B, L, D] or [L, D] with idx, strided
-    shift_ptr,  # [B or N, D]
-    scale_ptr,  # [B or N, D]
+    shift_ptr,  # [B or 1, D]
+    scale_ptr,  # [B or 1, D]
     res_ptr,  # [B, L, D]
-    gate_ptr,  # [B or N, D]
+    gate_ptr,  # [B or 1, D]
     norm_ptr,  # [D]
     idx_ptr,  # [L] sample of each token, for a varlen batch
     gated_ptr,  # [B, L, D]
@@ -74,7 +74,7 @@ def modulate(
 ) -> Tensor:
     # norm is LayerNorm (default) or RMSNorm, with optional weight
     # x: [B, L, D]. shift, scale, gate: [B, 1, D] or [1, 1, D]
-    # varlen: x: [L, D]. shift, scale, gate: [N, 1, D]. idx: [L]
+    # varlen: x: [L, D]. shift, scale, gate: [B, 1, D]. idx: [L]
     if torch.is_grad_enabled():
         if idx is not None:
             shift, scale = [t[:, 0].index_select(0, idx) for t in (shift, scale)]

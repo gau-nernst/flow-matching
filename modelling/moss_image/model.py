@@ -106,7 +106,7 @@ class Block(nn.Module):
         self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor, varlen: VarlenMetadata | None = None
     ) -> tuple[Tensor, Tensor]:
         # x: [B, L, D], or [L, D] if varlen
-        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.split(1, dim=1)  # [N, 1, D] each
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.split(1, dim=1)  # [B, 1, D] each
         idx = varlen.seq_ids if varlen is not None else None
 
         # attention
@@ -195,16 +195,16 @@ class MOSSImage(nn.Module):
         # inputs are from prepare(). returns [B, L_img, C], or [L_img, C] if varlen
         # skip_layers: blocks to skip, for the negative branch of CFG
         if img_varlen is not None:
-            N = img_varlen.cu_seqlens.shape[0] - 1
+            B = img_varlen.cu_seqlens.shape[0] - 1
             joint_varlen = img_varlen.concat(txt_varlen)
         else:
-            N = -1  # keep t's shape
+            B = -1  # keep t's shape
             joint_varlen = None
         dtype = self.video_embedder.weight.dtype
 
-        vec = self.time_embedding(timestep_embedding(t.expand(N), 256).to(dtype))
-        mod = self.shared_block_modulation(vec).unflatten(1, (6, -1))  # [N, 6, D]
-        shift, scale = self.video_head_modulation(vec).unflatten(1, (2, -1)).unbind(1)  # [N, D] each
+        vec = self.time_embedding(timestep_embedding(t.expand(B), 256).to(dtype))
+        mod = self.shared_block_modulation(vec).unflatten(1, (6, -1))  # [B, 6, D]
+        shift, scale = self.video_head_modulation(vec).unflatten(1, (2, -1)).unbind(1)  # [B, D] each
 
         L_img = img.shape[-2]
         x_img = self.video_embedder(img.to(dtype))

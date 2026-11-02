@@ -223,16 +223,16 @@ class ZImage(nn.Module):
         # the original Z-Image uses t=0 as noise and predicts (data - noise), so flip both t and v.
         # inputs are from prepare(). img: [B, L_img, p*p*C], or [L_img, p*p*C] if varlen
         if img_varlen is not None:
-            N = img_varlen.cu_seqlens.shape[0] - 1
+            B = img_varlen.cu_seqlens.shape[0] - 1
             joint_varlen = img_varlen.concat(txt_varlen)
         else:
-            N = -1  # keep t's shape
+            B = -1  # keep t's shape
             joint_varlen = None
         L_img = img.shape[-2]
         img_rope, txt_rope = rope[:L_img], rope[L_img:]
 
-        t_embeds = timestep_embedding(1 - t.expand(N), 256)
-        t_embeds = self.t_embedder(t_embeds.to(self.t_embedder[0][0].weight.dtype))  # [N, mod_dim]
+        t_embeds = timestep_embedding(1 - t.expand(B), 256)
+        t_embeds = self.t_embedder(t_embeds.to(self.t_embedder[0][0].weight.dtype))  # [B, mod_dim]
 
         # text-only processing
         txt = self.cap_embedder(txt)
