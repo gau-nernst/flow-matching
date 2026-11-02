@@ -11,7 +11,7 @@ from torch import Tensor
 class Varlen(NamedTuple):
     cu_seqlens: Tensor  # [N+1] int32
     seq_ids: Tensor  # [L] int32, sample of each token
-    max_seqlen: int  # rounded up to reduce recompiles
+    max_seqlen: int  # upper bound on sample length
     perm: Tensor | None = None  # from cat_varlen(): token order with each sample contiguous, for attention
 
     @staticmethod
@@ -19,7 +19,7 @@ class Varlen(NamedTuple):
         lens_t = torch.tensor(lens, dtype=torch.int32)
         cu_seqlens = F.pad(lens_t.cumsum(0, dtype=torch.int32), (1, 0))
         seq_ids = torch.repeat_interleave(torch.arange(len(lens), dtype=torch.int32), lens_t)
-        return Varlen(cu_seqlens.to(device), seq_ids.to(device), -(-max(lens) // 256) * 256)
+        return Varlen(cu_seqlens.to(device), seq_ids.to(device), max(lens))
 
 
 # layout of torch.cat([a, b]) of two packed streams e.g. [all txt, all img]. computed on device
