@@ -45,11 +45,11 @@ class Attention(nn.Module):
         self.register_load_state_dict_pre_hook(create_weight_merge_hook(["to_q", "to_k", "to_v"], "qkv"))
 
     def forward(self, x: Tensor, pe: Tensor, varlen: VarlenMetadata | None = None):
-        q, k, v = self.qkv(x).unflatten(-1, (-1, self.head_dim)).chunk(3, dim=-2)
+        q, k, v = self.qkv(x).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
         qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else x.dtype
         q = apply_rope(q, pe, self.norm_q.weight, self.eps, out=torch.empty_like(q, dtype=qk_dtype))
         k = apply_rope(k, pe, self.norm_k.weight, self.eps, out=torch.empty_like(k, dtype=qk_dtype))
-        out = dispatch_attn(q, k, v, self.attn_impl, varlen).flatten(-2)
+        out = dispatch_attn(q, k, v, self.attn_impl, varlen).flatten(2)
         return self.to_out(out)
 
 
@@ -63,7 +63,8 @@ class FeedForward(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if all(w.is_nvfp4() for w in (self.w1, self.w3, self.w2)):
             # assume w1.input_scale == w3.input_scale
-            xq, xs = quantize_nvfp4_triton(x.view(-1, x.shape[-1]), self.w1.input_scale)
+            B, L, C = x.shape
+            xq, xs = quantize_nvfp4_triton(x.view(B * L, C), self.w1.input_scale)
             xq, xs = sm120_gated_gemm_nvfp4.mm(
                 xq,
                 xs,
@@ -77,7 +78,7 @@ class FeedForward(nn.Module):
                 self.w2.input_scale,
             )
             out = nvfp4_mm(xq, xs, self.w2.input_scale, self.w2.weight, self.w2.weight_scale, self.w2.weight_scale_2)
-            out = out.view(x.shape)
+            out = out.unflatten(0, (B, L))
 
         else:
             out = self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -100,7 +101,6 @@ class Block(nn.Module):
     def forward(
         self, x: Tensor, adaln_input: Tensor | None, pe: Tensor, varlen: VarlenMetadata | None = None
     ) -> Tensor:
-        # x: [B, L, D], or [L, D] if varlen
         idx = varlen.seq_ids if varlen is not None else None
 
         if self.adaLN_modulation is not None:
@@ -221,14 +221,14 @@ class ZImage(nn.Module):
     ) -> Tensor:
         # inputs/outputs follow the repo convention: t=1 is noise, predict velocity (noise - data).
         # the original Z-Image uses t=0 as noise and predicts (data - noise), so flip both t and v.
-        # inputs are from prepare(). img: [B, L_img, p*p*C], or [L_img, p*p*C] if varlen
+        # inputs are from prepare(). img: [B, L_img, p*p*C], or [1, L_img, p*p*C] if varlen
         if img_varlen is not None:
             B = img_varlen.cu_seqlens.shape[0] - 1
             joint_varlen = img_varlen.concat(txt_varlen)
         else:
             B = -1  # keep t's shape
             joint_varlen = None
-        L_img = img.shape[-2]
+        L_img = img.shape[1]
         img_rope, txt_rope = rope[:L_img], rope[L_img:]
 
         t_embeds = timestep_embedding(1 - t.expand(B), 256)
@@ -245,10 +245,10 @@ class ZImage(nn.Module):
             img = layer(img, t_embeds, img_rope, img_varlen)
 
         # joint processing
-        unified = torch.cat([img, txt], dim=-2)
+        unified = torch.cat([img, txt], dim=1)
         for layer in self.layers:
             unified = layer(unified, t_embeds, rope, joint_varlen)
-        img = unified[..., :L_img, :]
+        img = unified[:, :L_img]
 
         return -self.all_final_layer["2-1"](img, t_embeds, img_varlen)
 

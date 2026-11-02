@@ -138,7 +138,7 @@ def apply_rope(
     gemma_norm: bool = False,
     out: Tensor | None = None,
 ) -> Tensor:
-    # x: [B, L, nH, D] in real, or [L, nH, D] if varlen
+    # x: [B, L, nH, D] in real
     # rope: [L, D/2] in complex
     # rot_dim: half-split layout only. pairs (i, i + rot_dim/2) within each chunk of rot_dim.
     #   for partial rotary, rope must have angle 0 beyond rot_dim/2
@@ -151,22 +151,22 @@ def apply_rope(
     if norm is not None:
         assert norm.is_contiguous()
     rope_real = torch.view_as_real(rope)
-    if out is None:
+    if out is not None:
+        assert out[0, 0].is_contiguous()
+    else:
         out = x.new_empty(x.shape)
-    x_, out_ = (x, out) if x.ndim == 4 else (x[None], out[None])
-    assert out_[0, 0].is_contiguous()
-    B, L, H, D = x_.shape
+    B, L, H, D = x.shape
     ROT_D = rot_dim or D
     assert interleaved or (D & (D - 1) == 0 and D % ROT_D == 0)  # half split requires power-of-2 D
     BLOCK_H = 8  # 8x128 = 1024. so 4 warps issue 16B
     grid = (L, B)
     _norm_rope_kernel[grid](
-        x_,
+        x,
         rope_real,
         norm,
-        out_,
-        *x_.stride()[:3],
-        *out_.stride()[:2],
+        out,
+        *x.stride()[:3],
+        *out.stride()[:2],
         H,
         D,
         BLOCK_H,

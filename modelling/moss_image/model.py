@@ -72,8 +72,8 @@ class TextBlock(nn.Module):
 
     def forward(self, x: Tensor, rope: Tensor, varlen: VarlenMetadata | None = None) -> Tensor:
         # attention
-        # x: [B, L, D], or [L, D] if varlen
-        q, k, v = self.qkv(self.norm1(x)).unflatten(-1, (3, -1, HEAD_DIM)).unbind(-3)
+        # x: [B, L, D], or [1, L, D] if varlen
+        q, k, v = self.qkv(self.norm1(x)).unflatten(-1, (3, -1, HEAD_DIM)).unbind(2)
         q = apply_rope(q, rope, self.q_norm.weight, interleaved=False)
         k = apply_rope(k, rope, self.k_norm.weight, interleaved=False)
         x = self.proj(dispatch_attn(q, k, v, varlen=varlen).flatten(-2), x)
@@ -105,7 +105,7 @@ class Block(nn.Module):
     def forward(
         self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor, varlen: VarlenMetadata | None = None
     ) -> tuple[Tensor, Tensor]:
-        # x: [B, L, D], or [L, D] if varlen
+        # x: [B, L, D], or [1, L, D] if varlen
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.split(1, dim=1)  # [B, 1, D] each
         idx = varlen.seq_ids if varlen is not None else None
 
@@ -192,7 +192,7 @@ class MOSSImage(nn.Module):
         img_varlen: VarlenMetadata | None = None,
         skip_layers: tuple[int, ...] = (),
     ) -> Tensor:
-        # inputs are from prepare(). returns [B, L_img, C], or [L_img, C] if varlen
+        # inputs are from prepare(). returns [B, L_img, C], or [1, L_img, C] if varlen
         # skip_layers: blocks to skip, for the negative branch of CFG
         if img_varlen is not None:
             B = img_varlen.cu_seqlens.shape[0] - 1
@@ -206,13 +206,13 @@ class MOSSImage(nn.Module):
         mod = self.shared_block_modulation(vec).unflatten(1, (6, -1))  # [B, 6, D]
         shift, scale = self.video_head_modulation(vec).unflatten(1, (2, -1)).unbind(1)  # [B, D] each
 
-        L_img = img.shape[-2]
+        L_img = img.shape[1]
         x_img = self.video_embedder(img.to(dtype))
         x_txt = self.text_embedder.proj(txt.to(dtype))
         for block in self.text_embedder.blocks:
             x_txt = block(x_txt, rope[L_img:], txt_varlen)
 
-        x = torch.cat([x_img, x_txt], dim=-2)
+        x = torch.cat([x_img, x_txt], dim=1)
         ffn_out = None
         for i, block in enumerate(self.layers):
             if i not in skip_layers:
@@ -222,7 +222,7 @@ class MOSSImage(nn.Module):
         norm = self.final_norm_video.weight
         idx = joint_varlen.seq_ids if joint_varlen is not None else None
         y, _ = modulate(x, shift[:, None], scale[:, None], ffn_out, gate_f, 1e-6, norm, True, idx)
-        return self.final_linear_video(y[..., :L_img, :])
+        return self.final_linear_video(y[:, :L_img])
 
 
 def load_moss_image(name: str = "moss-image-sft"):

@@ -6,8 +6,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-# a batch is either uniform, with shape [B, L, ...], or varlen, with shape [L, ...]: samples concatenated along L.
-# this describes where each sample sits in a varlen batch
+# a batch is either uniform, with shape [B, L, ...], or varlen, with shape [1, L, ...]: B samples concatenated
+# along L. this describes where each sample sits in a varlen batch
 class VarlenMetadata(NamedTuple):
     cu_seqlens: Tensor  # [B+1] int32
     seq_ids: Tensor  # [L] int32, sample of each token
@@ -42,9 +42,9 @@ class VarlenMetadata(NamedTuple):
         return VarlenMetadata(cu_seqlens, seq_ids, self.max_seqlen + other.max_seqlen, perm)
 
 
-# [B, 1, D] -> [L, D] for a varlen batch. idx: VarlenMetadata.seq_ids, or None for a uniform batch
+# [B, 1, D] -> [1, L, D] for a varlen batch. idx: VarlenMetadata.seq_ids, or None for a uniform batch
 def per_token(cond: Tensor, idx: Tensor | None) -> Tensor:
-    return cond if idx is None else cond[:, 0].index_select(0, idx)
+    return cond if idx is None else cond[:, 0].index_select(0, idx).unsqueeze(0)
 
 
 # returns (img, kwargs) for model(img, t, **kwargs). a single sample stays a uniform batch, otherwise a varlen batch.
@@ -69,8 +69,8 @@ def pack_inputs(
         seconds.append(second)
 
     device = imgs[0].device
-    return torch.cat(imgs), dict(
-        txt=torch.cat(txts),
+    return torch.cat(imgs)[None], dict(
+        txt=torch.cat(txts)[None],
         rope=torch.cat(firsts + seconds),
         txt_varlen=VarlenMetadata.from_lens([x.shape[0] for x in txts], device),
         img_varlen=VarlenMetadata.from_lens([x.shape[0] for x in imgs], device),
