@@ -1,11 +1,14 @@
+import pandas as pd
 import pytest
 import torch
+from PIL import Image
 from torch import nn
 
 from modelling.flux2.model import Flux2, Flux2Config
 from modelling.moss_image.model import MOSSImage, MOSSImageConfig
 from modelling.varlen import VarlenMetadata
 from modelling.z_image.model import ZImage, ZImageConfig
+from train_lora import ImageDataset
 
 MODELS = {
     "flux2": (Flux2, Flux2Config(txt_dim=64, dim=256, num_double_blocks=1, num_single_blocks=1), 128),
@@ -69,3 +72,18 @@ def test_mismatched_inputs_raise(setup):
     model, C = setup
     with pytest.raises(AssertionError):
         model.prepare([randn(16, 24, C)], [randn(20, 64)] * 2)
+
+
+@pytest.mark.parametrize("budget", [1, 2500, 4096])  # 1: every image is over budget and batched alone
+def test_batch_tokens(tmp_path, budget):
+    sizes = [(512, 768), (1024, 1024), (640, 640), (768, 512), (512, 512)]
+    for i, (W, H) in enumerate(sizes):
+        Image.new("RGB", (W, H)).save(tmp_path / f"{i}.png")
+    meta = pd.DataFrame(dict(filename=[f"{i}.png" for i in range(5)], prompt=list("abcde")))
+    meta.to_csv(tmp_path / "meta.csv", index=False)
+
+    ds_iter = iter(ImageDataset(tmp_path / "meta.csv", tmp_path, 512, 1024, budget))
+    for _ in range(20):
+        imgs, prompts = next(ds_iter)
+        assert len(imgs) == len(prompts)
+        assert len(imgs) == 1 or sum(x.shape[0] * x.shape[1] // 256 for x in imgs) <= budget
