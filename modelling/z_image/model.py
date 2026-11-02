@@ -14,7 +14,7 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_weight_merge_hook, load_hf_state_dict
-from ..varlen import Varlen, cat_varlen, per_token, prepare_inputs, seq_ids, unpatchify_outputs
+from ..varlen import VarlenMetadata, joint_metadata, pack_inputs, per_token
 from .gated_norm import gated_norm
 
 
@@ -24,8 +24,9 @@ class FinalLayer(nn.Module):
         self.linear = Linear(hidden_size, out_channels)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), Linear(256, hidden_size))
 
-    def forward(self, x: Tensor, c: Tensor, varlen: Varlen | None = None) -> Tensor:
-        scale = per_token(self.adaLN_modulation(c).unsqueeze(1), seq_ids(varlen))
+    def forward(self, x: Tensor, c: Tensor, varlen: VarlenMetadata | None = None) -> Tensor:
+        idx = varlen.seq_ids if varlen is not None else None
+        scale = per_token(self.adaLN_modulation(c).unsqueeze(1), idx)
         x = (1.0 + scale) * F.layer_norm(x, x.shape[-1:], eps=1e-6)
         return self.linear(x)
 
@@ -43,7 +44,7 @@ class Attention(nn.Module):
 
         self.register_load_state_dict_pre_hook(create_weight_merge_hook(["to_q", "to_k", "to_v"], "qkv"))
 
-    def forward(self, x: Tensor, pe: Tensor, varlen: Varlen | None = None):
+    def forward(self, x: Tensor, pe: Tensor, varlen: VarlenMetadata | None = None):
         q, k, v = self.qkv(x).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
         qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else x.dtype
         q = apply_rope(q, pe, self.norm_q.weight, self.eps, out=torch.empty_like(q, dtype=qk_dtype))
@@ -97,8 +98,10 @@ class Block(nn.Module):
         self.ffn_norm2 = nn.RMSNorm(dim, eps=eps)
         self.eps = eps
 
-    def forward(self, x: Tensor, adaln_input: Tensor | None, pe: Tensor, varlen: Varlen | None = None) -> Tensor:
-        idx = seq_ids(varlen)
+    def forward(
+        self, x: Tensor, adaln_input: Tensor | None, pe: Tensor, varlen: VarlenMetadata | None = None
+    ) -> Tensor:
+        idx = varlen.seq_ids if varlen is not None else None
 
         if self.adaLN_modulation is not None:
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).unsqueeze(1).chunk(4, dim=2)
@@ -179,10 +182,33 @@ class ZImage(nn.Module):
 
     # latents: [B, H, W, C] (dense) or a list of [H_i, W_i, C] (packed)
     def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
-        return prepare_inputs(latents, txt, self.make_rope, self.cfg.patch_size, txt_first=False)
+        p = self.cfg.patch_size
+        if isinstance(latents, Tensor):
+            _, H, W, _ = latents.shape
+            return self._patchify(latents), dict(txt=txt, rope=self.make_rope(H // p, W // p, txt.shape[1]))
+
+        imgs = [self._patchify(x[None])[0] for x in latents]
+        grids = [(x.shape[0] // p, x.shape[1] // p) for x in latents]
+        return pack_inputs(imgs, txt, grids, self.make_rope, txt_first=False)
+
+    def _patchify(self, x: Tensor) -> Tensor:
+        B, H, W, C = x.shape
+        p = self.cfg.patch_size
+        x = x.view(B, H // p, p, W // p, p, C).transpose(2, 3)  # (B, nH, nW, p, p, C)
+        return x.reshape(B, (H // p) * (W // p), p * p * C)
+
+    def _unpatchify(self, x: Tensor, H: int, W: int) -> Tensor:
+        p = self.cfg.patch_size
+        x = x.view(x.shape[0], H // p, W // p, p, p, -1).transpose(2, 3)  # (B, nH, p, nW, p, C)
+        return x.reshape(x.shape[0], H, W, -1)
 
     def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
-        return unpatchify_outputs(out, sizes, self.cfg.patch_size)
+        # sizes: latent (H, W) of a dense batch, or a list per sample
+        if isinstance(sizes, tuple):
+            return self._unpatchify(out, *sizes)
+        p = self.cfg.patch_size
+        outs = out.flatten(0, -2).split([(H // p) * (W // p) for H, W in sizes])
+        return [self._unpatchify(x[None], H, W)[0] for x, (H, W) in zip(outs, sizes)]
 
     def forward(
         self,
@@ -190,8 +216,8 @@ class ZImage(nn.Module):
         t: Tensor,
         txt: Tensor,
         rope: Tensor,
-        txt_varlen: Varlen | None = None,
-        img_varlen: Varlen | None = None,
+        txt_varlen: VarlenMetadata | None = None,
+        img_varlen: VarlenMetadata | None = None,
     ) -> Tensor:
         # inputs/outputs follow the repo convention: t=1 is noise, predict velocity (noise - data).
         # the original Z-Image uses t=0 as noise and predicts (data - noise), so flip both t and v.
@@ -200,7 +226,7 @@ class ZImage(nn.Module):
         if packed:
             img, txt = img[None], txt[None]
             N = img_varlen.cu_seqlens.shape[0] - 1
-            joint_varlen = cat_varlen(img_varlen, txt_varlen)
+            joint_varlen = joint_metadata(img_varlen, txt_varlen)
         else:
             N = -1  # keep t's shape
             joint_varlen = None

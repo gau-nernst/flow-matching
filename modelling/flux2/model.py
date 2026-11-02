@@ -15,7 +15,7 @@ from ..linear import Linear, nvfp4_mm
 from ..registry import MODELS
 from ..rope import RopeND, apply_rope
 from ..utils import create_remap_hook, load_hf_state_dict
-from ..varlen import Varlen, cat_varlen, patchify, per_token, prepare_inputs, seq_ids, unpatchify_outputs
+from ..varlen import VarlenMetadata, joint_metadata, pack_inputs, per_token
 
 
 class MLP(nn.ModuleList):
@@ -91,12 +91,12 @@ class DoubleStreamBlock(nn.Module):
         pe: Tensor,
         mod_img: tuple[Tensor, ...],
         mod_txt: tuple[Tensor, ...],
-        varlen: Varlen | None = None,
+        varlen: VarlenMetadata | None = None,
     ) -> tuple[Tensor, Tensor]:
         # varlen: of the joint sequence [txt, img]
         B, Limg, _ = img.shape
         _, Ltxt, _ = txt.shape
-        idx = seq_ids(varlen)
+        idx = varlen.seq_ids if varlen is not None else None
         txt_idx, img_idx = (idx[:Ltxt], idx[Ltxt:]) if idx is not None else (None, None)
 
         img_shift1, img_scale1, img_gate1, img_shift2, img_scale2, img_gate2 = mod_img
@@ -151,11 +151,12 @@ class SingleStreamBlock(nn.Module):
         self.register_load_state_dict_pre_hook(create_remap_hook(remap_pairs))
 
     def forward(
-        self, x: Tensor, res: Tensor | None, pe: Tensor, mod: tuple[Tensor, ...], varlen: Varlen | None = None
+        self, x: Tensor, res: Tensor | None, pe: Tensor, mod: tuple[Tensor, ...], varlen: VarlenMetadata | None = None
     ) -> Tensor:
         # TODO: fuse quantize with modulate
         shift, scale, gate = mod
-        x_mod, x = modulate(x, shift, scale, res, gate, idx=seq_ids(varlen))
+        idx = varlen.seq_ids if varlen is not None else None
+        x_mod, x = modulate(x, shift, scale, res, gate, idx=idx)
 
         if self.linear1.is_nvfp4():
             xs_2 = self.linear1.input_scale
@@ -249,16 +250,25 @@ class Flux2(nn.Module):
     def prepare(
         self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor], ref: list[Tensor] | None = None
     ) -> tuple[Tensor, dict]:
-        img, kwargs = prepare_inputs(latents, txt, self.make_rope, 1, txt_first=True)
+        if not isinstance(latents, Tensor):
+            assert not ref, "ref is only supported for a dense batch"
+            imgs = [x.flatten(0, 1) for x in latents]
+            return pack_inputs(imgs, txt, [x.shape[:2] for x in latents], self.make_rope, txt_first=True)
+
+        _, H, W, _ = latents.shape
+        img, kwargs = latents.flatten(1, 2), dict(txt=txt, rope=self.make_rope(H, W, txt.shape[1]))
         if ref:
-            assert isinstance(latents, Tensor), "ref is only supported for a dense batch"
             ref_rope = [self.make_img_rope(*x.shape[:2], t=10 * (i + 1)) for i, x in enumerate(ref)]
             kwargs["rope"] = torch.cat([kwargs["rope"], *ref_rope])
-            kwargs["ref"] = torch.cat([patchify(x, 1) for x in ref]).expand(img.shape[0], -1, -1)
+            kwargs["ref"] = torch.cat([x.flatten(0, 1) for x in ref]).expand(img.shape[0], -1, -1)
         return img, kwargs
 
     def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
-        return unpatchify_outputs(out, sizes, 1)
+        # sizes: (H, W) of a dense batch, or a list per sample
+        if isinstance(sizes, tuple):
+            return out.unflatten(1, sizes)
+        outs = out.flatten(0, -2).split([H * W for H, W in sizes])
+        return [x.unflatten(0, size) for x, size in zip(outs, sizes)]
 
     def forward(
         self,
@@ -268,15 +278,15 @@ class Flux2(nn.Module):
         rope: Tensor,
         guidance: Tensor | None = None,
         ref: Tensor | None = None,
-        txt_varlen: Varlen | None = None,
-        img_varlen: Varlen | None = None,
+        txt_varlen: VarlenMetadata | None = None,
+        img_varlen: VarlenMetadata | None = None,
     ) -> Tensor:
         # inputs are from prepare(). returns [B, L_img, C], or [L_img, C] if packed
         packed = img_varlen is not None
         if packed:
             img, txt = img[None], txt[None]
             N = img_varlen.cu_seqlens.shape[0] - 1
-            joint_varlen = cat_varlen(txt_varlen, img_varlen)
+            joint_varlen = joint_metadata(txt_varlen, img_varlen)
         else:
             N = -1  # keep t's shape
             joint_varlen = None
@@ -298,7 +308,8 @@ class Flux2(nn.Module):
         for block in self.double_blocks:
             img_res, img, txt_res, txt = block(img, img_res, txt, txt_res, rope, mod_img, mod_txt, joint_varlen)
 
-        img_idx, txt_idx = seq_ids(img_varlen), seq_ids(txt_varlen)
+        img_idx = img_varlen.seq_ids if packed else None
+        txt_idx = txt_varlen.seq_ids if packed else None
         img = torch.addcmul(img, per_token(mod_img[-1], img_idx), img_res)
         txt = torch.addcmul(txt, per_token(mod_txt[-1], txt_idx), txt_res)
         x = torch.cat((txt, img), dim=1)
