@@ -72,7 +72,8 @@ class TextBlock(nn.Module):
 
     def forward(self, x: Tensor, rope: Tensor, varlen: VarlenMetadata | None = None) -> Tensor:
         # attention
-        q, k, v = self.qkv(self.norm1(x)).unflatten(-1, (3, -1, HEAD_DIM)).unbind(2)
+        # x: [B, L, D], or [L, D] if varlen
+        q, k, v = self.qkv(self.norm1(x)).unflatten(-1, (3, -1, HEAD_DIM)).unbind(-3)
         q = apply_rope(q, rope, self.q_norm.weight, interleaved=False)
         k = apply_rope(k, rope, self.k_norm.weight, interleaved=False)
         x = self.proj(dispatch_attn(q, k, v, varlen=varlen).flatten(-2), x)
@@ -104,6 +105,7 @@ class Block(nn.Module):
     def forward(
         self, x: Tensor, ffn_out: Tensor | None, rope: Tensor, mod: Tensor, varlen: VarlenMetadata | None = None
     ) -> tuple[Tensor, Tensor]:
+        # x: [B, L, D], or [L, D] if varlen
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.split(1, dim=1)  # [N, 1, D] each
         idx = varlen.seq_ids if varlen is not None else None
 
@@ -163,7 +165,7 @@ class MOSSImage(nn.Module):
         ids = torch.cat([img_ids, txt_ids])
         return torch.cat([compute_rope(ids[:, i], HEAD_DIM // 4, 10_000.0) for i in range(4)], dim=-1)
 
-    # latents: [B, H, W, C] (dense) or a list of [H_i, W_i, C] (packed). txt: unpadded
+    # latents: [B, H, W, C] (uniform) or a list of [H_i, W_i, C] (varlen). txt: unpadded
     def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
         if isinstance(latents, Tensor):
             _, H, W, _ = latents.shape
@@ -174,7 +176,7 @@ class MOSSImage(nn.Module):
         return pack_inputs(imgs, txt, [x.shape[:2] for x in latents], make_rope, txt_first=False)
 
     def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
-        # sizes: (H, W) of a dense batch, or a list per sample
+        # sizes: (H, W) of a uniform batch, or a list per sample
         if isinstance(sizes, tuple):
             return out.unflatten(1, sizes)
         outs = out.flatten(0, -2).split([H * W for H, W in sizes])
@@ -190,11 +192,9 @@ class MOSSImage(nn.Module):
         img_varlen: VarlenMetadata | None = None,
         skip_layers: tuple[int, ...] = (),
     ) -> Tensor:
-        # inputs are from prepare(). returns [B, L_img, C], or [L_img, C] if packed
+        # inputs are from prepare(). returns [B, L_img, C], or [L_img, C] if varlen
         # skip_layers: blocks to skip, for the negative branch of CFG
-        packed = img_varlen is not None
-        if packed:
-            img, txt = img[None], txt[None]
+        if img_varlen is not None:
             N = img_varlen.cu_seqlens.shape[0] - 1
             joint_varlen = img_varlen.concat(txt_varlen)
         else:
@@ -206,13 +206,13 @@ class MOSSImage(nn.Module):
         mod = self.shared_block_modulation(vec).unflatten(1, (6, -1))  # [N, 6, D]
         shift, scale = self.video_head_modulation(vec).unflatten(1, (2, -1)).unbind(1)  # [N, D] each
 
-        L_img = img.shape[1]
+        L_img = img.shape[-2]
         x_img = self.video_embedder(img.to(dtype))
         x_txt = self.text_embedder.proj(txt.to(dtype))
         for block in self.text_embedder.blocks:
             x_txt = block(x_txt, rope[L_img:], txt_varlen)
 
-        x = torch.cat([x_img, x_txt], dim=1)
+        x = torch.cat([x_img, x_txt], dim=-2)
         ffn_out = None
         for i, block in enumerate(self.layers):
             if i not in skip_layers:
@@ -220,10 +220,9 @@ class MOSSImage(nn.Module):
 
         gate_f = mod[:, 5:6]
         norm = self.final_norm_video.weight
-        idx = joint_varlen.seq_ids if packed else None
+        idx = joint_varlen.seq_ids if joint_varlen is not None else None
         y, _ = modulate(x, shift[:, None], scale[:, None], ffn_out, gate_f, 1e-6, norm, True, idx)
-        out = self.final_linear_video(y[:, :L_img])
-        return out[0] if packed else out
+        return self.final_linear_video(y[..., :L_img, :])
 
 
 def load_moss_image(name: str = "moss-image-sft"):

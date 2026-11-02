@@ -6,7 +6,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-# where each sample sits in a packed tensor [1, L, ...], whose samples are concatenated along L
+# a batch is either uniform, with shape [B, L, ...], or varlen, with shape [L, ...]: samples concatenated along L.
+# this describes where each sample sits in a varlen batch
 class VarlenMetadata(NamedTuple):
     cu_seqlens: Tensor  # [N+1] int32
     seq_ids: Tensor  # [L] int32, sample of each token
@@ -22,7 +23,7 @@ class VarlenMetadata(NamedTuple):
         seq_ids = torch.repeat_interleave(ids, lens_t, output_size=sum(lens))
         return VarlenMetadata(cu_seqlens, seq_ids, max(lens))
 
-    # metadata of torch.cat([self_tensor, other_tensor], dim=1). the tensor keeps the two streams apart,
+    # metadata of torch.cat([self_tensor, other_tensor], dim=-2). the tensor keeps the two streams apart,
     # so perm is needed for attention, which wants each sample contiguous:
     #   self lens [2, 3], other lens [1, 2]
     #   tensor order:     a0 a0 a1 a1 a1 b0 b1 b1
@@ -41,12 +42,12 @@ class VarlenMetadata(NamedTuple):
         return VarlenMetadata(cu_seqlens, seq_ids, self.max_seqlen + other.max_seqlen, perm)
 
 
-# [N, 1, D] -> [1, L, D] for packed input. idx: VarlenMetadata.seq_ids, or None for a dense batch
+# [N, 1, D] -> [L, D] for a varlen batch. idx: VarlenMetadata.seq_ids, or None for a uniform batch
 def per_token(cond: Tensor, idx: Tensor | None) -> Tensor:
-    return cond if idx is None else cond[:, 0].index_select(0, idx).unsqueeze(0)
+    return cond if idx is None else cond[:, 0].index_select(0, idx)
 
 
-# returns (img, kwargs) for model(img, t, **kwargs). a single sample stays a dense batch, otherwise samples are packed.
+# returns (img, kwargs) for model(img, t, **kwargs). a single sample stays a uniform batch, otherwise a varlen batch.
 # imgs: patchified [L_i, D]. grids: patchified (H, W) of each sample. make_rope(H, W, L_txt): one sample's joint rope
 def pack_inputs(
     imgs: list[Tensor],

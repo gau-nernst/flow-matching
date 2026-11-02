@@ -45,11 +45,11 @@ class Attention(nn.Module):
         self.register_load_state_dict_pre_hook(create_weight_merge_hook(["to_q", "to_k", "to_v"], "qkv"))
 
     def forward(self, x: Tensor, pe: Tensor, varlen: VarlenMetadata | None = None):
-        q, k, v = self.qkv(x).unflatten(2, (-1, self.head_dim)).chunk(3, dim=2)
+        q, k, v = self.qkv(x).unflatten(-1, (-1, self.head_dim)).chunk(3, dim=-2)
         qk_dtype = torch.float8_e4m3fn if self.attn_impl == "qk-fp8" else x.dtype
         q = apply_rope(q, pe, self.norm_q.weight, self.eps, out=torch.empty_like(q, dtype=qk_dtype))
         k = apply_rope(k, pe, self.norm_k.weight, self.eps, out=torch.empty_like(k, dtype=qk_dtype))
-        out = dispatch_attn(q, k, v, self.attn_impl, varlen).flatten(2)
+        out = dispatch_attn(q, k, v, self.attn_impl, varlen).flatten(-2)
         return self.to_out(out)
 
 
@@ -63,8 +63,7 @@ class FeedForward(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if all(w.is_nvfp4() for w in (self.w1, self.w3, self.w2)):
             # assume w1.input_scale == w3.input_scale
-            B, L, C = x.shape
-            xq, xs = quantize_nvfp4_triton(x.view(B * L, C), self.w1.input_scale)
+            xq, xs = quantize_nvfp4_triton(x.view(-1, x.shape[-1]), self.w1.input_scale)
             xq, xs = sm120_gated_gemm_nvfp4.mm(
                 xq,
                 xs,
@@ -78,7 +77,7 @@ class FeedForward(nn.Module):
                 self.w2.input_scale,
             )
             out = nvfp4_mm(xq, xs, self.w2.input_scale, self.w2.weight, self.w2.weight_scale, self.w2.weight_scale_2)
-            out = out.unflatten(0, (B, L))
+            out = out.view(x.shape)
 
         else:
             out = self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -101,6 +100,7 @@ class Block(nn.Module):
     def forward(
         self, x: Tensor, adaln_input: Tensor | None, pe: Tensor, varlen: VarlenMetadata | None = None
     ) -> Tensor:
+        # x: [B, L, D], or [L, D] if varlen
         idx = varlen.seq_ids if varlen is not None else None
 
         if self.adaLN_modulation is not None:
@@ -180,7 +180,7 @@ class ZImage(nn.Module):
         txt_rope = self.pos_embed.create((1, 0, 0), (L_txt, 1, 1))
         return torch.cat([img_rope, txt_rope])
 
-    # latents: [B, H, W, C] (dense) or a list of [H_i, W_i, C] (packed)
+    # latents: [B, H, W, C] (uniform) or a list of [H_i, W_i, C] (varlen)
     def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
         p = self.cfg.patch_size
         if isinstance(latents, Tensor):
@@ -203,7 +203,7 @@ class ZImage(nn.Module):
         return x.reshape(x.shape[0], H, W, -1)
 
     def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
-        # sizes: latent (H, W) of a dense batch, or a list per sample
+        # sizes: latent (H, W) of a uniform batch, or a list per sample
         if isinstance(sizes, tuple):
             return self._unpatchify(out, *sizes)
         p = self.cfg.patch_size
@@ -221,16 +221,14 @@ class ZImage(nn.Module):
     ) -> Tensor:
         # inputs/outputs follow the repo convention: t=1 is noise, predict velocity (noise - data).
         # the original Z-Image uses t=0 as noise and predicts (data - noise), so flip both t and v.
-        # inputs are from prepare(). img: [B, L_img, p*p*C], or [L_img, p*p*C] if packed
-        packed = img_varlen is not None
-        if packed:
-            img, txt = img[None], txt[None]
+        # inputs are from prepare(). img: [B, L_img, p*p*C], or [L_img, p*p*C] if varlen
+        if img_varlen is not None:
             N = img_varlen.cu_seqlens.shape[0] - 1
             joint_varlen = img_varlen.concat(txt_varlen)
         else:
             N = -1  # keep t's shape
             joint_varlen = None
-        L_img = img.shape[1]
+        L_img = img.shape[-2]
         img_rope, txt_rope = rope[:L_img], rope[L_img:]
 
         t_embeds = timestep_embedding(1 - t.expand(N), 256)
@@ -247,13 +245,12 @@ class ZImage(nn.Module):
             img = layer(img, t_embeds, img_rope, img_varlen)
 
         # joint processing
-        unified = torch.cat([img, txt], dim=1)
+        unified = torch.cat([img, txt], dim=-2)
         for layer in self.layers:
             unified = layer(unified, t_embeds, rope, joint_varlen)
-        img = unified[:, :L_img]
+        img = unified[..., :L_img, :]
 
-        img = self.all_final_layer["2-1"](img, t_embeds, img_varlen)
-        return -img[0] if packed else -img
+        return -self.all_final_layer["2-1"](img, t_embeds, img_varlen)
 
 
 def load_zimage(name: str = "z-image-turbo"):

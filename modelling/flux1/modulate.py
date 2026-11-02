@@ -7,13 +7,13 @@ from torch import Tensor
 
 @triton.jit
 def _modulate_kernel(
-    x_ptr,  # [B, L, D], strided
+    x_ptr,  # [B, L, D] or [L, D] with idx, strided
     shift_ptr,  # [B or N, D]
     scale_ptr,  # [B or N, D]
     res_ptr,  # [B, L, D]
     gate_ptr,  # [B or N, D]
     norm_ptr,  # [D]
-    idx_ptr,  # [L] sample of each token, for packed input
+    idx_ptr,  # [L] sample of each token, for a varlen batch
     gated_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
     x_stride_b,
@@ -73,12 +73,13 @@ def modulate(
     idx: Tensor | None = None,
 ) -> Tensor:
     # norm is LayerNorm (default) or RMSNorm, with optional weight
-    # x: [B, L, D]. shift, scale, gate: [B, 1, D] or [1, 1, D]. packed: [N, 1, D] with idx [L]
+    # x: [B, L, D]. shift, scale, gate: [B, 1, D] or [1, 1, D]
+    # varlen: x: [L, D]. shift, scale, gate: [N, 1, D]. idx: [L]
     if torch.is_grad_enabled():
         if idx is not None:
-            shift, scale = [t[:, 0].index_select(0, idx).unsqueeze(0) for t in (shift, scale)]
+            shift, scale = [t[:, 0].index_select(0, idx) for t in (shift, scale)]
             if gate is not None:
-                gate = gate[:, 0].index_select(0, idx).unsqueeze(0)
+                gate = gate[:, 0].index_select(0, idx)
         if res is not None:
             x = torch.addcmul(x, gate, res)
         if rms:
@@ -88,7 +89,8 @@ def modulate(
         out = torch.addcmul(out, out, scale) + shift
         return out, x
 
-    B, L, D = x.shape
+    L, D = x.shape[-2:]
+    B = 1 if idx is not None else x.shape[0]
     assert x.stride(-1) == 1
 
     def check(t: Tensor) -> int:  # row stride
@@ -98,7 +100,7 @@ def modulate(
         return t.stride(0) if t.shape[0] > 1 else 0
 
     if idx is not None:
-        assert B == 1 and idx.shape == (L,), (x.shape, idx.shape)
+        assert x.ndim == 2 and idx.shape == (L,), (x.shape, idx.shape)
     shift_stride, scale_stride = check(shift), check(scale)
     gate_stride = 0
     if res is not None:
@@ -107,8 +109,8 @@ def modulate(
         gate_stride = check(gate)
     if norm_weight is not None:
         assert norm_weight.shape == (D,) and norm_weight.is_contiguous()
-    gated = x.new_empty(B, L, D) if res is not None else x
-    out = x.new_empty(B, L, D)
+    gated = x.new_empty(x.shape) if res is not None else x
+    out = x.new_empty(x.shape)
     _modulate_kernel[(L, B)](
         x,
         shift,
@@ -119,8 +121,8 @@ def modulate(
         idx,
         gated,
         out,
-        x.stride(0),
-        x.stride(1),
+        x.stride(0) if idx is None else 0,
+        x.stride(-2),
         shift_stride,
         scale_stride,
         gate_stride,

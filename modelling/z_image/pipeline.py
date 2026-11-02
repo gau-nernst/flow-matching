@@ -67,8 +67,9 @@ class ZImagePipeline:
 
         device = next(self.qwen3.parameters()).device
         varlen = VarlenMetadata.from_lens(lens, device) if len(lens) > 1 else None
-        input_ids = torch.tensor(sum(input_ids, [])).pin_memory().to(device, non_blocking=True)[None]
-        return list(self.qwen3(input_ids, varlen=varlen)[0].split(lens))
+        input_ids = torch.tensor(sum(input_ids, [])).pin_memory().to(device, non_blocking=True)
+        input_ids = input_ids if varlen is not None else input_ids[None]
+        return list(self.qwen3(input_ids, varlen=varlen).flatten(0, -2).split(lens))
 
     # imgs: uint8 [H_i, W_i, 3]. returns per-sample latents and kwargs for model.prepare()
     @torch.no_grad()

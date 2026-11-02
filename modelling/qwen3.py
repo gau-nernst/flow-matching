@@ -43,7 +43,7 @@ class Qwen3Attention(nn.Module):
 
             cu, max_len = varlen.cu_seqlens, varlen.max_seqlen
             # window_size (-1, 0) is causal
-            out = varlen_attn(q[0], k[0], v[0], cu, cu, max_len, max_len, window_size=(-1, 0), enable_gqa=True)[None]
+            out = varlen_attn(q, k, v, cu, cu, max_len, max_len, window_size=(-1, 0), enable_gqa=True)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             if attn_mask is None:
@@ -99,7 +99,7 @@ class Qwen3Model(nn.Module):
         self.norm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
     # attn_mask: [B, 1, L, L] bool, True means attend. default to causal mask.
-    # varlen: input_ids is [1, L] packed, without padding
+    # varlen: input_ids is [L], without padding
     def forward(
         self,
         input_ids: Tensor,

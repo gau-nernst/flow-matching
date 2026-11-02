@@ -6,7 +6,7 @@ from .varlen import VarlenMetadata
 
 
 def dispatch_attn(q: Tensor, k: Tensor, v: Tensor, impl: str = "pt", varlen: VarlenMetadata | None = None) -> Tensor:
-    # q, k, v: [B, L, H, D], or [1, T, H, D] packed
+    # q, k, v: [B, L, H, D], or [L, H, D] if varlen
     if varlen is not None:
         if impl != "pt":
             raise NotImplementedError(f"varlen attention is not supported for {impl=}")
@@ -14,11 +14,11 @@ def dispatch_attn(q: Tensor, k: Tensor, v: Tensor, impl: str = "pt", varlen: Var
 
         # varlen_attn is CUDA only, and needs each sample contiguous
         if varlen.perm is not None:
-            q, k, v = [x.index_select(1, varlen.perm) for x in (q, k, v)]
+            q, k, v = [x.index_select(0, varlen.perm) for x in (q, k, v)]
         cu, max_len = varlen.cu_seqlens, varlen.max_seqlen
-        out = varlen_attn(q[0], k[0], v[0], cu, cu, max_len, max_len).unsqueeze(0)
+        out = varlen_attn(q, k, v, cu, cu, max_len, max_len)
         if varlen.perm is not None:
-            out = torch.empty_like(out).index_copy(1, varlen.perm, out)
+            out = torch.empty_like(out).index_copy(0, varlen.perm, out)
         return out
 
     if impl == "pt":
