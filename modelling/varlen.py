@@ -44,19 +44,6 @@ def per_token(cond: Tensor, idx: Tensor | None) -> Tensor:
     return cond if idx is None else cond[:, 0].index_select(0, idx).unsqueeze(0)
 
 
-def varlen_attn(q: Tensor, k: Tensor, v: Tensor, varlen: VarlenMetadata) -> Tensor:
-    # q, k, v: [1, L, H, D]. CUDA only
-    from torch.nn.attention.varlen import varlen_attn as _varlen_attn
-
-    if varlen.perm is not None:
-        q, k, v = [x.index_select(1, varlen.perm) for x in (q, k, v)]
-    cu, max_len = varlen.cu_seqlens, varlen.max_seqlen
-    out = _varlen_attn(q[0], k[0], v[0], cu, cu, max_len, max_len).unsqueeze(0)
-    if varlen.perm is not None:
-        out = torch.empty_like(out).index_copy(1, varlen.perm, out)
-    return out
-
-
 # returns (img, kwargs) for model(img, t, **kwargs). a single sample stays a dense batch, otherwise samples are packed.
 # imgs: patchified [L_i, D]. grids: patchified (H, W) of each sample. make_rope(H, W, L_txt): one sample's joint rope
 def pack_inputs(
