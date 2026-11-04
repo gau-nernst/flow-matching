@@ -167,7 +167,6 @@ class MOSSImage(nn.Module):
 
     # uniform: latents BHWC, txt BLD -> img [B, HW, C]
     # varlen: latents list[HWC], txt list[LD] (unpadded) -> img [1, sum(HW), C]
-    # a list is always varlen, even when all shapes match
     def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
         if isinstance(latents, Tensor):
             assert isinstance(txt, Tensor), (

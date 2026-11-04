@@ -182,7 +182,6 @@ class ZImage(nn.Module):
 
     # uniform: latents BHWC, txt BLD -> img [B, HW/p^2, p^2C]
     # varlen: latents list[HWC], txt list[LD] -> img [1, sum(HW)/p^2, p^2C]
-    # a list is always varlen, even when all shapes match
     def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
         p = self.cfg.patch_size
         if isinstance(latents, Tensor):

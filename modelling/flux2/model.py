@@ -245,8 +245,7 @@ class Flux2(nn.Module):
         return torch.cat([self.pos_embed.create((0, 0, 0, 0), (1, 1, 1, L_txt)), self.make_img_rope(H, W)])
 
     # uniform: latents BHWC, txt BLD, ref list[HWC] -> img [B, HW, C]
-    # varlen: latents list[HWC], txt list[LD] -> img [1, sum(HW), C]. no ref
-    # a list is always varlen, even when all shapes match
+    # varlen: latents list[HWC], txt list[LD] -> img [1, sum(HW), C]
     def prepare(
         self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor], ref: list[Tensor] | None = None
     ) -> tuple[Tensor, dict]:
