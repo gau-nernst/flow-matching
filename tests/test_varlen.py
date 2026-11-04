@@ -62,6 +62,33 @@ def test_varlen_matches_uniform(setup, grad):
             assert (outs[i].float() - expected).norm() / expected.norm() < 0.02
 
 
+# modulation gradients sum over all of a sample's tokens. accumulating in BF16 is ~3% off, in FP32 ~0.6%
+def test_varlen_modulation_grad():
+    torch.manual_seed(0)
+    with torch.device("cuda"):
+        model = ZImage(MODELS["zimage"][1])
+    for p in model.parameters():
+        nn.init.normal_(p, std=0.1)
+    model = model.bfloat16()
+    params = [p for layer in model.lora_blocks() for p in layer.adaLN_modulation.parameters()]
+    sizes = [(2 * H, 2 * W) for H, W in SIZES]  # more tokens per sample: more BF16 error
+    latents = [randn(H, W, 16) for H, W in sizes]
+    txts = [randn(L, 64) for L in TXT_LENS]
+    t = torch.tensor([0.3, 0.6, 0.9], device="cuda")
+    dys = [randn(H, W, 16) for H, W in sizes]
+
+    def grad(latents, txt, t, dys):
+        img, kwargs = model.prepare(latents, txt)
+        outs = model.unpatchify(model(img, t, **kwargs), [x.shape[-3:-1] for x in latents])
+        loss = sum((out.float() * dy.float()).sum() for out, dy in zip(outs, dys))
+        return torch.cat([g.float().flatten() for g in torch.autograd.grad(loss, params)])
+
+    varlen = grad(latents, txts, t, dys)
+    expected = sum(grad(latents[i][None], txts[i][None], t[i : i + 1], dys[i][None]) for i in range(3))
+    err = (varlen - expected).norm() / expected.norm()
+    assert err < 0.015, err
+
+
 # a list is varlen even when all samples have the same shape. a tensor is uniform
 def test_layout_follows_input_type(setup):
     model, C = setup

@@ -45,14 +45,14 @@ class VarlenMetadata(NamedTuple):
 
 
 # [B, 1, D] -> [1, L, D] for a varlen batch. idx: VarlenMetadata.seq_ids, or None for a uniform batch
+# gathers in FP32: the backward is an index_add over all of a sample's tokens, which is inaccurate in BF16
 def expand_to_tokens(cond: Tensor, idx: Tensor | None) -> Tensor:
-    return cond if idx is None else cond[:, 0].index_select(0, idx).unsqueeze(0)
+    return cond if idx is None else cond[:, 0].float().index_select(0, idx).to(cond.dtype).unsqueeze(0)
 
 
 # imgs: list[LD] (patchified), txt: list[LD], grids: (H, W) of each patchified image
 # make_rope(H, W, L_txt): one sample's joint rope
 # -> img [1, sum(L), D], kwargs: txt [1, sum(L), D], rope, txt_varlen, img_varlen, joint_varlen
-# imgs: patchified [L_i, D]. grids: patchified (H, W) of each sample. make_rope(H, W, L_txt): one sample's joint rope
 def pack_inputs(
     imgs: list[Tensor],
     txt: Tensor | list[Tensor],
