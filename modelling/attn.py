@@ -6,16 +6,27 @@ from torch.nn.attention.varlen import varlen_attn
 from .varlen import VarlenMetadata
 
 
-def dispatch_attn(q: Tensor, k: Tensor, v: Tensor, impl: str = "pt", varlen: VarlenMetadata | None = None) -> Tensor:
-    # q, k, v: [B, L, H, D], or [1, L, H, D] if varlen
+def dispatch_attn(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    impl: str = "pt",
+    varlen: VarlenMetadata | None = None,
+    kv_varlen: VarlenMetadata | None = None,
+) -> Tensor:
+    # q, k, v: [B, L, H, D], or [1, L, H, D] if varlen. kv_varlen: for k, v of another sequence (cross-attention),
+    # otherwise they follow varlen
     if varlen is not None:
         if impl != "pt":
             raise NotImplementedError(f"varlen attention is not supported for {impl=}")
+        kv_varlen = kv_varlen or varlen
         # varlen_attn is CUDA only, and needs each sample contiguous
         if varlen.perm is not None:
-            q, k, v = [x.index_select(1, varlen.perm) for x in (q, k, v)]
-        cu, max_len = varlen.cu_seqlens, varlen.max_seqlen
-        out = varlen_attn(q[0], k[0], v[0], cu, cu, max_len, max_len).unsqueeze(0)
+            q = q.index_select(1, varlen.perm)
+        if kv_varlen.perm is not None:
+            k, v = [x.index_select(1, kv_varlen.perm) for x in (k, v)]
+        cu_q, cu_k = varlen.cu_seqlens, kv_varlen.cu_seqlens
+        out = varlen_attn(q[0], k[0], v[0], cu_q, cu_k, varlen.max_seqlen, kv_varlen.max_seqlen).unsqueeze(0)
         if varlen.perm is not None:
             out = torch.empty_like(out).index_copy_(1, varlen.perm, out)
         return out

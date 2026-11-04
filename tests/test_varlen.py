@@ -17,13 +17,20 @@ MODELS = {
     "flux2": (Flux2, Flux2Config(txt_dim=64, dim=256, num_double_blocks=1, num_single_blocks=1), 128),
     "moss": (MOSSImage, MOSSImageConfig(dim=256, ffn_dim=512, num_layers=2, text_dim=64), 128),
     "zimage": (ZImage, ZImageConfig(dim=256, n_layers=2, n_refiner_layers=1, txt_dim=64), 16),
+    # 8 layers to reach the first injection block (layer 6)
+    "fibo": (Fibo, FiboConfig(dim=256, num_layers=8, txt_dim=64, img_dim=16), 16),
 }
 SIZES = [(16, 24), (32, 16), (24, 24)]
-TXT_LENS = [37, 80, 12]
+TXT_LENS = [37, 300, 12]  # 300: Fibo uses more gist tokens past 256
 
 
 def randn(*shape):
     return torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+
+
+def randn_txt(model, L):
+    # Fibo's text is 6 bundles of hidden states
+    return randn(6, L, 64) if isinstance(model, Fibo) else randn(L, 64)
 
 
 @pytest.fixture(params=MODELS)
@@ -50,7 +57,7 @@ def test_concat():
 def test_varlen_matches_uniform(setup, grad):
     model, C = setup
     latents = [randn(H, W, C) for H, W in SIZES]
-    txts = [randn(L, 64) for L in TXT_LENS]
+    txts = [randn_txt(model, L) for L in TXT_LENS]
     t = torch.tensor([0.3, 0.6, 0.9], device="cuda")
 
     with torch.set_grad_enabled(grad):
@@ -68,16 +75,16 @@ def test_varlen_matches_uniform(setup, grad):
 # a list is varlen even when all samples have the same shape. a tensor is uniform
 def test_layout_follows_input_type(setup):
     model, C = setup
-    img, kwargs = model.prepare([randn(16, 24, C)] * 2, [randn(20, 64)] * 2)
+    img, kwargs = model.prepare([randn(16, 24, C)] * 2, [randn_txt(model, 20)] * 2)
     assert img.shape[0] == 1 and "img_varlen" in kwargs
-    img, kwargs = model.prepare(randn(2, 16, 24, C), randn(2, 20, 64))
+    img, kwargs = model.prepare(randn(2, 16, 24, C), torch.stack([randn_txt(model, 20)] * 2))
     assert img.shape[0] == 2 and "img_varlen" not in kwargs
 
 
 def test_mismatched_inputs_raise(setup):
     model, C = setup
     with pytest.raises(AssertionError):
-        model.prepare([randn(16, 24, C)], [randn(20, 64)] * 2)
+        model.prepare([randn(16, 24, C)], [randn_txt(model, 20)] * 2)
 
 
 @pytest.mark.parametrize("budget", [1, 2500, 4096])  # 1: every image is over budget and batched alone
@@ -107,7 +114,7 @@ def test_fibo_interface():
     assert kwargs["rope"].shape[0] == model.num_gist_tokens(10) + 24
     compute_loss(model, latents, LogitNormal(), txts).backward()
 
+    # editing has no varlen support
+    ctx = [torch.randn(2, 4, 6, 16)]
     with pytest.raises(NotImplementedError):
-        model.prepare([latents[0], torch.randn(6, 4, 16)], txts)
-    with pytest.raises(NotImplementedError):
-        model.prepare(latents, [txts[0], torch.randn(6, 12, 32)])
+        model.prepare([latents[0], torch.randn(6, 4, 16)], txts, ctx)
