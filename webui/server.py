@@ -1,5 +1,6 @@
 import base64
 import gc
+import inspect
 import io
 import json
 import queue
@@ -142,15 +143,21 @@ async def generate(
     seed: int | None = Form(None),
     images: list[UploadFile] = File(default=[]),
 ):
+    if PIPELINE is None:
+        raise HTTPException(status_code=400, detail="No model loaded")
+
     kwargs = dict(
         prompt=prompt,
-        neg_prompt=neg_prompt,
         img_size=(height, width),
         cfg_scale=cfg_scale,
         num_steps=num_steps,
         seed=seed,
         pbar=False,
     )
+
+    # an empty negative prompt keeps the pipeline's default (Fibo's is an empty JSON caption)
+    if neg_prompt:
+        kwargs.update(neg_prompt=neg_prompt)
 
     # Flux2-klein specific logic
     limit_pixels = 2048 * 2048 if len(images) == 1 else 1024 * 1024
@@ -162,7 +169,17 @@ async def generate(
         ref_imgs.append(img.convert("RGB"))
 
     if ref_imgs:
-        kwargs.update(ref_imgs=ref_imgs)
+        # Flux.2 takes ref_imgs. Fibo takes images, up to MAX_NUM_IMAGES
+        params = inspect.signature(PIPELINE.generate).parameters
+        if "images" in params:
+            max_images = getattr(PIPELINE, "MAX_NUM_IMAGES", len(ref_imgs))
+            if len(ref_imgs) > max_images:
+                raise HTTPException(status_code=400, detail=f"{ACTIVE_MODEL} takes at most {max_images} images")
+            kwargs.update(images=ref_imgs)
+        elif "ref_imgs" in params:
+            kwargs.update(ref_imgs=ref_imgs)
+        else:
+            raise HTTPException(status_code=400, detail=f"{ACTIVE_MODEL} does not take input images")
 
     stream_queue: queue.Queue[str | None] = queue.Queue()
 
