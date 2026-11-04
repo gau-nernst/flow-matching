@@ -1,4 +1,4 @@
-# https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py
+# https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py
 # Qwen3-VL = Qwen3 text model + a ViT whose features replace the image placeholder tokens, with 3D (t, h, w) MRoPE
 # for the text model and "deepstack" features added to the first few text layers' outputs at the image tokens.
 # the text model is our Qwen3Model. here are the vision tower and the glue.
