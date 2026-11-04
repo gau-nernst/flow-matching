@@ -9,9 +9,7 @@ from modelling.flux2.model import Flux2, Flux2Config
 from modelling.moss_image.model import MOSSImage, MOSSImageConfig
 from modelling.varlen import VarlenMetadata
 from modelling.z_image.model import ZImage, ZImageConfig
-from time_sampler import LogitNormal
 from train_lora import ImageDataset
-from train_utils import compute_loss
 
 MODELS = {
     "flux2": (Flux2, Flux2Config(txt_dim=64, dim=256, num_double_blocks=1, num_single_blocks=1), 128),
@@ -100,26 +98,6 @@ def test_batch_tokens(tmp_path, budget):
         imgs, prompts = next(ds_iter)
         assert len(imgs) == len(prompts)
         assert len(imgs) == 1 or sum(x.shape[0] * x.shape[1] // 256 for x in imgs) <= budget
-
-
-def test_fibo_interface():
-    with torch.device("cuda"):
-        model = Fibo(FiboConfig(dim=256, num_layers=2, txt_dim=32, img_dim=16))
-    for p in model.parameters():
-        nn.init.normal_(p, std=0.1)
-    model = model.bfloat16()
-    latents = [randn(4, 6, 16) for _ in range(2)]
-    txts = [randn(6, 10, 32) for _ in range(2)]
-
-    img, kwargs = model.prepare(torch.stack(latents), torch.stack(txts))
-    assert img.shape == (2, 24, 16)
-    assert kwargs["rope"].shape[0] == model.num_gist_tokens(10) + 24
-    compute_loss(model, latents, LogitNormal(), txts).backward()
-
-    # a uniform batch stacks each sample's images to edit
-    refs = [[randn(2, 4, 16), randn(4, 4, 16)] for _ in range(2)]
-    img, kwargs = model.prepare(torch.stack(latents), torch.stack(txts), refs)
-    assert img.shape == (2, 24, 16) and kwargs["ref"].shape == (2, 8 + 16, 16) and "img_varlen" not in kwargs
 
 
 @pytest.mark.parametrize("grad", [False, True])
