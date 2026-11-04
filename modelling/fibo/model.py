@@ -71,32 +71,34 @@ class Block(nn.Module):
         else:
             self.cross_attention = None
 
-    # vec: [B, S, 256] timestep embedding of each segment of x. with S=2, tokens [0, split) use vec[:, 0]
-    # (gist tokens, t=0), the rest use vec[:, 1] (image tokens).
-    # varlen: x is [1, L, D], vec is [N, 1, 256], token l uses vec[mod_idx[l]]. txt_varlen: of txt
+    # x: [B, L, D], or [1, L, D] if varlen. vec: [N, 1, 256] timestep embeddings. token l of the flattened x uses
+    # vec[mod_idx[l]]. txt_varlen: of txt
     def forward(
         self,
         x: Tensor,
         vec: Tensor,
+        mod_idx: Tensor,
         pe: Tensor,
         txt: Tensor | None = None,
-        split: int | None = None,
         varlen: VarlenMetadata | None = None,
         txt_varlen: VarlenMetadata | None = None,
-        mod_idx: Tensor | None = None,
     ) -> Tensor:
-        scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(vec).chunk(4, dim=-1)  # [B, S, D] each
-        eps, idx = self.eps, mod_idx
+        scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(vec).chunk(4, dim=-1)  # [N, 1, D] each
 
-        y = gated_norm(x, self.attention_norm1.weight, scale_msa, eps=eps, split=split, idx=idx)
-        x = gated_norm(self.attention(y, pe, varlen), self.attention_norm2.weight, gate_msa, x, "tanh", eps, split, idx)
+        # per-token modulation on the flattened tokens, as a varlen batch
+        def norm(x: Tensor, w: Tensor, gate: Tensor, add: Tensor | None = None, gate_type: str = "plus_one"):
+            flat = [None if t is None else t.view(1, -1, t.shape[-1]) for t in (x, add)]
+            return gated_norm(flat[0], w, gate, flat[1], gate_type, self.eps, mod_idx).view(x.shape)
+
+        y = norm(x, self.attention_norm1.weight, scale_msa)
+        x = norm(self.attention(y, pe, varlen), self.attention_norm2.weight, gate_msa, x, "tanh")
 
         if self.cross_attention is not None:
             cross = self.cross_attention(self.cross_attn_norm1(x), txt, varlen, txt_varlen)
-            x = gated_norm(cross, self.cross_attn_norm2.weight * self.cross_attn_gate.tanh(), add=x, eps=eps)
+            x = gated_norm(cross, self.cross_attn_norm2.weight * self.cross_attn_gate.tanh(), add=x, eps=self.eps)
 
-        ffn = self.feed_forward(gated_norm(x, self.ffn_norm1.weight, scale_mlp, eps=eps, split=split, idx=idx))
-        return gated_norm(ffn, self.ffn_norm2.weight, gate_mlp, x, "tanh", eps, split, idx)
+        ffn = self.feed_forward(norm(x, self.ffn_norm1.weight, scale_mlp))
+        return norm(ffn, self.ffn_norm2.weight, gate_mlp, x, "tanh")
 
 
 # gist tokens read the text encoder (cross-attention), then each other (self-attention), then an FFN
@@ -265,32 +267,36 @@ class Fibo(nn.Module):
 
         x = self.x_embedder((img if ref is None else torch.cat([ref, img], dim=1)).to(dtype))
         num_ref = x.shape[1] - img.shape[1]
+
+        # token l is modulated by vecs[mod_idx[l]]: its sample's row for image tokens, the extra t=0 row B for clean
+        # tokens (gist, ref)
+        vecs = torch.cat([vec, vec_clean])[:, None]  # [B+1, 1, 256]
+        device = img.device
         if varlen:
-            # gist token i of each sample is latent query i. token l is modulated by vecs[mod_idx[l]]: its sample's
-            # row for image tokens, the extra t=0 row B for clean tokens (gist, ref)
+            # gist token i of each sample is latent query i
             num_gist = gist_varlen.seq_ids.shape[0]
-            gist_pos = torch.arange(num_gist, device=img.device) - gist_varlen.cu_seqlens[gist_varlen.seq_ids]
+            gist_pos = torch.arange(num_gist, device=device) - gist_varlen.cu_seqlens[gist_varlen.seq_ids]
             gist = self.perceiver.latent_queries[gist_pos][None]
-            vecs = torch.cat([vec, vec_clean])[:, None]  # [B+1, 1, 256]
 
-            def clean_idx(n: int) -> Tensor:
-                return torch.full((n,), B, dtype=torch.int32, device=img.device)
+            def mod_idx(num_clean: int) -> Tensor:  # [clean tokens of all samples, image tokens of all samples]
+                return torch.cat([torch.full((num_clean,), B, dtype=torch.int32, device=device), img_varlen.seq_ids])
 
-            refiner_varlen = ref_img_varlen if num_ref else img_varlen
-            refiner_idx = torch.cat([clean_idx(num_ref), img_varlen.seq_ids])
-            refiner_vec, refiner_kwargs = vecs, dict(varlen=refiner_varlen, mod_idx=refiner_idx)
-            mod_idx = torch.cat([clean_idx(num_gist + num_ref), img_varlen.seq_ids])
-            joint_kwargs = dict(varlen=joint_varlen, txt_varlen=txt_varlen, mod_idx=mod_idx)
+            refiner_kwargs = dict(varlen=ref_img_varlen if num_ref else img_varlen)
+            joint_kwargs = dict(varlen=joint_varlen, txt_varlen=txt_varlen)
         else:
-            # 2 segments: clean tokens [0, split) use vecs[:, 0], image tokens vecs[:, 1]
             num_gist = self.num_gist_tokens(txt.shape[2])
             gist = self.perceiver.latent_queries[:num_gist].unsqueeze(0).expand(B, -1, -1)
-            vecs = torch.stack([vec_clean.expand(B, -1), vec], dim=1)  # [B, 2, 256]
-            refiner_vec, refiner_kwargs = (vecs, dict(split=num_ref)) if num_ref else (vec[:, None], {})
-            joint_kwargs = dict(split=num_gist + num_ref)
 
+            def mod_idx(num_clean: int) -> Tensor:  # each sample: [its clean tokens, its image tokens]
+                pos = torch.arange(num_clean + img.shape[1], device=device)
+                sample = torch.arange(B, dtype=torch.int32, device=device)[:, None]
+                return torch.where(pos < num_clean, B, sample).flatten()
+
+            refiner_kwargs = joint_kwargs = {}
+
+        refiner_idx = mod_idx(num_ref)
         for block in self.noise_refiner:
-            x = block(x, refiner_vec, rope[num_gist:], **refiner_kwargs)
+            x = block(x, vecs, refiner_idx, rope[num_gist:], **refiner_kwargs)
 
         # Perceiver
         txt = txt.to(dtype)
@@ -301,8 +307,9 @@ class Fibo(nn.Module):
         # one stream: gist tokens, ref tokens, then image tokens. injection blocks also read their own text bundle.
         x = torch.cat([gist, x], dim=1)
         bundle_ids = {layer_id: i + 1 for i, layer_id in enumerate(INJECTION_LAYER_IDS)}
+        joint_idx = mod_idx(num_gist + num_ref)
         for i, block in enumerate(self.layers):
-            x = block(x, vecs, rope, txt[:, bundle_ids[i]] if i in bundle_ids else None, **joint_kwargs)
+            x = block(x, vecs, joint_idx, rope, txt[:, bundle_ids[i]] if i in bundle_ids else None, **joint_kwargs)
 
         return self.final_layer(x[:, num_gist + num_ref :], vec, img_varlen)
 

@@ -11,13 +11,11 @@ from ..varlen import expand_to_tokens
 def _gated_norm_kernel(
     x_ptr,  # [B, L, D]
     w_ptr,  # [D]
-    gate_ptr,  # [B or 1, S, D], strided. token l uses segment (l >= split)
+    gate_ptr,  # [B or 1, D], strided
     idx_ptr,  # [L] sample of each token, for a varlen batch
     add_ptr,  # [B, L, D]
     o_ptr,  # [B, L, D]
-    stride_gb,  # 0 to broadcast
-    stride_gs,
-    split,
+    gate_stride,  # 0 to broadcast
     L: tl.constexpr,
     D: tl.constexpr,
     gate_type: tl.constexpr,
@@ -36,8 +34,7 @@ def _gated_norm_kernel(
             gate_row = tl.load(idx_ptr + pid_l)
         else:
             gate_row = pid_b
-        seg = (pid_l >= split).to(tl.int32)
-        gate = tl.load(gate_ptr + (gate_row * stride_gb + seg * stride_gs + offs), mask)
+        gate = tl.load(gate_ptr + (gate_row * gate_stride + offs), mask)
 
     x = x.to(tl.float32)
     var = tl.sum(x * x) * (1.0 / D)
@@ -66,20 +63,13 @@ def gated_norm(
     add: Tensor | None = None,
     gate_type: str = "plus_one",
     eps: float = 1e-6,
-    split: int | None = None,
     idx: Tensor | None = None,
 ) -> Tensor:
     # x: [B, L, D]. gate: [B, 1, D] or [1, 1, D]
-    # or [B, 2, D] with split: tokens [0, split) use gate[:, 0], the rest use gate[:, 1]
     # varlen: x: [1, L, D]. gate: [B, 1, D]. idx: [L]
-    if gate is not None and split is not None:
-        assert gate.shape[1] == 2 and idx is None, (gate.shape, idx is None)
     if torch.is_grad_enabled():
         # if True:
         x = F.rms_norm(x, x.shape[-1:], w, eps=eps)
-        if gate is not None and split is not None:
-            L = x.shape[1]
-            gate = torch.cat([gate[:, :1].expand(-1, split, -1), gate[:, 1:].expand(-1, L - split, -1)], dim=1)
         if gate is not None:
             gate = expand_to_tokens(gate, idx)
             if gate_type == "plus_one":
@@ -94,18 +84,17 @@ def gated_norm(
 
     assert x.is_contiguous() and w.is_contiguous()
     B, L, D = x.shape
-    stride_gb = stride_gs = 0
+    gate_stride = 0
     if gate is not None:
+        gate = gate.flatten(0, -2)
         assert gate.shape[-1] == D and gate.stride(-1) == 1, (gate.shape, gate.stride())
         if idx is not None:
             assert B == 1 and idx.shape == (L,), (x.shape, idx.shape)
         else:
             assert gate.shape[0] in (1, B), (x.shape, gate.shape)
-        stride_gb = 0 if gate.shape[0] == 1 else gate.stride(0)
-        stride_gs = gate.stride(1)
+        gate_stride = 0 if gate.shape[0] == 1 else gate.stride(0)
     if add is not None:
         assert add.is_contiguous()
     out = torch.empty_like(x)
-    split = L if split is None else split  # all tokens use segment 0
-    _gated_norm_kernel[(L, B)](x, w, gate, idx, add, out, stride_gb, stride_gs, split, L, D, gate_type, eps)
+    _gated_norm_kernel[(L, B)](x, w, gate, idx, add, out, gate_stride, L, D, gate_type, eps)
     return out
