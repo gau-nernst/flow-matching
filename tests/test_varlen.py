@@ -141,7 +141,7 @@ def test_fibo_interface():
     assert kwargs["rope"].shape[0] == model.num_gist_tokens(10) + 24
     compute_loss(model, latents, LogitNormal(), txts).backward()
 
-    # a list of samples with the same images to edit stays uniform, in the batched ctx form
+    # samples with the same images to edit stay uniform
     ctxs = [[torch.randn(2, 4, 16), torch.randn(4, 4, 16)] for _ in range(2)]
     img, kwargs = model.prepare(latents, txts, ctxs)
     assert img.shape == (2, 24, 16) and kwargs["ctx"].shape == (2, 8 + 16, 16) and "img_varlen" not in kwargs
@@ -165,6 +165,6 @@ def test_fibo_varlen_editing(grad):
         assert "ctx_img_varlen" in kwargs
         outs = model.unpatchify(model(img, t, **kwargs), SIZES)
         for i, size in enumerate(SIZES):
-            img, kwargs = model.prepare(latents[i][None], txts[i][None], [c[None] for c in ctxs[i]])
+            img, kwargs = model.prepare(latents[i][None], txts[i][None], [ctxs[i]])
             expected = model.unpatchify(model(img, t[i : i + 1], **kwargs), size)[0].float()
             assert (outs[i].float() - expected).norm() / expected.norm() < 0.02

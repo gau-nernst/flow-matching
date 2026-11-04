@@ -350,7 +350,7 @@ class FiboPipeline:
                 crop.thumbnail((self.TEXT_ENCODER_IMAGE_SIZE, self.TEXT_ENCODER_IMAGE_SIZE))
                 te_images.append(crop)
             device = self.ae.encoder.conv_in.weight.device
-            ctx = [self.ae.encode(torch.from_numpy(np.array(crop)).to(device)[None]).bfloat16() for crop in crops]
+            ctx = [[self.ae.encode(torch.from_numpy(np.array(crop)).to(device)[None])[0].bfloat16() for crop in crops]]
 
         # the images of each prompt's text
         captions = [fibo_parse_prompt(p)[0] for p in prompts]
@@ -419,7 +419,7 @@ def fibo_generate(
     timesteps: list[float],
     txt: Tensor,
     neg_txt: Tensor | None = None,
-    ctx: list[Tensor] | None = None,
+    ctx: list[list[Tensor]] | None = None,  # each sample's images to edit, see Fibo.prepare()
     base_txt: Tensor | None = None,
     base_max_noise_level: float = 0.9,
     cfg_scale: float = 1.0,

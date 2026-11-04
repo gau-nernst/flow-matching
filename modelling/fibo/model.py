@@ -174,24 +174,25 @@ class Fibo(nn.Module):
     # latents: [B, H, W, C] (Flux.2 VAE latents, patchified + normalized), or a list of [H_i, W_i, C] (varlen)
     # txt: [B, 6, L, txt_dim], or a list of [6, L_i, txt_dim]. text encoder bundles: the Perceiver's first,
     # then one per injection block.
-    # ctx: latents of the images to edit, clean tokens (t=0), not predicted. with latents [B, H, W, C]: a list of
-    # [B, h, w, C], sizes can differ. with a list of latents: one list of [h, w, C] per sample, counts can differ.
+    # ctx: latents of each sample's images to edit, a list of [h, w, C] per sample. counts and sizes can differ.
+    # clean tokens (t=0), not predicted.
     # samples of the same image size, prompt length and images to edit stay a uniform batch.
     def prepare(
         self,
         latents: Tensor | list[Tensor],
         txt: Tensor | list[Tensor],
-        ctx: list[Tensor] | list[list[Tensor]] | None = None,
+        ctx: list[list[Tensor]] | None = None,
     ) -> tuple[Tensor, dict]:
+        ctxs = ctx or [[] for _ in range(len(latents))]
+        assert len(latents) == len(txt) == len(ctxs), (len(latents), len(txt), len(ctxs))
+        same_ctx = len({tuple(c.shape for c in cs) for cs in ctxs}) == 1
         if not isinstance(latents, Tensor):
             txts = list(txt)
-            ctxs = ctx or [[] for _ in latents]
-            assert len(latents) == len(txts) == len(ctxs), (len(latents), len(txts), len(ctxs))
-            ctx_shapes = {tuple(c.shape for c in x) for x in ctxs}
-            if len({x.shape for x in latents}) > 1 or len({x.shape for x in txts}) > 1 or len(ctx_shapes) > 1:
+            if len({x.shape for x in latents}) > 1 or len({x.shape for x in txts}) > 1 or not same_ctx:
                 return self._pack_varlen(latents, txts, ctxs)
             latents, txt = torch.stack(latents), torch.stack(txts)
-            ctx = [torch.stack(cs) for cs in zip(*ctxs)]
+        assert same_ctx, "a batched tensor needs the same images to edit in each sample. pass a list of latents"
+        ctx = [torch.stack(cs) for cs in zip(*ctxs)]  # [B, h, w, C] for each image to edit
 
         _, H, W, _ = latents.shape
         ctx = ctx or []
