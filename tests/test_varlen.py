@@ -141,7 +141,30 @@ def test_fibo_interface():
     assert kwargs["rope"].shape[0] == model.num_gist_tokens(10) + 24
     compute_loss(model, latents, LogitNormal(), txts).backward()
 
-    # editing has no varlen support
-    ctx = [torch.randn(2, 4, 6, 16)]
-    with pytest.raises(NotImplementedError):
-        model.prepare([latents[0], torch.randn(6, 4, 16)], txts, ctx)
+    # a list of samples with the same images to edit stays uniform, in the batched ctx form
+    ctxs = [[torch.randn(2, 4, 16), torch.randn(4, 4, 16)] for _ in range(2)]
+    img, kwargs = model.prepare(latents, txts, ctxs)
+    assert img.shape == (2, 24, 16) and kwargs["ctx"].shape == (2, 8 + 16, 16) and "img_varlen" not in kwargs
+
+
+@pytest.mark.parametrize("grad", [False, True])
+def test_fibo_varlen_editing(grad):
+    torch.manual_seed(0)
+    with torch.device("cuda"):
+        model = Fibo(MODELS["fibo"][1])
+    for p in model.parameters():
+        nn.init.normal_(p, std=1.0)
+    model = model.bfloat16()
+    latents = [randn(H, W, 16) for H, W in SIZES]
+    txts = [randn(6, L, 64) for L in TXT_LENS]
+    ctxs = [[randn(8, 12, 16)], [], [randn(16, 16, 16), randn(8, 8, 16)]]  # 1, 0 and 2 images to edit
+    t = torch.tensor([0.3, 0.6, 0.9], device="cuda")
+
+    with torch.set_grad_enabled(grad):
+        img, kwargs = model.prepare(latents, txts, ctxs)
+        assert "ctx_img_varlen" in kwargs
+        outs = model.unpatchify(model(img, t, **kwargs), SIZES)
+        for i, size in enumerate(SIZES):
+            img, kwargs = model.prepare(latents[i][None], txts[i][None], [c[None] for c in ctxs[i]])
+            expected = model.unpatchify(model(img, t[i : i + 1], **kwargs), size)[0].float()
+            assert (outs[i].float() - expected).norm() / expected.norm() < 0.02
