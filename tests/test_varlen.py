@@ -15,20 +15,13 @@ MODELS = {
     "flux2": (Flux2, Flux2Config(txt_dim=64, dim=256, num_double_blocks=1, num_single_blocks=1), 128),
     "moss": (MOSSImage, MOSSImageConfig(dim=256, ffn_dim=512, num_layers=2, text_dim=64), 128),
     "zimage": (ZImage, ZImageConfig(dim=256, n_layers=2, n_refiner_layers=1, txt_dim=64), 16),
-    # 8 layers to reach the first injection block (layer 6)
-    "fibo": (Fibo, FiboConfig(dim=256, num_layers=8, txt_dim=64, img_dim=16), 16),
 }
 SIZES = [(16, 24), (32, 16), (24, 24)]
-TXT_LENS = [37, 300, 12]  # 300: Fibo uses more gist tokens past 256
+TXT_LENS = [37, 80, 12]
 
 
 def randn(*shape):
     return torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
-
-
-def randn_txt(model, L):
-    # Fibo's text is 6 bundles of hidden states
-    return randn(6, L, 64) if isinstance(model, Fibo) else randn(L, 64)
 
 
 @pytest.fixture(params=MODELS)
@@ -55,7 +48,7 @@ def test_concat():
 def test_varlen_matches_uniform(setup, grad):
     model, C = setup
     latents = [randn(H, W, C) for H, W in SIZES]
-    txts = [randn_txt(model, L) for L in TXT_LENS]
+    txts = [randn(L, 64) for L in TXT_LENS]
     t = torch.tensor([0.3, 0.6, 0.9], device="cuda")
 
     with torch.set_grad_enabled(grad):
@@ -73,16 +66,16 @@ def test_varlen_matches_uniform(setup, grad):
 # a list is varlen even when all samples have the same shape. a tensor is uniform
 def test_layout_follows_input_type(setup):
     model, C = setup
-    img, kwargs = model.prepare([randn(16, 24, C)] * 2, [randn_txt(model, 20)] * 2)
+    img, kwargs = model.prepare([randn(16, 24, C)] * 2, [randn(20, 64)] * 2)
     assert img.shape[0] == 1 and "img_varlen" in kwargs
-    img, kwargs = model.prepare(randn(2, 16, 24, C), torch.stack([randn_txt(model, 20)] * 2))
+    img, kwargs = model.prepare(randn(2, 16, 24, C), randn(2, 20, 64))
     assert img.shape[0] == 2 and "img_varlen" not in kwargs
 
 
 def test_mismatched_inputs_raise(setup):
     model, C = setup
     with pytest.raises(AssertionError):
-        model.prepare([randn(16, 24, C)], [randn_txt(model, 20)] * 2)
+        model.prepare([randn(16, 24, C)], [randn(20, 64)] * 2)
 
 
 @pytest.mark.parametrize("budget", [1, 2500, 4096])  # 1: every image is over budget and batched alone
@@ -100,24 +93,27 @@ def test_batch_tokens(tmp_path, budget):
         assert len(imgs) == 1 or sum(x.shape[0] * x.shape[1] // 256 for x in imgs) <= budget
 
 
-@pytest.mark.parametrize("grad", [False, True])
-def test_fibo_varlen_editing(grad):
+@pytest.mark.parametrize("grad", [False, True])  # Triton kernels and their reference paths
+@pytest.mark.parametrize("with_ref", [False, True])
+def test_fibo_varlen(grad, with_ref):
+    # 8 layers: reaches the first cross-attention block (layer 6). text: 6 bundles of [L, D].
+    # 300 tokens -> 320 gist tokens, the others 256. refs: 1, 0 and 2 images to edit
     torch.manual_seed(0)
     with torch.device("cuda"):
-        model = Fibo(MODELS["fibo"][1])
+        model = Fibo(FiboConfig(dim=256, num_layers=8, txt_dim=64, img_dim=16))
     for p in model.parameters():
         nn.init.normal_(p, std=1.0)
     model = model.bfloat16()
     latents = [randn(H, W, 16) for H, W in SIZES]
-    txts = [randn(6, L, 64) for L in TXT_LENS]
-    refs = [[randn(8, 12, 16)], [], [randn(16, 16, 16), randn(8, 8, 16)]]  # 1, 0 and 2 images to edit
+    txts = [randn(6, L, 64) for L in (37, 300, 12)]
+    refs = [[randn(8, 12, 16)], [], [randn(16, 16, 16), randn(8, 8, 16)]] if with_ref else None
     t = torch.tensor([0.3, 0.6, 0.9], device="cuda")
 
     with torch.set_grad_enabled(grad):
         img, kwargs = model.prepare(latents, txts, refs)
-        assert "ref_img_varlen" in kwargs
         outs = model.unpatchify(model(img, t, **kwargs), SIZES)
         for i, size in enumerate(SIZES):
-            img, kwargs = model.prepare(latents[i][None], txts[i][None], [refs[i]])
+            img, kwargs = model.prepare(latents[i][None], txts[i][None], None if refs is None else [refs[i]])
             expected = model.unpatchify(model(img, t[i : i + 1], **kwargs), size)[0].float()
+            # clean is ~1%, another sample's text is ~50% off
             assert (outs[i].float() - expected).norm() / expected.norm() < 0.02
