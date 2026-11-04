@@ -111,6 +111,8 @@ class Flux2Pipeline:
     ) -> Tensor:
         cfg_scale = self.sample_defaults["cfg_scale"] if cfg_scale is None else cfg_scale
         num_steps = self.sample_defaults["num_steps"] if num_steps is None else num_steps
+        if ref_imgs is not None and not isinstance(prompt, str) and len(prompt) > 1:
+            raise ValueError("ref_imgs needs a single prompt")
         txt = self.text_encoder(prompt)
 
         if cfg_scale != 1.0:
@@ -150,7 +152,7 @@ class Flux2Pipeline:
         latents = flux2_generate(
             flux=self.model,
             latents=noise,
-            ref_latents=ref_latents,
+            ref_latents=None if ref_latents is None else [ref_latents],
             timesteps=timesteps,
             txt=txt,
             neg_txt=neg_txt,
@@ -200,7 +202,7 @@ def flux2_generate(
     timesteps: list[float],
     txt: Tensor,
     neg_txt: Tensor | None = None,
-    ref_latents: list[Tensor] | None = None,
+    ref_latents: list[list[Tensor]] | None = None,  # each sample's reference images, see Flux2.prepare()
     guidance: Tensor | float | None = None,
     cfg_scale: float = 1.0,
     solver: str = "euler",
