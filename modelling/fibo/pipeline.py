@@ -373,7 +373,7 @@ class FiboPipeline:
         base_txts = [None] * len(prompts)
         if images is None and any(own_text_images):
             base_txts = self.text_encoder(base_prompts)
-        neg_txt = self.text_encoder(neg_prompt)[0][None] if cfg_scale != 1.0 else None
+        neg_txt = self.text_encoder(neg_prompt)[0] if cfg_scale != 1.0 else None
 
         ae = self.ae
         H = height // ae.downsample // 2
@@ -382,27 +382,23 @@ class FiboPipeline:
 
         rng = torch.Generator(device).manual_seed(seed) if seed is not None else None
 
-        # the DiT doesn't support padding, so generate each prompt separately
-        imgs = []
-        for i, (txt, base_txt) in enumerate(zip(txts, base_txts)):
-            noise = torch.randn(1, H, W, ae.cfg.z_dim * 4, device=device, generator=rng)
-            cb = (lambda step, n, i=i: progress_cb(i * n + step, len(txts) * n)) if progress_cb else None
-            latents = fibo_generate(
-                fibo=self.model,
-                latents=noise,
-                timesteps=fibo_timesteps(num_steps, H * W),
-                txt=txt[None],
-                neg_txt=neg_txt,
-                ref=ref,
-                base_txt=None if base_txt is None else base_txt[None],
-                base_max_noise_level=self.TEXT_IMAGES_MAX_NOISE_LEVEL,
-                cfg_scale=cfg_scale,
-                solver=solver,
-                pbar=pbar,
-                progress_cb=cb,
-            )
-            imgs.append(ae.decode(latents, uint8=True))
-        return torch.cat(imgs)
+        # one noise per prompt, drawn in order
+        noise = torch.cat([torch.randn(1, H, W, ae.cfg.z_dim * 4, device=device, generator=rng) for _ in prompts])
+        latents = fibo_generate(
+            fibo=self.model,
+            latents=noise,
+            timesteps=fibo_timesteps(num_steps, H * W),
+            txt=txts,
+            neg_txt=neg_txt,
+            ref=ref,
+            base_txt=base_txts,
+            base_max_noise_level=self.TEXT_IMAGES_MAX_NOISE_LEVEL,
+            cfg_scale=cfg_scale,
+            solver=solver,
+            pbar=pbar,
+            progress_cb=progress_cb,
+        )
+        return ae.decode(latents, uint8=True)
 
 
 # sigmas from 1 to 1/num_steps, with resolution-dependent exponential shift. ends with 0.
@@ -414,15 +410,17 @@ def fibo_timesteps(num_steps: int, img_seq_len: int) -> list[float]:
     return sigmas.float().tolist() + [0.0]
 
 
+# latents: [B, H, W, C] noise. txt: [6, L_i, txt_dim] per sample, lengths can differ (a varlen batch).
+# neg_txt: [6, L, txt_dim], shared by all samples. base_txt: per sample, None for a sample without text images.
 @torch.no_grad()
 def fibo_generate(
     fibo: Fibo,
     latents: Tensor,
     timesteps: list[float],
-    txt: Tensor,
+    txt: list[Tensor],
     neg_txt: Tensor | None = None,
     ref: list[list[Tensor]] | None = None,  # each sample's images to edit, see Fibo.prepare()
-    base_txt: Tensor | None = None,
+    base_txt: list[Tensor | None] | None = None,
     base_max_noise_level: float = 0.9,
     cfg_scale: float = 1.0,
     solver: str = "euler",
@@ -431,27 +429,39 @@ def fibo_generate(
 ) -> Tensor:
     num_steps = len(timesteps) - 1
     solver_ = get_solver(solver, timesteps)
-    B = latents.shape[0]
-    size = tuple(latents.shape[1:3])
+    B, H, W, _ = latents.shape
+    imgs = list(latents)
 
-    # the number of gist tokens depends on the text length, so each text has its own rope
-    neg_kwargs = fibo.prepare(latents, neg_txt, ref)[1] if cfg_scale != 1.0 else None
-    base_kwargs = fibo.prepare(latents, base_txt, ref)[1] if base_txt is not None else None
-    latents, pos_kwargs = fibo.prepare(latents, txt, ref)
+    # the number of gist tokens depends on the text length, so each text set has its own rope
+    neg_kwargs = fibo.prepare(imgs, [neg_txt] * B, ref)[1] if cfg_scale != 1.0 else None
+    if base_txt is not None and any(x is not None for x in base_txt):
+        base_txt = [t if b is None else b for t, b in zip(txt, base_txt)]  # samples without text images keep txt
+        base_kwargs = fibo.prepare(imgs, base_txt, ref)[1]
+    else:
+        base_txt = base_kwargs = None
+    pos_kwargs = fibo.prepare(imgs, txt, ref)[1]
+
+    # a text set is a uniform or a varlen batch, depending on its lengths. all samples have the same image size, so
+    # the two layouts of the image tokens are views of [B, H*W, C]
+    latents = latents.flatten(1, 2)
+
+    def run(x: Tensor, t: Tensor, kwargs: dict) -> Tensor:
+        out = fibo(x.view(1, -1, x.shape[-1]) if "img_varlen" in kwargs else x, t, **kwargs)
+        return out.float().view(x.shape)
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
         t = torch.tensor([timesteps[i]], device=latents.device).expand(B)
         # base_txt (prompt without text images) is used while the noise level is above base_max_noise_level
         use_base = base_txt is not None and timesteps[i] > base_max_noise_level
-        v = fibo(latents, t, **(base_kwargs if use_base else pos_kwargs)).float()
+        v = run(latents, t, base_kwargs if use_base else pos_kwargs)
 
         # classifier-free guidance. the images to edit condition both passes.
         if cfg_scale != 1.0:
-            neg_v = fibo(latents, t, **neg_kwargs).float()
+            neg_v = run(latents, t, neg_kwargs)
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
         if progress_cb is not None:
             progress_cb(i + 1, num_steps)
 
-    return fibo.unpatchify(latents, size)
+    return latents.unflatten(1, (H, W))
