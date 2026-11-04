@@ -13,6 +13,7 @@ from torch.nn.attention.varlen import varlen_attn
 from .linear import Linear
 from .qwen3 import Qwen3Model
 from .rope import apply_rope, compute_rope
+from .utils import list_to_tensor_async
 
 
 class VisionAttention(nn.Module):
@@ -140,7 +141,7 @@ class Qwen3VLVisionModel(nn.Module):
         x = x + torch.cat([self._pos_embed(h, w, device) for _, h, w in grid_thw])
         rope = torch.cat([self._rope(h, w, device) for _, h, w in grid_thw])
         seqlens = [h * w for _, h, w in grid_thw]
-        cu_seqlens = torch.tensor([0, *itertools.accumulate(seqlens)], dtype=torch.int32, device=device)
+        cu_seqlens = list_to_tensor_async([0, *itertools.accumulate(seqlens)], device, torch.int32)
 
         deepstack = []
         for i, block in enumerate(self.blocks):

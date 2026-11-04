@@ -196,7 +196,6 @@ class Fibo(nn.Module):
         ref = [torch.stack(cs) for cs in zip(*refs)]  # [B, h, w, C] for each image to edit
 
         _, H, W, _ = latents.shape
-        ref = ref or []
         rope = self.make_rope(H, W, txt.shape[2], [c.shape[1:3] for c in ref])
         kwargs = dict(txt=txt, rope=rope)
         if ref:

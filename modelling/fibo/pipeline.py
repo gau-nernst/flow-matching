@@ -330,7 +330,8 @@ class FiboPipeline:
                 raise ValueError("ref_imgs needs a single prompt")
             if not 1 <= len(images) <= self.MAX_NUM_IMAGES:
                 raise ValueError(f"Fibo takes 1 to {self.MAX_NUM_IMAGES} images, got {len(images)}")
-        assert mask is None or (images is not None and len(images) == 1 and mask.size == images[0].size)
+        if mask is not None and (images is None or len(images) != 1 or mask.size != images[0].size):
+            raise ValueError("a mask needs a single image to edit, of the same size")
 
         # output size. by default for an edit, the trained size for the aspect ratio of the first image.
         if img_size is None:
