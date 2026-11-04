@@ -169,17 +169,17 @@ async def generate(
         ref_imgs.append(img.convert("RGB"))
 
     if ref_imgs:
-        # Flux.2 takes ref_imgs. Fibo takes images, up to MAX_NUM_IMAGES
         params = inspect.signature(PIPELINE.generate).parameters
-        if "images" in params:
-            max_images = getattr(PIPELINE, "MAX_NUM_IMAGES", len(ref_imgs))
-            if len(ref_imgs) > max_images:
-                raise HTTPException(status_code=400, detail=f"{ACTIVE_MODEL} takes at most {max_images} images")
-            kwargs.update(images=ref_imgs)
-        elif "ref_imgs" in params:
-            kwargs.update(ref_imgs=ref_imgs)
-        else:
+        if "ref_imgs" not in params:
             raise HTTPException(status_code=400, detail=f"{ACTIVE_MODEL} does not take input images")
+        max_images = getattr(PIPELINE, "MAX_NUM_IMAGES", len(ref_imgs))
+        if len(ref_imgs) > max_images:
+            raise HTTPException(status_code=400, detail=f"{ACTIVE_MODEL} takes at most {max_images} images")
+        kwargs.update(ref_imgs=ref_imgs)
+        # a pipeline whose img_size defaults to None picks the output size from the input images (Fibo: the trained
+        # size for the first image's aspect ratio). the UI's size would crop them.
+        if params["img_size"].default is None:
+            del kwargs["img_size"]
 
     stream_queue: queue.Queue[str | None] = queue.Queue()
 
@@ -201,7 +201,7 @@ async def generate(
             pil_img.save(img_bytes, format="WEBP", lossless=True)
             img_bytes.seek(0)
             encoded = base64.b64encode(img_bytes.getvalue()).decode("ascii")
-            emit({"type": "done", "image_base64": encoded, "width": width, "height": height})
+            emit({"type": "done", "image_base64": encoded, "width": pil_img.width, "height": pil_img.height})
 
         except Exception as exc:
             emit({"type": "error", "message": str(exc)})

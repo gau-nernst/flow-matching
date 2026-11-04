@@ -228,6 +228,7 @@ class Fibo(nn.Module):
         return [x.unflatten(0, size) for x, size in zip(outs, sizes)]
 
     # inputs are from prepare(). img: [B, L_img, C]. time: [B] in [0, 1], 1 is noise. ctx: [B, L_ctx, C]
+    # varlen batch (no ctx): img [1, L_img, C], txt [1, 6, L_txt, txt_dim]
     def forward(
         self,
         img: Tensor,
@@ -240,81 +241,52 @@ class Fibo(nn.Module):
         img_varlen: VarlenMetadata | None = None,
         joint_varlen: VarlenMetadata | None = None,
     ) -> Tensor:
-        if img_varlen is not None:
-            return self._forward_varlen(img, time, txt, rope, txt_varlen, gist_varlen, img_varlen, joint_varlen)
-        B, L_img, _ = img.shape
+        varlen = img_varlen is not None
+        B = img_varlen.cu_seqlens.shape[0] - 1 if varlen else img.shape[0]
         dtype = self.x_embedder.weight.dtype
 
-        # image tokens get the real timestep, clean tokens (gist, context) get t=0
+        # image tokens get the real timestep, clean tokens (gist, context) get t=0, which is the same for every sample
         t_mlp = self.t_embedder.mlp
-        vec = t_mlp(timestep_embedding(time, 256).to(dtype))
-        vec_clean = t_mlp(timestep_embedding(torch.zeros_like(time), 256).to(dtype))
-        vecs = torch.stack([vec_clean, vec], dim=1)
+        vec = t_mlp(timestep_embedding(time.expand(B), 256).to(dtype))  # [B, 256]
+        vec_clean = t_mlp(timestep_embedding(time.new_zeros(1), 256).to(dtype))  # [1, 256]
 
-        num_gist = self.num_gist_tokens(txt.shape[2])
         x = self.x_embedder((img if ctx is None else torch.cat([ctx, img], dim=1)).to(dtype))
-        num_ctx = x.shape[1] - L_img
+        num_ctx = x.shape[1] - img.shape[1]
+        if varlen:
+            # gist token i of each sample is latent query i. token l is modulated by vecs[mod_idx[l]]: its sample's
+            # row for image tokens, the extra t=0 row B for gist tokens
+            num_gist = gist_varlen.seq_ids.shape[0]
+            gist_pos = torch.arange(num_gist, device=img.device) - gist_varlen.cu_seqlens[gist_varlen.seq_ids]
+            gist = self.perceiver.latent_queries[gist_pos][None]
+            vecs = torch.cat([vec, vec_clean])[:, None]  # [B+1, 1, 256]
+            gist_idx = torch.full((num_gist,), B, dtype=torch.int32, device=img.device)
+            refiner_vec, refiner_kwargs = vec[:, None], dict(varlen=img_varlen, mod_idx=img_varlen.seq_ids)
+            mod_idx = torch.cat([gist_idx, img_varlen.seq_ids])
+            joint_kwargs = dict(varlen=joint_varlen, txt_varlen=txt_varlen, mod_idx=mod_idx)
+        else:
+            # 2 segments: clean tokens [0, split) use vecs[:, 0], image tokens vecs[:, 1]
+            num_gist = self.num_gist_tokens(txt.shape[2])
+            gist = self.perceiver.latent_queries[:num_gist].unsqueeze(0).expand(B, -1, -1)
+            vecs = torch.stack([vec_clean.expand(B, -1), vec], dim=1)  # [B, 2, 256]
+            refiner_vec, refiner_kwargs = (vecs, dict(split=num_ctx)) if num_ctx else (vec[:, None], {})
+            joint_kwargs = dict(split=num_gist + num_ctx)
+
         for block in self.noise_refiner:
-            x = block(x, vecs, rope[num_gist:], split=num_ctx) if num_ctx else block(x, vec[:, None], rope[num_gist:])
+            x = block(x, refiner_vec, rope[num_gist:], **refiner_kwargs)
 
         # Perceiver
         txt = txt.to(dtype)
-        gist = self.perceiver.latent_queries[:num_gist].unsqueeze(0).expand(B, -1, -1)
         for layer in self.perceiver.layers:
-            gist = layer(gist, txt[:, 0])
+            gist = layer(gist, txt[:, 0], gist_varlen, txt_varlen)
         gist = self.perceiver.norm_out(gist)
 
         # one stream: gist tokens, context tokens, then image tokens. injection blocks also read their own text bundle.
         x = torch.cat([gist, x], dim=1)
         bundle_ids = {layer_id: i + 1 for i, layer_id in enumerate(INJECTION_LAYER_IDS)}
         for i, block in enumerate(self.layers):
-            x = block(x, vecs, rope, txt[:, bundle_ids[i]] if i in bundle_ids else None, num_gist + num_ctx)
+            x = block(x, vecs, rope, txt[:, bundle_ids[i]] if i in bundle_ids else None, **joint_kwargs)
 
-        return self.final_layer(x[:, num_gist + num_ctx :], vec)
-
-    # same as forward() without ctx, for a varlen batch from prepare(): img [1, L_img, C], txt [1, 6, L_txt, txt_dim]
-    def _forward_varlen(
-        self,
-        img: Tensor,
-        time: Tensor,
-        txt: Tensor,
-        rope: Tensor,
-        txt_varlen: VarlenMetadata,
-        gist_varlen: VarlenMetadata,
-        img_varlen: VarlenMetadata,
-        joint_varlen: VarlenMetadata,
-    ) -> Tensor:
-        B = img_varlen.cu_seqlens.shape[0] - 1
-        dtype = self.x_embedder.weight.dtype
-
-        # clean tokens use t=0, which is the same for every sample: one extra modulation row, index B
-        t_mlp = self.t_embedder.mlp
-        vec = t_mlp(timestep_embedding(time.expand(B), 256).to(dtype))  # [B, 256]
-        vec_clean = t_mlp(timestep_embedding(time.new_zeros(1), 256).to(dtype))
-        vecs = torch.cat([vec, vec_clean])[:, None]  # [B+1, 1, 256]
-
-        num_gist = gist_varlen.seq_ids.shape[0]
-        x = self.x_embedder(img.to(dtype))
-        for block in self.noise_refiner:
-            x = block(x, vec[:, None], rope[num_gist:], varlen=img_varlen, mod_idx=img_varlen.seq_ids)
-
-        # Perceiver. gist token i of each sample is latent query i
-        txt = txt.to(dtype)
-        gist_pos = torch.arange(num_gist, device=img.device) - gist_varlen.cu_seqlens[gist_varlen.seq_ids]
-        gist = self.perceiver.latent_queries[gist_pos][None]
-        for layer in self.perceiver.layers:
-            gist = layer(gist, txt[:, 0], gist_varlen, txt_varlen)
-        gist = self.perceiver.norm_out(gist)
-
-        x = torch.cat([gist, x], dim=1)
-        gist_idx = torch.full((num_gist,), B, dtype=torch.int32, device=img.device)
-        mod_idx = torch.cat([gist_idx, img_varlen.seq_ids])
-        bundle_ids = {layer_id: i + 1 for i, layer_id in enumerate(INJECTION_LAYER_IDS)}
-        for i, block in enumerate(self.layers):
-            bundle = txt[:, bundle_ids[i]] if i in bundle_ids else None
-            x = block(x, vecs, rope, bundle, varlen=joint_varlen, txt_varlen=txt_varlen, mod_idx=mod_idx)
-
-        return self.final_layer(x[:, num_gist:], vec, img_varlen)
+        return self.final_layer(x[:, num_gist + num_ctx :], vec, img_varlen)
 
 
 def load_fibo(name: str = "fibo-2.0-dev"):

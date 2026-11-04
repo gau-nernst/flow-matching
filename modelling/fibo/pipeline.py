@@ -82,7 +82,12 @@ class FiboTextEncoder(nn.Module):
         for text, imgs in zip(texts, images):
             text = f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
             inputs = self.processor(
-                text=[text], images=imgs or None, truncation=True, max_length=self.max_length, return_tensors="pt"
+                text=[text],
+                images=imgs or None,
+                # truncating would cut image tokens, which then don't match pixel_values
+                truncation=not imgs,
+                max_length=self.max_length,
+                return_tensors="pt",
             )
             input_ids = inputs.input_ids.to(device)
 
@@ -296,7 +301,7 @@ class FiboPipeline:
     # prompt: a structured JSON caption (preferred), or a short description.
     #   with images: the edit instruction, or a JSON object with "edit_instruction" and the caption of the result
     #   (its other keys, or a "structured_caption" key).
-    # images: up to 5 images to edit, which the instruction can refer to as <image_1>, <image_2>, ...
+    # ref_imgs: up to 5 images to edit, which the instruction can refer to as <image_1>, <image_2>, ...
     # mask: the region of the single image to regenerate, white on black.
     # text_images: show Qwen3-VL an image of each text in the caption's text_render, as training did.
     # cfg_scale and num_steps default to self.sample_defaults
@@ -305,7 +310,7 @@ class FiboPipeline:
         self,
         prompt: str | list[str],
         neg_prompt: str = DEFAULT_NEG_PROMPT,
-        images: Image.Image | list[Image.Image] | None = None,
+        ref_imgs: Image.Image | list[Image.Image] | None = None,
         mask: Image.Image | None = None,
         text_images: bool = True,
         img_size: int | tuple[int, int] | None = None,
@@ -319,7 +324,7 @@ class FiboPipeline:
         cfg_scale = self.sample_defaults["cfg_scale"] if cfg_scale is None else cfg_scale
         num_steps = self.sample_defaults["num_steps"] if num_steps is None else num_steps
         prompts = [prompt] if isinstance(prompt, str) else prompt
-        images = [images] if isinstance(images, Image.Image) else images
+        images = [ref_imgs] if isinstance(ref_imgs, Image.Image) else ref_imgs
         if images is not None:
             assert 1 <= len(images) <= self.MAX_NUM_IMAGES
         assert mask is None or (images is not None and len(images) == 1 and mask.size == images[0].size)
