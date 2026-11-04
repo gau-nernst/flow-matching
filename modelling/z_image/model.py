@@ -180,13 +180,14 @@ class ZImage(nn.Module):
         txt_rope = self.pos_embed.create((1, 0, 0), (L_txt, 1, 1))
         return torch.cat([img_rope, txt_rope])
 
-    # latents: [B, H, W, C] with txt [B, L, D] (uniform), or a list of [H_i, W_i, C] with a list of [L_i, D] (varlen,
-    # even when all samples have the same size)
+    # uniform batch: latents [B, H, W, C], txt [B, L, D]
+    # varlen batch: latents a list of [H_i, W_i, C], txt a list of [L_i, D]. a list is always varlen, even when all
+    # samples have the same shape
     def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
         p = self.cfg.patch_size
         if isinstance(latents, Tensor):
             assert isinstance(txt, Tensor), (
-                "a uniform batch needs txt as a tensor. pass a list of latents for a varlen batch"
+                "latents is a tensor, so txt must be too. for a varlen batch, pass both as lists"
             )
             _, H, W, _ = latents.shape
             return self._patchify(latents), dict(txt=txt, rope=self.make_rope(H // p, W // p, txt.shape[1]))

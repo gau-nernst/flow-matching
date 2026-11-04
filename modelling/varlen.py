@@ -49,8 +49,10 @@ def expand_to_tokens(cond: Tensor, idx: Tensor | None) -> Tensor:
     return cond if idx is None else cond[:, 0].index_select(0, idx).unsqueeze(0)
 
 
-# returns (img, kwargs) for model(img, t, **kwargs) of a varlen batch, even when all samples have the same size: the
-# layout follows the input type (a list), not its contents, so calls with different texts for the same images agree.
+# packs a list of samples into a varlen batch. returns (img, kwargs) for model(img, t, **kwargs).
+# always varlen, even when all samples have the same shape: the layout depends only on the input type, never on
+# shapes. e.g. a sampler calls prepare() on the same images twice, with the prompts and with the negative prompt, and
+# both calls must give the same img layout.
 # imgs: patchified [L_i, D]. grids: patchified (H, W) of each sample. make_rope(H, W, L_txt): one sample's joint rope
 def pack_inputs(
     imgs: list[Tensor],

@@ -17,8 +17,8 @@ def randn(*shape):
     return torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
 
 
-# prompts of different lengths with one shared negative prompt: the negative pass must use the same layout as the
-# prompts. each sample matches sampling it alone
+# guidance with prompts of different lengths and one negative prompt. the prompt pass is varlen, so the negative
+# prompt pass must be too, or they disagree on the latents' layout. each sample matches sampling it alone
 @pytest.mark.parametrize("name", SAMPLERS)
 def test_batched_prompts_cfg(name):
     cls, cfg, C, generate = SAMPLERS[name]
