@@ -161,56 +161,56 @@ class Fibo(nn.Module):
     def lora_blocks(self) -> list[nn.Module]:
         return list(self.layers)
 
-    # one sample's [gist, context, image] rope. axes (plane, h, w). gist token i is on plane 1+i, the image on plane
-    # MAX_NUM_GIST_TOKENS+1, context image k on the k-th plane after it.
-    # reference order is [gist, image, context]. we put context before the image, so that clean and noisy tokens
+    # one sample's [gist, ref, image] rope. axes (plane, h, w). gist token i is on plane 1+i, the image on plane
+    # MAX_NUM_GIST_TOKENS+1, ref image k on the k-th plane after it.
+    # diffusers' order is [gist, image, ref]. we put refs before the image, so that clean and noisy tokens
     # are 2 contiguous segments. positions come from RoPE, so this only changes rounding.
-    def make_rope(self, H: int, W: int, L_txt: int, ctx_sizes: list[tuple[int, int]] = ()) -> Tensor:
+    def make_rope(self, H: int, W: int, L_txt: int, ref_sizes: list[tuple[int, int]] = ()) -> Tensor:
         img_plane = MAX_NUM_GIST_TOKENS + 1
         gist_rope = self.pos_embed.create((1, 0, 0), (self.num_gist_tokens(L_txt), 1, 1))
-        ctx_rope = [self.pos_embed.create((img_plane + 1 + k, 0, 0), (1, *s)) for k, s in enumerate(ctx_sizes)]
-        return torch.cat([gist_rope, *ctx_rope, self.pos_embed.create((img_plane, 0, 0), (1, H, W))])
+        ref_rope = [self.pos_embed.create((img_plane + 1 + k, 0, 0), (1, *s)) for k, s in enumerate(ref_sizes)]
+        return torch.cat([gist_rope, *ref_rope, self.pos_embed.create((img_plane, 0, 0), (1, H, W))])
 
     # latents: [B, H, W, C] (Flux.2 VAE latents, patchified + normalized), or a list of [H_i, W_i, C] (varlen)
     # txt: [B, 6, L, txt_dim], or a list of [6, L_i, txt_dim]. text encoder bundles: the Perceiver's first,
     # then one per injection block.
-    # ctx: latents of each sample's images to edit, a list of [h, w, C] per sample. counts and sizes can differ.
+    # ref: latents of each sample's images to edit, a list of [h, w, C] per sample. counts and sizes can differ.
     # clean tokens (t=0), not predicted.
     # samples of the same image size, prompt length and images to edit stay a uniform batch.
     def prepare(
         self,
         latents: Tensor | list[Tensor],
         txt: Tensor | list[Tensor],
-        ctx: list[list[Tensor]] | None = None,
+        ref: list[list[Tensor]] | None = None,
     ) -> tuple[Tensor, dict]:
-        ctxs = ctx or [[] for _ in range(len(latents))]
-        assert len(latents) == len(txt) == len(ctxs), (len(latents), len(txt), len(ctxs))
-        same_ctx = len({tuple(c.shape for c in cs) for cs in ctxs}) == 1
+        refs = ref or [[] for _ in range(len(latents))]
+        assert len(latents) == len(txt) == len(refs), (len(latents), len(txt), len(refs))
+        same_ref = len({tuple(c.shape for c in cs) for cs in refs}) == 1
         if not isinstance(latents, Tensor):
             txts = list(txt)
-            if len({x.shape for x in latents}) > 1 or len({x.shape for x in txts}) > 1 or not same_ctx:
-                return self._pack_varlen(latents, txts, ctxs)
+            if len({x.shape for x in latents}) > 1 or len({x.shape for x in txts}) > 1 or not same_ref:
+                return self._pack_varlen(latents, txts, refs)
             latents, txt = torch.stack(latents), torch.stack(txts)
-        assert same_ctx, "a batched tensor needs the same images to edit in each sample. pass a list of latents"
-        ctx = [torch.stack(cs) for cs in zip(*ctxs)]  # [B, h, w, C] for each image to edit
+        assert same_ref, "a batched tensor needs the same images to edit in each sample. pass a list of latents"
+        ref = [torch.stack(cs) for cs in zip(*refs)]  # [B, h, w, C] for each image to edit
 
         _, H, W, _ = latents.shape
-        ctx = ctx or []
-        rope = self.make_rope(H, W, txt.shape[2], [c.shape[1:3] for c in ctx])
+        ref = ref or []
+        rope = self.make_rope(H, W, txt.shape[2], [c.shape[1:3] for c in ref])
         kwargs = dict(txt=txt, rope=rope)
-        if ctx:
-            kwargs["ctx"] = torch.cat([c.flatten(1, 2) for c in ctx], dim=1)
+        if ref:
+            kwargs["ref"] = torch.cat([c.flatten(1, 2) for c in ref], dim=1)
         return latents.flatten(1, 2), kwargs
 
-    # varlen batch: [all gist tokens, all context tokens, all image tokens], each part sample after sample.
+    # varlen batch: [all gist tokens, all ref tokens, all image tokens], each part sample after sample.
     # the txt bundles are concatenated along L: [1, 6, sum L_i, txt_dim]
-    def _pack_varlen(self, latents: list[Tensor], txts: list[Tensor], ctxs: list[list[Tensor]]) -> tuple[Tensor, dict]:
+    def _pack_varlen(self, latents: list[Tensor], txts: list[Tensor], refs: list[list[Tensor]]) -> tuple[Tensor, dict]:
         txt_lens = [x.shape[1] for x in txts]
         gist_lens = [self.num_gist_tokens(L) for L in txt_lens]
-        ctx_lens = [sum(c.shape[0] * c.shape[1] for c in cs) for cs in ctxs]
+        ref_lens = [sum(c.shape[0] * c.shape[1] for c in cs) for cs in refs]
         img_lens = [x.shape[0] * x.shape[1] for x in latents]
-        ropes = [[], [], []]  # gist, ctx, img
-        for x, L, cs, lens in zip(latents, txt_lens, ctxs, zip(gist_lens, ctx_lens, img_lens)):
+        ropes = [[], [], []]  # gist, ref, img
+        for x, L, cs, lens in zip(latents, txt_lens, refs, zip(gist_lens, ref_lens, img_lens)):
             sample_rope = self.make_rope(x.shape[0], x.shape[1], L, [c.shape[:2] for c in cs])
             for part, rope in zip(ropes, sample_rope.split(lens)):
                 part.append(rope)
@@ -226,11 +226,11 @@ class Fibo(nn.Module):
             img_varlen=img_varlen,
             joint_varlen=gist_varlen.concat(img_varlen),
         )
-        if any(ctx_lens):
-            ctx_varlen = VarlenMetadata.from_lens(ctx_lens, device)
-            kwargs["ctx"] = torch.cat([c.flatten(0, 1) for cs in ctxs for c in cs])[None]
-            kwargs["ctx_img_varlen"] = ctx_varlen.concat(img_varlen)
-            kwargs["joint_varlen"] = gist_varlen.concat(ctx_varlen, img_varlen)
+        if any(ref_lens):
+            ref_varlen = VarlenMetadata.from_lens(ref_lens, device)
+            kwargs["ref"] = torch.cat([c.flatten(0, 1) for cs in refs for c in cs])[None]
+            kwargs["ref_img_varlen"] = ref_varlen.concat(img_varlen)
+            kwargs["joint_varlen"] = gist_varlen.concat(ref_varlen, img_varlen)
         return torch.cat([x.flatten(0, 1) for x in latents])[None], kwargs
 
     def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:
@@ -240,35 +240,35 @@ class Fibo(nn.Module):
         outs = out.flatten(0, -2).split([H * W for H, W in sizes])
         return [x.unflatten(0, size) for x, size in zip(outs, sizes)]
 
-    # inputs are from prepare(). img: [B, L_img, C]. time: [B] in [0, 1], 1 is noise. ctx: [B, L_ctx, C]
-    # varlen batch: img [1, L_img, C], txt [1, 6, L_txt, txt_dim], ctx [1, L_ctx, C]
+    # inputs are from prepare(). img: [B, L_img, C]. time: [B] in [0, 1], 1 is noise. ref: [B, L_ref, C]
+    # varlen batch: img [1, L_img, C], txt [1, 6, L_txt, txt_dim], ref [1, L_ref, C]
     def forward(
         self,
         img: Tensor,
         time: Tensor,
         txt: Tensor,
         rope: Tensor,
-        ctx: Tensor | None = None,
+        ref: Tensor | None = None,
         txt_varlen: VarlenMetadata | None = None,
         gist_varlen: VarlenMetadata | None = None,
         img_varlen: VarlenMetadata | None = None,
         joint_varlen: VarlenMetadata | None = None,
-        ctx_img_varlen: VarlenMetadata | None = None,
+        ref_img_varlen: VarlenMetadata | None = None,
     ) -> Tensor:
         varlen = img_varlen is not None
         B = img_varlen.cu_seqlens.shape[0] - 1 if varlen else img.shape[0]
         dtype = self.x_embedder.weight.dtype
 
-        # image tokens get the real timestep, clean tokens (gist, context) get t=0, which is the same for every sample
+        # image tokens get the real timestep, clean tokens (gist, ref) get t=0, which is the same for every sample
         t_mlp = self.t_embedder.mlp
         vec = t_mlp(timestep_embedding(time.expand(B), 256).to(dtype))  # [B, 256]
         vec_clean = t_mlp(timestep_embedding(time.new_zeros(1), 256).to(dtype))  # [1, 256]
 
-        x = self.x_embedder((img if ctx is None else torch.cat([ctx, img], dim=1)).to(dtype))
-        num_ctx = x.shape[1] - img.shape[1]
+        x = self.x_embedder((img if ref is None else torch.cat([ref, img], dim=1)).to(dtype))
+        num_ref = x.shape[1] - img.shape[1]
         if varlen:
             # gist token i of each sample is latent query i. token l is modulated by vecs[mod_idx[l]]: its sample's
-            # row for image tokens, the extra t=0 row B for clean tokens (gist, context)
+            # row for image tokens, the extra t=0 row B for clean tokens (gist, ref)
             num_gist = gist_varlen.seq_ids.shape[0]
             gist_pos = torch.arange(num_gist, device=img.device) - gist_varlen.cu_seqlens[gist_varlen.seq_ids]
             gist = self.perceiver.latent_queries[gist_pos][None]
@@ -277,18 +277,18 @@ class Fibo(nn.Module):
             def clean_idx(n: int) -> Tensor:
                 return torch.full((n,), B, dtype=torch.int32, device=img.device)
 
-            refiner_varlen = ctx_img_varlen if num_ctx else img_varlen
-            refiner_idx = torch.cat([clean_idx(num_ctx), img_varlen.seq_ids])
+            refiner_varlen = ref_img_varlen if num_ref else img_varlen
+            refiner_idx = torch.cat([clean_idx(num_ref), img_varlen.seq_ids])
             refiner_vec, refiner_kwargs = vecs, dict(varlen=refiner_varlen, mod_idx=refiner_idx)
-            mod_idx = torch.cat([clean_idx(num_gist + num_ctx), img_varlen.seq_ids])
+            mod_idx = torch.cat([clean_idx(num_gist + num_ref), img_varlen.seq_ids])
             joint_kwargs = dict(varlen=joint_varlen, txt_varlen=txt_varlen, mod_idx=mod_idx)
         else:
             # 2 segments: clean tokens [0, split) use vecs[:, 0], image tokens vecs[:, 1]
             num_gist = self.num_gist_tokens(txt.shape[2])
             gist = self.perceiver.latent_queries[:num_gist].unsqueeze(0).expand(B, -1, -1)
             vecs = torch.stack([vec_clean.expand(B, -1), vec], dim=1)  # [B, 2, 256]
-            refiner_vec, refiner_kwargs = (vecs, dict(split=num_ctx)) if num_ctx else (vec[:, None], {})
-            joint_kwargs = dict(split=num_gist + num_ctx)
+            refiner_vec, refiner_kwargs = (vecs, dict(split=num_ref)) if num_ref else (vec[:, None], {})
+            joint_kwargs = dict(split=num_gist + num_ref)
 
         for block in self.noise_refiner:
             x = block(x, refiner_vec, rope[num_gist:], **refiner_kwargs)
@@ -299,13 +299,13 @@ class Fibo(nn.Module):
             gist = layer(gist, txt[:, 0], gist_varlen, txt_varlen)
         gist = self.perceiver.norm_out(gist)
 
-        # one stream: gist tokens, context tokens, then image tokens. injection blocks also read their own text bundle.
+        # one stream: gist tokens, ref tokens, then image tokens. injection blocks also read their own text bundle.
         x = torch.cat([gist, x], dim=1)
         bundle_ids = {layer_id: i + 1 for i, layer_id in enumerate(INJECTION_LAYER_IDS)}
         for i, block in enumerate(self.layers):
             x = block(x, vecs, rope, txt[:, bundle_ids[i]] if i in bundle_ids else None, **joint_kwargs)
 
-        return self.final_layer(x[:, num_gist + num_ctx :], vec, img_varlen)
+        return self.final_layer(x[:, num_gist + num_ref :], vec, img_varlen)
 
 
 def load_fibo(name: str = "fibo-2.0-dev"):

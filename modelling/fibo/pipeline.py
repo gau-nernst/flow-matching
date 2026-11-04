@@ -326,6 +326,8 @@ class FiboPipeline:
         prompts = [prompt] if isinstance(prompt, str) else prompt
         images = [ref_imgs] if isinstance(ref_imgs, Image.Image) else ref_imgs
         if images is not None:
+            if len(prompts) > 1:
+                raise ValueError("ref_imgs needs a single prompt")
             assert 1 <= len(images) <= self.MAX_NUM_IMAGES
         assert mask is None or (images is not None and len(images) == 1 and mask.size == images[0].size)
 
@@ -336,7 +338,7 @@ class FiboPipeline:
 
         # the images to edit: center-cropped to the output size (a single image), or each to its own trained size.
         # the VAE encodes the crops, Qwen3-VL sees downsized copies.
-        ctx, te_images = None, []
+        ref, te_images = None, []
         if images is not None:
             if mask is not None:
                 images = [fibo_grey_out(images[0], mask)]
@@ -350,7 +352,7 @@ class FiboPipeline:
                 crop.thumbnail((self.TEXT_ENCODER_IMAGE_SIZE, self.TEXT_ENCODER_IMAGE_SIZE))
                 te_images.append(crop)
             device = self.ae.encoder.conv_in.weight.device
-            ctx = [[self.ae.encode(torch.from_numpy(np.array(crop)).to(device)[None])[0].bfloat16() for crop in crops]]
+            ref = [[self.ae.encode(torch.from_numpy(np.array(crop)).to(device)[None])[0].bfloat16() for crop in crops]]
 
         # the images of each prompt's text
         captions = [fibo_parse_prompt(p)[0] for p in prompts]
@@ -391,7 +393,7 @@ class FiboPipeline:
                 timesteps=fibo_timesteps(num_steps, H * W),
                 txt=txt[None],
                 neg_txt=neg_txt,
-                ctx=ctx,
+                ref=ref,
                 base_txt=None if base_txt is None else base_txt[None],
                 base_max_noise_level=self.TEXT_IMAGES_MAX_NOISE_LEVEL,
                 cfg_scale=cfg_scale,
@@ -419,7 +421,7 @@ def fibo_generate(
     timesteps: list[float],
     txt: Tensor,
     neg_txt: Tensor | None = None,
-    ctx: list[list[Tensor]] | None = None,  # each sample's images to edit, see Fibo.prepare()
+    ref: list[list[Tensor]] | None = None,  # each sample's images to edit, see Fibo.prepare()
     base_txt: Tensor | None = None,
     base_max_noise_level: float = 0.9,
     cfg_scale: float = 1.0,
@@ -433,9 +435,9 @@ def fibo_generate(
     size = tuple(latents.shape[1:3])
 
     # the number of gist tokens depends on the text length, so each text has its own rope
-    neg_kwargs = fibo.prepare(latents, neg_txt, ctx)[1] if cfg_scale != 1.0 else None
-    base_kwargs = fibo.prepare(latents, base_txt, ctx)[1] if base_txt is not None else None
-    latents, pos_kwargs = fibo.prepare(latents, txt, ctx)
+    neg_kwargs = fibo.prepare(latents, neg_txt, ref)[1] if cfg_scale != 1.0 else None
+    base_kwargs = fibo.prepare(latents, base_txt, ref)[1] if base_txt is not None else None
+    latents, pos_kwargs = fibo.prepare(latents, txt, ref)
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
         t = torch.tensor([timesteps[i]], device=latents.device).expand(B)
