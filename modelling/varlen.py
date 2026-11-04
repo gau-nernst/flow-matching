@@ -49,9 +49,9 @@ def expand_to_tokens(cond: Tensor, idx: Tensor | None) -> Tensor:
     return cond if idx is None else cond[:, 0].index_select(0, idx).unsqueeze(0)
 
 
-# imgs: list of [L_i, D] (patchified), txt: list of [L_txt_i, D_txt], grids: (H, W) of each patchified image
+# imgs: list[LD] (patchified), txt: list[LD], grids: (H, W) of each patchified image
 # make_rope(H, W, L_txt): one sample's joint rope
-# -> img [1, sum(L_i), D], kwargs: txt [1, sum(L_txt_i), D_txt], rope, txt_varlen, img_varlen, joint_varlen
+# -> img [1, sum(L), D], kwargs: txt [1, sum(L), D], rope, txt_varlen, img_varlen, joint_varlen
 # always varlen, even when all shapes match
 # imgs: patchified [L_i, D]. grids: patchified (H, W) of each sample. make_rope(H, W, L_txt): one sample's joint rope
 def pack_inputs(
