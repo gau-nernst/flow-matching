@@ -244,13 +244,14 @@ class Flux2(nn.Module):
     def make_rope(self, H: int, W: int, L_txt: int) -> Tensor:
         return torch.cat([self.pos_embed.create((0, 0, 0, 0), (1, 1, 1, L_txt)), self.make_img_rope(H, W)])
 
-    # uniform: latents BHWC, txt BLD, ref list[HWC] -> img [B, HW, C]
+    # uniform: latents BHWC, txt BLD, ref list[list[HWC]] (ref[i]: sample i's references) -> img [B, HW, C]
     # varlen: latents list[HWC], txt list[LD] -> img [1, sum(HW), C]
     def prepare(
-        self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor], ref: list[Tensor] | None = None
+        self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor], ref: list[list[Tensor]] | None = None
     ) -> tuple[Tensor, dict]:
+        has_ref = ref is not None and any(len(x) for x in ref)
         if not isinstance(latents, Tensor):
-            assert not ref, "ref is only supported for a uniform batch"
+            assert not has_ref, "ref is only supported for a uniform batch"
             imgs = [x.flatten(0, 1) for x in latents]
             return pack_inputs(imgs, txt, [x.shape[:2] for x in latents], self.make_rope, txt_first=True)
 
@@ -259,10 +260,13 @@ class Flux2(nn.Module):
         )
         _, H, W, _ = latents.shape
         img, kwargs = latents.flatten(1, 2), dict(txt=txt, rope=self.make_rope(H, W, txt.shape[1]))
-        if ref:
-            ref_rope = [self.make_img_rope(*x.shape[:2], t=10 * (i + 1)) for i, x in enumerate(ref)]
+        if has_ref:
+            assert len(ref) == img.shape[0], (len(ref), img.shape[0])
+            assert len({tuple(x.shape for x in refs) for refs in ref}) == 1, "a uniform batch needs the same ref sizes"
+            ref = [torch.stack(xs) for xs in zip(*ref)]  # [B, h, w, C] for each reference image
+            ref_rope = [self.make_img_rope(*x.shape[1:3], t=10 * (i + 1)) for i, x in enumerate(ref)]
             kwargs["rope"] = torch.cat([kwargs["rope"], *ref_rope])
-            kwargs["ref"] = torch.cat([x.flatten(0, 1) for x in ref]).expand(img.shape[0], -1, -1)
+            kwargs["ref"] = torch.cat([x.flatten(1, 2) for x in ref], dim=1)
         return img, kwargs
 
     def unpatchify(self, out: Tensor, sizes: tuple[int, int] | list[tuple[int, int]]) -> Tensor | list[Tensor]:

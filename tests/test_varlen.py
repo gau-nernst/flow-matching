@@ -4,6 +4,7 @@ import torch
 from PIL import Image
 from torch import nn
 
+from modelling.fibo.model import Fibo, FiboConfig
 from modelling.flux2.model import Flux2, Flux2Config
 from modelling.moss_image.model import MOSSImage, MOSSImageConfig
 from modelling.varlen import VarlenMetadata
@@ -90,3 +91,29 @@ def test_batch_tokens(tmp_path, budget):
         imgs, prompts = next(ds_iter)
         assert len(imgs) == len(prompts)
         assert len(imgs) == 1 or sum(x.shape[0] * x.shape[1] // 256 for x in imgs) <= budget
+
+
+@pytest.mark.parametrize("grad", [False, True])  # Triton kernels and their reference paths
+@pytest.mark.parametrize("with_ref", [False, True])
+def test_fibo_varlen(grad, with_ref):
+    # 8 layers: reaches the first cross-attention block (layer 6). text: 6 bundles of [L, D].
+    # 300 tokens -> 320 gist tokens, the others 256. refs: 1, 0 and 2 images to edit
+    torch.manual_seed(0)
+    with torch.device("cuda"):
+        model = Fibo(FiboConfig(dim=256, num_layers=8, txt_dim=64, img_dim=16))
+    for p in model.parameters():
+        nn.init.normal_(p, std=1.0)
+    model = model.bfloat16()
+    latents = [randn(H, W, 16) for H, W in SIZES]
+    txts = [randn(6, L, 64) for L in (37, 300, 12)]
+    refs = [[randn(8, 12, 16)], [], [randn(16, 16, 16), randn(8, 8, 16)]] if with_ref else None
+    t = torch.tensor([0.3, 0.6, 0.9], device="cuda")
+
+    with torch.set_grad_enabled(grad):
+        img, kwargs = model.prepare(latents, txts, refs)
+        outs = model.unpatchify(model(img, t, **kwargs), SIZES)
+        for i, size in enumerate(SIZES):
+            img, kwargs = model.prepare(latents[i][None], txts[i][None], None if refs is None else [refs[i]])
+            expected = model.unpatchify(model(img, t[i : i + 1], **kwargs), size)[0].float()
+            # clean is ~1%, another sample's text is ~50% off
+            assert (outs[i].float() - expected).norm() / expected.norm() < 0.02

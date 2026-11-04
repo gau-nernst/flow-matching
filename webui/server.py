@@ -142,15 +142,21 @@ async def generate(
     seed: int | None = Form(None),
     images: list[UploadFile] = File(default=[]),
 ):
+    if PIPELINE is None:
+        raise HTTPException(status_code=400, detail="No model loaded")
+
     kwargs = dict(
         prompt=prompt,
-        neg_prompt=neg_prompt,
         img_size=(height, width),
         cfg_scale=cfg_scale,
         num_steps=num_steps,
         seed=seed,
         pbar=False,
     )
+
+    # an empty negative prompt keeps the pipeline's default (Fibo's is an empty JSON caption)
+    if neg_prompt:
+        kwargs.update(neg_prompt=neg_prompt)
 
     # Flux2-klein specific logic
     limit_pixels = 2048 * 2048 if len(images) == 1 else 1024 * 1024
@@ -184,7 +190,7 @@ async def generate(
             pil_img.save(img_bytes, format="WEBP", lossless=True)
             img_bytes.seek(0)
             encoded = base64.b64encode(img_bytes.getvalue()).decode("ascii")
-            emit({"type": "done", "image_base64": encoded, "width": width, "height": height})
+            emit({"type": "done", "image_base64": encoded, "width": pil_img.width, "height": pil_img.height})
 
         except Exception as exc:
             emit({"type": "error", "message": str(exc)})

@@ -25,23 +25,28 @@ class VarlenMetadata(NamedTuple):
         seq_ids = torch.repeat_interleave(ids, lens_t, output_size=sum(lens))
         return VarlenMetadata(cu_seqlens, seq_ids, max(lens))
 
-    # metadata of torch.cat([self_tensor, other_tensor], dim=-2). the tensor keeps the two streams apart,
+    # metadata of torch.cat([self_tensor, *other_tensors], dim=-2). the tensor keeps the streams apart,
     # so perm is needed for attention, which wants each sample contiguous:
     #   self lens [2, 3], other lens [1, 2]
     #   tensor order:     a0 a0 a1 a1 a1 b0 b1 b1
     #   attention order:  a0 a0 b0 a1 a1 a1 b1 b1
     #   perm = [0, 1, 5, 2, 3, 4, 6, 7], cu_seqlens = [0, 3, 8]
-    def concat(self, other: "VarlenMetadata") -> "VarlenMetadata":
-        La, Lb = self.seq_ids.shape[0], other.seq_ids.shape[0]
+    def concat(self, *others: "VarlenMetadata") -> "VarlenMetadata":
+        parts = (self, *others)
+        assert all(x.perm is None for x in parts), "concat of a concat is not supported"
         device = self.seq_ids.device
-        a_pos = torch.arange(La, device=device) + other.cu_seqlens.index_select(0, self.seq_ids)
-        b_pos = torch.arange(Lb, device=device) + self.cu_seqlens[1:].index_select(0, other.seq_ids)
-        perm = torch.empty(La + Lb, dtype=torch.long, device=device)
-        perm.index_copy_(0, a_pos, torch.arange(La, device=device))
-        perm.index_copy_(0, b_pos, torch.arange(La, La + Lb, device=device))
-        seq_ids = torch.cat([self.seq_ids, other.seq_ids])
-        cu_seqlens = self.cu_seqlens + other.cu_seqlens
-        return VarlenMetadata(cu_seqlens, seq_ids, self.max_seqlen + other.max_seqlen, perm)
+        cu_seqlens = sum(x.cu_seqlens for x in parts)
+        perm = torch.empty(sum(x.seq_ids.shape[0] for x in parts), dtype=torch.long, device=device)
+        start = 0  # tensor index of this part's first token
+        offset = cu_seqlens[:-1]  # attention index of each sample's first token of this part
+        for x in parts:
+            L = x.seq_ids.shape[0]
+            pos = torch.arange(L, device=device) + (offset - x.cu_seqlens[:-1]).index_select(0, x.seq_ids)
+            perm.index_copy_(0, pos, torch.arange(start, start + L, device=device))
+            offset = offset + x.cu_seqlens.diff()
+            start += L
+        seq_ids = torch.cat([x.seq_ids for x in parts])
+        return VarlenMetadata(cu_seqlens, seq_ids, sum(x.max_seqlen for x in parts), perm)
 
 
 # [B, 1, D] -> [1, L, D] for a varlen batch. idx: VarlenMetadata.seq_ids, or None for a uniform batch
