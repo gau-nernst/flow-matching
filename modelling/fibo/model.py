@@ -1,4 +1,4 @@
-# https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_bria_fibo2.py
+# https://github.com/huggingface/diffusers/blob/v0.42.1/src/diffusers/models/transformers/transformer_bria_fibo2.py
 # Z-Image blocks, plus a Perceiver that compresses the text encoder's hidden states into "gist" tokens, and gated
 # cross-attention to the text encoder in a few blocks.
 

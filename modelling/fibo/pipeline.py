@@ -1,4 +1,4 @@
-# https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/bria_fibo2/pipeline_bria_fibo2.py
+# https://github.com/huggingface/diffusers/blob/v0.42.1/src/diffusers/pipelines/bria_fibo2/pipeline_bria_fibo2.py
 
 import json
 import math
