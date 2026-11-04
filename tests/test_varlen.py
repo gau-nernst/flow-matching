@@ -62,9 +62,12 @@ def test_varlen_matches_uniform(setup, grad):
             assert (outs[i].float() - expected).norm() / expected.norm() < 0.02
 
 
-def test_same_size_stays_uniform(setup):
+# the layout follows the input type: lists are varlen even with the same sizes, tensors are uniform
+def test_layout_follows_input_type(setup):
     model, C = setup
     img, kwargs = model.prepare([randn(16, 24, C)] * 2, [randn(20, 64)] * 2)
+    assert img.shape[0] == 1 and "img_varlen" in kwargs
+    img, kwargs = model.prepare(randn(2, 16, 24, C), randn(2, 20, 64))
     assert img.shape[0] == 2 and "img_varlen" not in kwargs
 
 
