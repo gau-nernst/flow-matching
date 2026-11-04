@@ -439,29 +439,21 @@ def fibo_generate(
         base_kwargs = fibo.prepare(imgs, base_txt, ref)[1]
     else:
         base_txt = base_kwargs = None
-    pos_kwargs = fibo.prepare(imgs, txt, ref)[1]
-
-    # a text set is a uniform or a varlen batch, depending on its lengths. all samples have the same image size, so
-    # the two layouts of the image tokens are views of [B, H*W, C]
-    latents = latents.flatten(1, 2)
-
-    def run(x: Tensor, t: Tensor, kwargs: dict) -> Tensor:
-        out = fibo(x.view(1, -1, x.shape[-1]) if "img_varlen" in kwargs else x, t, **kwargs)
-        return out.float().view(x.shape)
+    latents, pos_kwargs = fibo.prepare(imgs, txt, ref)  # lists: a varlen batch, the same layout for every text set
 
     for i in tqdm(range(num_steps), disable=not pbar, dynamic_ncols=True):
         t = torch.tensor([timesteps[i]], device=latents.device).expand(B)
         # base_txt (prompt without text images) is used while the noise level is above base_max_noise_level
         use_base = base_txt is not None and timesteps[i] > base_max_noise_level
-        v = run(latents, t, base_kwargs if use_base else pos_kwargs)
+        v = fibo(latents, t, **(base_kwargs if use_base else pos_kwargs)).float()
 
         # classifier-free guidance. the images to edit condition both passes.
         if cfg_scale != 1.0:
-            neg_v = run(latents, t, neg_kwargs)
+            neg_v = fibo(latents, t, **neg_kwargs).float()
             v = neg_v.lerp(v, cfg_scale)
 
         latents = solver_.step(latents, v, i)
         if progress_cb is not None:
             progress_cb(i + 1, num_steps)
 
-    return latents.unflatten(1, (H, W))
+    return torch.stack(fibo.unpatchify(latents, [(H, W)] * B))

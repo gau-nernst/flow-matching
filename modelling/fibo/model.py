@@ -171,12 +171,11 @@ class Fibo(nn.Module):
         ref_rope = [self.pos_embed.create((img_plane + 1 + k, 0, 0), (1, *s)) for k, s in enumerate(ref_sizes)]
         return torch.cat([gist_rope, *ref_rope, self.pos_embed.create((img_plane, 0, 0), (1, H, W))])
 
-    # latents: [B, H, W, C] (Flux.2 VAE latents, patchified + normalized), or a list of [H_i, W_i, C] (varlen)
-    # txt: [B, 6, L, txt_dim], or a list of [6, L_i, txt_dim]. text encoder bundles: the Perceiver's first,
-    # then one per injection block.
-    # ref: latents of each sample's images to edit, a list of [h, w, C] per sample. counts and sizes can differ.
-    # clean tokens (t=0), not predicted.
-    # samples of the same image size, prompt length and images to edit stay a uniform batch.
+    # uniform: latents BHWC, txt [B, 6, L, D], ref list[list[HWC]] -> img [B, HW, C]
+    # varlen: latents list[HWC], txt list[6LD], ref list[list[HWC]] -> img [1, sum(HW), C]
+    # latents: Flux.2 VAE latents, patchified + normalized. txt: 6 text encoder bundles, the Perceiver's first, then
+    # one per injection block. ref[i]: sample i's images to edit, clean tokens (t=0). a uniform batch needs the same
+    # ref shapes in each sample
     def prepare(
         self,
         latents: Tensor | list[Tensor],
@@ -185,13 +184,13 @@ class Fibo(nn.Module):
     ) -> tuple[Tensor, dict]:
         refs = ref or [[] for _ in range(len(latents))]
         assert len(latents) == len(txt) == len(refs), (len(latents), len(txt), len(refs))
-        same_ref = len({tuple(c.shape for c in cs) for cs in refs}) == 1
         if not isinstance(latents, Tensor):
-            txts = list(txt)
-            if len({x.shape for x in latents}) > 1 or len({x.shape for x in txts}) > 1 or not same_ref:
-                return self._pack_varlen(latents, txts, refs)
-            latents, txt = torch.stack(latents), torch.stack(txts)
-        assert same_ref, "a batched tensor needs the same images to edit in each sample. pass a list of latents"
+            return self._pack_varlen(latents, list(txt), refs)
+
+        assert isinstance(txt, Tensor), (
+            "latents is a tensor, so txt must be too. for a varlen batch, pass both as lists"
+        )
+        assert len({tuple(c.shape for c in cs) for cs in refs}) == 1, "a uniform batch needs the same ref shapes"
         ref = [torch.stack(cs) for cs in zip(*refs)]  # [B, h, w, C] for each image to edit
 
         _, H, W, _ = latents.shape

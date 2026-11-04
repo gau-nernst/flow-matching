@@ -130,20 +130,22 @@ def test_batch_tokens(tmp_path, budget):
 
 
 def test_fibo_interface():
-    model = Fibo(FiboConfig(dim=256, num_layers=2, txt_dim=32, img_dim=16))
+    with torch.device("cuda"):
+        model = Fibo(FiboConfig(dim=256, num_layers=2, txt_dim=32, img_dim=16))
     for p in model.parameters():
         nn.init.normal_(p, std=0.1)
-    latents = [torch.randn(4, 6, 16) for _ in range(2)]
-    txts = [torch.randn(6, 10, 32) for _ in range(2)]
+    model = model.bfloat16()
+    latents = [randn(4, 6, 16) for _ in range(2)]
+    txts = [randn(6, 10, 32) for _ in range(2)]
 
     img, kwargs = model.prepare(torch.stack(latents), torch.stack(txts))
     assert img.shape == (2, 24, 16)
     assert kwargs["rope"].shape[0] == model.num_gist_tokens(10) + 24
     compute_loss(model, latents, LogitNormal(), txts).backward()
 
-    # samples with the same images to edit stay uniform
-    refs = [[torch.randn(2, 4, 16), torch.randn(4, 4, 16)] for _ in range(2)]
-    img, kwargs = model.prepare(latents, txts, refs)
+    # a uniform batch stacks each sample's images to edit
+    refs = [[randn(2, 4, 16), randn(4, 4, 16)] for _ in range(2)]
+    img, kwargs = model.prepare(torch.stack(latents), torch.stack(txts), refs)
     assert img.shape == (2, 24, 16) and kwargs["ref"].shape == (2, 8 + 16, 16) and "img_varlen" not in kwargs
 
 
