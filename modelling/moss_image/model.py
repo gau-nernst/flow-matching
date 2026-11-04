@@ -165,9 +165,13 @@ class MOSSImage(nn.Module):
         ids = torch.cat([img_ids, txt_ids])
         return torch.cat([compute_rope(ids[:, i], HEAD_DIM // 4, 10_000.0) for i in range(4)], dim=-1)
 
-    # latents: [B, H, W, C] (uniform) or a list of [H_i, W_i, C] (varlen). txt: unpadded
+    # uniform: latents BHWC, txt BLD -> img [B, HW, C]
+    # varlen: latents list[HWC], txt list[LD] (unpadded) -> img [1, sum(HW), C]
     def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
         if isinstance(latents, Tensor):
+            assert isinstance(txt, Tensor), (
+                "latents is a tensor, so txt must be too. for a varlen batch, pass both as lists"
+            )
             _, H, W, _ = latents.shape
             return latents.flatten(1, 2), dict(txt=txt, rope=self.make_rope(H, W, txt.shape[1], latents.device))
 

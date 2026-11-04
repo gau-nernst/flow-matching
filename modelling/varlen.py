@@ -49,7 +49,9 @@ def expand_to_tokens(cond: Tensor, idx: Tensor | None) -> Tensor:
     return cond if idx is None else cond[:, 0].index_select(0, idx).unsqueeze(0)
 
 
-# returns (img, kwargs) for model(img, t, **kwargs). samples of the same size stay a uniform batch.
+# imgs: list[LD] (patchified), txt: list[LD], grids: (H, W) of each patchified image
+# make_rope(H, W, L_txt): one sample's joint rope
+# -> img [1, sum(L), D], kwargs: txt [1, sum(L), D], rope, txt_varlen, img_varlen, joint_varlen
 # imgs: patchified [L_i, D]. grids: patchified (H, W) of each sample. make_rope(H, W, L_txt): one sample's joint rope
 def pack_inputs(
     imgs: list[Tensor],
@@ -60,8 +62,6 @@ def pack_inputs(
 ) -> tuple[Tensor, dict]:
     txts = list(txt)
     assert len(imgs) == len(txts) == len(grids), (len(imgs), len(txts), len(grids))
-    if len(set(grids)) == 1 and len({x.shape[0] for x in txts}) == 1:
-        return torch.stack(imgs), dict(txt=torch.stack(txts), rope=make_rope(*grids[0], txts[0].shape[0]))
 
     # joint rope in the same order as the joint sequence: [all first stream, all second stream]
     firsts, seconds = [], []

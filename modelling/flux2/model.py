@@ -244,7 +244,8 @@ class Flux2(nn.Module):
     def make_rope(self, H: int, W: int, L_txt: int) -> Tensor:
         return torch.cat([self.pos_embed.create((0, 0, 0, 0), (1, 1, 1, L_txt)), self.make_img_rope(H, W)])
 
-    # latents: [B, H, W, C] (uniform) or a list of [H_i, W_i, C] (varlen). ref: uniform only
+    # uniform: latents BHWC, txt BLD, ref list[HWC] -> img [B, HW, C]
+    # varlen: latents list[HWC], txt list[LD] -> img [1, sum(HW), C]
     def prepare(
         self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor], ref: list[Tensor] | None = None
     ) -> tuple[Tensor, dict]:
@@ -253,6 +254,9 @@ class Flux2(nn.Module):
             imgs = [x.flatten(0, 1) for x in latents]
             return pack_inputs(imgs, txt, [x.shape[:2] for x in latents], self.make_rope, txt_first=True)
 
+        assert isinstance(txt, Tensor), (
+            "latents is a tensor, so txt must be too. for a varlen batch, pass both as lists"
+        )
         _, H, W, _ = latents.shape
         img, kwargs = latents.flatten(1, 2), dict(txt=txt, rope=self.make_rope(H, W, txt.shape[1]))
         if ref:
