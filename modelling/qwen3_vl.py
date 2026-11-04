@@ -8,6 +8,7 @@ import itertools
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn.attention.varlen import varlen_attn
 
 from .linear import Linear
 from .qwen3 import Qwen3Model
@@ -21,17 +22,14 @@ class VisionAttention(nn.Module):
         self.qkv = Linear(dim, dim * 3)
         self.proj = Linear(dim, dim)
 
-    # x: [L, D]. rope: [L, head_dim / 2] complex, half-split layout. attention within each image only.
-    def forward(self, x: Tensor, rope: Tensor, seqlens: list[int]) -> Tensor:
+    # x: [L, D], images concatenated. rope: [L, head_dim / 2] complex, half-split layout.
+    # cu_seqlens: [N+1] int32 image boundaries, attention within each image only
+    def forward(self, x: Tensor, rope: Tensor, cu_seqlens: Tensor, max_seqlen: int) -> Tensor:
         q, k, v = self.qkv(x)[None].unflatten(-1, (3, self.num_heads, -1)).unbind(2)  # [1, L, nH, Dh] each
         q = apply_rope(q, rope, interleaved=False)
         k = apply_rope(k, rope, interleaved=False)
-        q, k, v = (t[0].transpose(0, 1) for t in (q, k, v))  # [nH, L, Dh]
-        out = [
-            F.scaled_dot_product_attention(*args)
-            for args in zip(q.split(seqlens, 1), k.split(seqlens, 1), v.split(seqlens, 1))
-        ]
-        return self.proj(torch.cat(out, dim=1).transpose(0, 1).flatten(1))
+        out = varlen_attn(q[0], k[0], v[0], cu_seqlens, cu_seqlens, max_seqlen, max_seqlen)  # [L, nH, Dh]
+        return self.proj(out.flatten(1))
 
 
 class VisionBlock(nn.Module):
@@ -44,8 +42,8 @@ class VisionBlock(nn.Module):
         self.mlp.linear_fc1 = Linear(dim, mlp_dim)
         self.mlp.linear_fc2 = Linear(mlp_dim, dim)
 
-    def forward(self, x: Tensor, rope: Tensor, seqlens: list[int]) -> Tensor:
-        x = x + self.attn(self.norm1(x), rope, seqlens)
+    def forward(self, x: Tensor, rope: Tensor, cu_seqlens: Tensor, max_seqlen: int) -> Tensor:
+        x = x + self.attn(self.norm1(x), rope, cu_seqlens, max_seqlen)
         mlp = self.mlp
         return x + mlp.linear_fc2(F.gelu(mlp.linear_fc1(self.norm2(x)), approximate="tanh"))
 
@@ -142,10 +140,11 @@ class Qwen3VLVisionModel(nn.Module):
         x = x + torch.cat([self._pos_embed(h, w, device) for _, h, w in grid_thw])
         rope = torch.cat([self._rope(h, w, device) for _, h, w in grid_thw])
         seqlens = [h * w for _, h, w in grid_thw]
+        cu_seqlens = torch.tensor([0, *itertools.accumulate(seqlens)], dtype=torch.int32, device=device)
 
         deepstack = []
         for i, block in enumerate(self.blocks):
-            x = block(x, rope, seqlens)
+            x = block(x, rope, cu_seqlens, max(seqlens))
             if i in self.deepstack_visual_indexes:
                 deepstack.append(self.deepstack_merger_list[self.deepstack_visual_indexes.index(i)](x))
         return self.merger(x), deepstack
