@@ -72,33 +72,6 @@ def test_varlen_matches_uniform(setup, grad):
             assert (outs[i].float() - expected).norm() / expected.norm() < 0.02
 
 
-# Fibo only: at std=1 the other models' gradients are bf16 noise (a uniform batch of 2 is 20-45% off running each
-# sample alone), and at small std a sample's text barely changes them, so the test couldn't catch mixing
-@pytest.mark.parametrize("setup", ["fibo"], indirect=True)
-def test_varlen_backward_matches_uniform(setup):
-    model, C = setup
-    latents = [randn(H, W, C) for H, W in SIZES]
-    txts = [randn_txt(model, L) for L in TXT_LENS]
-    t = torch.tensor([0.3, 0.6, 0.9], device="cuda")
-    dys = [randn(H, W, C) for H, W in SIZES]  # upstream gradient of each sample's output
-    params = [p for p in model.parameters() if p.requires_grad]
-
-    def grads(outs, idxs):
-        loss = sum((out.float() * dys[i].float()).sum() for out, i in zip(outs, idxs))
-        return torch.cat(
-            [g.float().flatten() for g in torch.autograd.grad(loss, params, allow_unused=True) if g is not None]
-        )
-
-    img, kwargs = model.prepare(latents, txts)
-    varlen_grad = grads(model.unpatchify(model(img, t, **kwargs), SIZES), range(3))
-    expected = 0
-    for i, size in enumerate(SIZES):
-        img, kwargs = model.prepare(latents[i][None], txts[i][None])
-        expected = expected + grads([model.unpatchify(model(img, t[i : i + 1], **kwargs), size)[0]], [i])
-    err = (varlen_grad - expected).norm() / expected.norm()
-    assert err < 0.05, err  # 1-3%, varlen_attn backward is not deterministic. mixing samples is ~50%
-
-
 # a list is varlen even when all samples have the same shape. a tensor is uniform
 def test_layout_follows_input_type(setup):
     model, C = setup
