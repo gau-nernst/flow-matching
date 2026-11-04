@@ -244,9 +244,9 @@ class Flux2(nn.Module):
     def make_rope(self, H: int, W: int, L_txt: int) -> Tensor:
         return torch.cat([self.pos_embed.create((0, 0, 0, 0), (1, 1, 1, L_txt)), self.make_img_rope(H, W)])
 
-    # uniform batch: latents [B, H, W, C], txt [B, L, D]
-    # varlen batch: latents a list of [H_i, W_i, C], txt a list of [L_i, D]. a list is always varlen, even when all
-    # samples have the same shape. ref: uniform only
+    # uniform: latents [B, H, W, C], txt [B, L, D], ref list of [h, w, C] -> img [B, H*W, C]
+    # varlen: latents list of [H_i, W_i, C], txt list of [L_i, D] -> img [1, sum(H_i*W_i), C]. no ref
+    # a list is always varlen, even when all shapes match
     def prepare(
         self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor], ref: list[Tensor] | None = None
     ) -> tuple[Tensor, dict]:

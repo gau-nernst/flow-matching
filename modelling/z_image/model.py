@@ -180,9 +180,9 @@ class ZImage(nn.Module):
         txt_rope = self.pos_embed.create((1, 0, 0), (L_txt, 1, 1))
         return torch.cat([img_rope, txt_rope])
 
-    # uniform batch: latents [B, H, W, C], txt [B, L, D]
-    # varlen batch: latents a list of [H_i, W_i, C], txt a list of [L_i, D]. a list is always varlen, even when all
-    # samples have the same shape
+    # uniform: latents [B, H, W, C], txt [B, L, D] -> img [B, H*W/p^2, p^2*C]
+    # varlen: latents list of [H_i, W_i, C], txt list of [L_i, D] -> img [1, sum(H_i*W_i)/p^2, p^2*C]
+    # a list is always varlen, even when all shapes match
     def prepare(self, latents: Tensor | list[Tensor], txt: Tensor | list[Tensor]) -> tuple[Tensor, dict]:
         p = self.cfg.patch_size
         if isinstance(latents, Tensor):
