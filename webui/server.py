@@ -1,6 +1,5 @@
 import base64
 import gc
-import inspect
 import io
 import json
 import queue
@@ -169,12 +168,6 @@ async def generate(
         ref_imgs.append(img.convert("RGB"))
 
     if ref_imgs:
-        params = inspect.signature(PIPELINE.generate).parameters
-        if "ref_imgs" not in params:
-            raise HTTPException(status_code=400, detail=f"{ACTIVE_MODEL} does not take input images")
-        max_images = getattr(PIPELINE, "MAX_NUM_IMAGES", len(ref_imgs))
-        if len(ref_imgs) > max_images:
-            raise HTTPException(status_code=400, detail=f"{ACTIVE_MODEL} takes at most {max_images} images")
         kwargs.update(ref_imgs=ref_imgs)
 
     stream_queue: queue.Queue[str | None] = queue.Queue()
