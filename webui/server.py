@@ -176,10 +176,6 @@ async def generate(
         if len(ref_imgs) > max_images:
             raise HTTPException(status_code=400, detail=f"{ACTIVE_MODEL} takes at most {max_images} images")
         kwargs.update(ref_imgs=ref_imgs)
-        # a pipeline whose img_size defaults to None picks the output size from the input images (Fibo: the trained
-        # size for the first image's aspect ratio). the UI's size would crop them.
-        if params["img_size"].default is None:
-            del kwargs["img_size"]
 
     stream_queue: queue.Queue[str | None] = queue.Queue()
 
